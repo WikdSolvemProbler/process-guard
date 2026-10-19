@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      PROCESS_GUARD_TIMING: info
+    steps:
+      - uses: actions/checkout@v5
+      - name: Test
+        run: cargo test --release --locked --no-fail-fast
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/process-guard.exe LICENSE NOTICE README.md POLICY.md dist/
+          cd dist && sha256sum process-guard.exe > SHA256SUMS && cat SHA256SUMS
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md --verify-tag

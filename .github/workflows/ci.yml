@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      # Shared runners are too noisy for the timing bounds; they are reported, not asserted.
+      PROCESS_GUARD_TIMING: info
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: cargo build --release --locked
+      - name: Test
+        run: cargo test --release --locked --no-fail-fast

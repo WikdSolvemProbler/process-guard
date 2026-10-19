@@ -1,0 +1,22 @@
+[package]
+name = "process-guard"
+version = "1.4.0"
+edition = "2021"
+description = "Windows process tree deadline: runs one command under a job object and kills the whole tree at a finite timeout."
+license = "Apache-2.0"
+repository = "https://github.com/WikdSolvemProbler/process-guard"
+readme = "README.md"
+keywords = ["windows", "process", "timeout", "job-object", "sandbox"]
+categories = ["command-line-utilities", "os::windows-apis"]
+publish = false
+
+[[bin]]
+name = "process-guard"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
