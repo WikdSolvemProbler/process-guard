@@ -1,6 +1,6 @@
 [package]
 name = "process-guard"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 description = "Windows process tree deadline: runs one command under a job object and kills the whole tree at a finite timeout."
 license = "Apache-2.0"

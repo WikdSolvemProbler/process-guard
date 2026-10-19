@@ -307,6 +307,25 @@ fn a01_to_a12_hook_decisions() {
     }
     checks.check("A7", "missing, empty, non-string and ambiguous CommandLine is denied", denied, detail);
 
+    // A25: a second toolCall, name or args key in any letter case, or a repeated one, is
+    // ambiguous and denied whatever tool either candidate names.
+    let mut denied = true;
+    let mut detail = String::new();
+    for body in [
+        r#"{"toolCall":{"name":"view_file","args":{}},"toolcall":{"name":"run_command","args":{"CommandLine":"evil"}}}"#,
+        r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"evil"}},"toolCall":{"name":"view_file","args":{}}}"#,
+        r#"{"toolCall":{"name":"view_file","Name":"run_command","args":{"CommandLine":"evil"}}}"#,
+        r#"{"toolCall":{"name":"run_command","name":"view_file","args":{"CommandLine":"evil"}}}"#,
+        r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi"},"ARGS":{"CommandLine":"evil"}}}"#,
+    ] {
+        let d = s.ask("A25", body.as_bytes());
+        if decision(&d) != Some("deny") || !reason(&d).starts_with("TIMEOUT_REQUIRED") || d.get("overwrite").is_some() {
+            denied = false;
+            detail = body.to_string();
+        }
+    }
+    checks.check("A25", "ambiguous toolCall, name and args keys are denied", denied, detail);
+
     // A8: unreadable or invalid input is denied, including a payload past the 16 MiB cap.
     let mut denied = true;
     let mut detail = String::new();
@@ -454,8 +473,15 @@ fn a24_powershell_without_exit_collection() {
     checks.finish();
 }
 
-/// The longest command the hook wraps, per `MAX_REWRITTEN_LINE` in `src/hook.rs`.
-const MAX_LINE: usize = 8000;
+/// The longest rewritten line the hook produces, read from `MAX_REWRITTEN_LINE` in
+/// `src/hook.rs` so the test follows any change to the limit.
+fn max_line() -> usize {
+    let source = include_str!("../src/hook.rs");
+    let prefix = "const MAX_REWRITTEN_LINE: usize = ";
+    let start = source.find(prefix).expect("MAX_REWRITTEN_LINE is defined in src/hook.rs") + prefix.len();
+    let digits: String = source[start..].chars().take_while(|c| c.is_ascii_digit() || *c == '_').filter(|c| *c != '_').collect();
+    digits.parse().expect("MAX_REWRITTEN_LINE is an integer literal")
+}
 
 /// `echo` followed by `a` repeated so the command has exactly `bytes` bytes.
 fn echo_of(bytes: usize) -> String {
@@ -464,7 +490,7 @@ fn echo_of(bytes: usize) -> String {
 
 /// The most bytes of command that still fit the line limit for this install.
 fn room(install: &Install) -> usize {
-    (MAX_LINE - format!("{} --command-b64 ", install.auto).len()) / 4 * 3
+    (max_line() - format!("{} --command-b64 ", install.auto).len()) / 4 * 3
 }
 
 #[test]
@@ -477,7 +503,7 @@ fn a22_a23_long_commands() {
     // A22: the longest command that fits is wrapped within the limit; one more group is denied
     // with a reason that tells the agent to use a file, and no overwrite.
     let d = session.ask("A22", call(&json_quote(&echo_of(fit))).as_bytes());
-    let fits = decision(&d) == Some("allow") && command_line(&d).map_or(false, |l| l.len() <= MAX_LINE);
+    let fits = decision(&d) == Some("allow") && command_line(&d).map_or(false, |l| l.len() <= max_line());
     let d = session.ask("A22", call(&json_quote(&echo_of(fit + 1))).as_bytes());
     let refused = decision(&d) == Some("deny") && d.get("overwrite").is_none()
         && reason(&d).starts_with("TIMEOUT_REQUIRED") && reason(&d).contains("too long") && reason(&d).contains("file");
@@ -486,7 +512,7 @@ fn a22_a23_long_commands() {
     // A line that is already in the wrapper form passes through unchanged, even past the limit.
     let guarded = session.wrapped(&echo_of(fit + 300));
     let d = session.ask("A22", call(&json_quote(&guarded)).as_bytes());
-    let passes = guarded.len() > MAX_LINE && decision(&d) == Some("allow") && d.get("overwrite").is_none();
+    let passes = guarded.len() > max_line() && decision(&d) == Some("allow") && d.get("overwrite").is_none();
     let bad: Vec<String> = session.runs.iter().filter(|r| r.1 != 0 || !matches!(Json::parse(r.2.trim()), Some(Json::Obj(_)))).map(|r| r.0.clone()).collect();
     checks.check("A22", "the longest fitting command is wrapped, a longer one is denied with a reason, a long guarded line passes, exit 0",
         fits && refused && huge && passes && bad.is_empty(), format!("fits {} refused {} huge {} passes {} bad {:?}", fits, refused, huge, passes, bad));
@@ -498,7 +524,7 @@ fn a22_a23_long_commands() {
     let sh = bash(&line, &[]);
     let cm = cmd(&line, &[]);
     checks.check("A23", "a command at the length limit runs in PowerShell, Git Bash and cmd",
-        line.len() <= MAX_LINE && [&ps, &sh, &cm].iter().all(|o| o.code == 0 && o.out().contains(&expected)),
+        line.len() <= max_line() && [&ps, &sh, &cm].iter().all(|o| o.code == 0 && o.out().contains(&expected)),
         format!("line {} ps {} {:?} bash {} {:?} cmd {} {:?}", line.len(), ps.code, ps.err(), sh.code, sh.err(), cm.code, cm.err()));
     checks.finish();
 }

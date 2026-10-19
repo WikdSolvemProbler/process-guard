@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1
+
+- `hook antigravity` also denies a payload with more than one `toolCall` key, or a `toolCall` object with more than one `name` or `args` key, in any letter case or repeated (check A25). Before, the hook read the last exact match, and a host that chose another candidate could run a command the hook had not checked. The rule applies whatever tool the payload names.
+- The long command checks read the line limit from `MAX_REWRITTEN_LINE` in `src/hook.rs` instead of repeating it.
+
 ## 1.5.0
 
 Google Antigravity support (integrated development environment, App and command-line interface).

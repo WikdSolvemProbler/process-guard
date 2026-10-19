@@ -91,6 +91,7 @@ The hook reads and writes payloads in JavaScript Object Notation (JSON).
 | A22 | `a22_a23_long_commands` | the longest command that fits the 8000 character line limit is wrapped; one more group of three bytes and a one million byte command are denied with a reason that names the file remedy and no `overwrite`; a wrapper form line longer than the limit passes through unchanged; exit 0 and one JSON object throughout |
 | A23 | `a22_a23_long_commands` | the command at the limit runs end to end in PowerShell, Git Bash and `cmd`, output intact |
 | A24 | `a24_powershell_without_exit_collection` | PowerShell run with `-Command` and no explicit exit: success reads 0, a failing command reads 1 and a deadline reads 1 with `PROCESS_TIMEOUT` on standard error (the documented limit) |
+| A25 | `a01_to_a12_hook_decisions` | five payloads with a second `toolCall`, `name` or `args` key in another letter case, or a repeated one, are denied with no `overwrite`, whatever tool either candidate names |
 
 The unit tests in `src/hook.rs` add the Base64 encoder round trip, the pass-through matcher and the decision function.
 

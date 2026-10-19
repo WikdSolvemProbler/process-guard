@@ -368,6 +368,15 @@ fn antigravity_deny(why: &str) -> String {
         "TIMEOUT_REQUIRED: {} Native tool timeout alone does not guarantee child cleanup.", why)))
 }
 
+/// Whether `obj` is an object with more than one key equal to `key` in any ASCII letter
+/// case, a repeated key included.
+fn ambiguous(obj: &Json, key: &str) -> bool {
+    match obj {
+        Json::Object(pairs) => pairs.iter().filter(|(k, _)| k.eq_ignore_ascii_case(key)).count() > 1,
+        _ => false,
+    }
+}
+
 /// The one-line JSON decision for a Google Antigravity PreToolUse payload.
 /// `exe` is this executable's path with forward slashes; `wrapper_exists` says
 /// whether `process-guard-auto.exe` is present beside it.
@@ -376,6 +385,17 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
         Some(p) => p,
         None => return antigravity_deny("the hook payload is missing or is not valid JSON."),
     };
+    // The hook reads exact keys. A host that matches keys without regard to case, or lets
+    // another spelling or a repeated key win, could act on a different tool or command than
+    // the one checked, so any second candidate for a key the hook reads is denied.
+    if ambiguous(&payload, "toolCall") {
+        return antigravity_deny("the hook payload holds ambiguous toolCall keys (more than one key that is toolCall in any letter case).");
+    }
+    if let Some(c) = payload.get("toolCall") {
+        if let Some(key) = ["name", "args"].into_iter().find(|k| ambiguous(c, k)) {
+            return antigravity_deny(&format!("the toolCall object holds ambiguous {} keys (more than one key that is {} in any letter case).", key, key));
+        }
+    }
     // A payload without a toolCall object that names its tool is not the documented
     // shape (the schema changed or the hook is miswired); it is denied, not waved through.
     let call = payload.get("toolCall").filter(|c| matches!(c, Json::Object(_)));
@@ -384,13 +404,9 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
         Some("run_command") => {}
         Some(_) => return "{\"decision\":\"allow\"}".into(),
     }
-    // The hook reads the exact key `CommandLine` and rewrites only that key. A host that
-    // matches keys without regard to case, or lets another spelling or a repeated key win,
-    // could run a different command than the one wrapped, so any second candidate is denied.
-    if let Some(Json::Object(pairs)) = call.and_then(|c| c.get("args")) {
-        if pairs.iter().filter(|(k, _)| k.eq_ignore_ascii_case("CommandLine")).count() > 1 {
-            return antigravity_deny("run_command arguments hold ambiguous CommandLine keys (more than one key that is CommandLine in any letter case).");
-        }
+    // The hook rewrites only the exact key `CommandLine`, under the same rule.
+    if call.and_then(|c| c.get("args")).map_or(false, |a| ambiguous(a, "CommandLine")) {
+        return antigravity_deny("run_command arguments hold ambiguous CommandLine keys (more than one key that is CommandLine in any letter case).");
     }
     let command = match call.and_then(|c| c.get("args")).and_then(|a| a.get("CommandLine")).and_then(Json::as_str) {
         Some(c) if !c.trim().is_empty() && !c.contains('\0') => c,
@@ -617,6 +633,12 @@ mod tests {
             r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi","commandline":"evil"}}}"#,
             r#"{"toolCall":{"name":"run_command","args":{"COMMANDLINE":"evil","CommandLine":"echo hi"}}}"#,
             r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi","CommandLine":"evil"}}}"#,
+            // The same holds for the toolCall, name and args keys, whatever the tool.
+            r#"{"toolCall":{"name":"view_file","args":{}},"toolcall":{"name":"run_command","args":{"CommandLine":"evil"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"evil"}},"toolCall":{"name":"view_file","args":{}}}"#,
+            r#"{"toolCall":{"name":"view_file","Name":"run_command","args":{"CommandLine":"evil"}}}"#,
+            r#"{"toolCall":{"name":"run_command","name":"view_file","args":{"CommandLine":"evil"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi"},"ARGS":{"CommandLine":"evil"}}}"#,
         ] {
             let d = decide(input);
             assert_eq!(d.get("decision").and_then(Json::as_str), Some("deny"), "{}", input);
