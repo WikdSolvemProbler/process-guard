@@ -6,7 +6,7 @@ Every command or process launched by a person or an automated agent must end wit
 
 ## How commands are bounded
 
-Where the host runs shell commands through {{BIN}}/process-guard-auto.exe, every command is bounded automatically. The wrapper runs the command in a Windows job object. Its deadline is a default that nobody chooses per command: two hours (7200 seconds, or PROCESS_GUARD_AUTO_TIMEOUT when set), after which the whole process tree is ended. The tree is ended earlier when the command's shell or any shell above it exits, for example when a task is stopped or a session ends. Write commands plainly, with no envelope.
+Where the host runs shell commands through {{BIN}}/process-guard-auto.exe, every command is bounded automatically. The wrapper runs the command in a Windows job object. Its deadline is a default that nobody chooses per command: two hours (7200 seconds, or PROCESS_GUARD_AUTO_TIMEOUT when set), after which the whole process tree is ended. The tree is ended earlier when the command's shell or any shell above it exits, for example when a task is stopped or a session ends. Write commands plainly, with no envelope. Google Antigravity with `hook antigravity` installed is such a host: its commands are wrapped automatically.
 
 Any command that needs a shorter deadline, including every search, runs as `process-guard --timeout SECONDS -- program arguments` inside the command. The automatic default still caps everything.
 

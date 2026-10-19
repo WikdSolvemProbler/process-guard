@@ -1,6 +1,6 @@
 # Check table
 
-This table lists every check (27 guard checks, 14 automatic mode checks and 116 battery checks) and the Rust test that covers it. The suite began as a port of an earlier behaviour suite, item for item. Each check prints its identifier (`G`, `U` or `B` and a number) with PASS or FAIL, so a run traces back to this table; use `cargo test --release -- --nocapture` to see every line.
+This table lists every check (27 guard checks, 14 automatic mode checks, 116 battery checks and 24 Google Antigravity hook checks) and the Rust test that covers it. The suite began as a port of an earlier behaviour suite, item for item. Each check prints its identifier (`G`, `U`, `B` or `A` and a number) with PASS or FAIL, so a run traces back to this table; use `cargo test --release -- --nocapture` to see every line.
 
 The helper executable `src/bin/testkit.rs` stands in for every child process: sleepers, exit codes, standard stream relays, argument reporters, markers that record their process identifier, wide and deep process trees, bulk output, and children started with given creation flags.
 
@@ -64,6 +64,36 @@ The helper executable `src/bin/testkit.rs` stands in for every child process: sl
 | B104 to B112 | `b104_to_b116_hook_mode_fails_closed` | nine malformed payloads denied |
 | B113 to B116 | `b104_to_b116_hook_mode_fails_closed` | 20 MiB payload, extra fields, context output, exit 2 passes through the guard |
 
+## Google Antigravity hook (`tests/antigravity.rs`)
+
+The hook reads and writes payloads in JavaScript Object Notation (JSON).
+
+| Ids | Test | Observation |
+|---|---|---|
+| A1 | `a01_to_a12_hook_decisions` | six awkward commands (quotes, backslashes, newline, padding, characters outside the basic Latin set, shell metacharacters) and a payload with JSON escapes are wrapped; the payload decodes to the original exactly and equals the expected line |
+| A2 | `a01_to_a12_hook_decisions` | the answer has exactly `decision`, `reason` and `overwrite`; `overwrite` has only `CommandLine`; the decision is `allow` |
+| A3 | `a01_to_a12_hook_decisions` | the wrapper form passes through with no `overwrite`, also with whitespace around it |
+| A4 | `a01_to_a12_hook_decisions` | three valid envelopes pass through with no `overwrite` |
+| A5 | `a01_to_a12_hook_decisions` | twenty near misses (trailing `; evil`, `&& evil`, newline, prefix, path case, extra spaces, invalid Base64, extra option, another path, bad envelopes, no-break space or vertical tab around the wrapper form or an envelope) are wrapped again, whole |
+| A6 | `a01_to_a12_hook_decisions` | five payloads naming another tool (including `run_command ` with a trailing space and an empty name) are allowed with no `overwrite`; ten payloads with no `toolCall` object or no string name (`{}`, `[]`, `null`, `toolCall` null, array or string, `name` numeric or null) are denied |
+| A7 | `a01_to_a12_hook_decisions` | fourteen missing, empty, whitespace, non-string, null character and ambiguous (case-variant or repeated key) `CommandLine` payloads are denied |
+| A8 | `a01_to_a12_hook_decisions` | empty, invalid, truncated, byte order mark, text that is not valid 8-bit Unicode Transformation Format (UTF-8) and 20 MiB input is denied |
+| A9 | `a01_to_a12_hook_decisions` | the guard alone in a folder: denied, the reason names the missing wrapper; other tools still allowed |
+| A10 | `a01_to_a12_hook_decisions` | install paths with a space, an ampersand, an apostrophe and a letter outside the basic Latin set are denied |
+| A11 | `a01_to_a12_hook_decisions` | exit code 0 in every run of A1 to A10 |
+| A12 | `a01_to_a12_hook_decisions` | standard output is one JSON object on one line in every run of A1 to A10 |
+| A13, A16 | `a13_a16_powershell_end_to_end` | the rewritten line run in PowerShell with `; exit $LASTEXITCODE` appended, as a host that collects the exit code does: exit 9, a code point outside the basic Latin set, quotes and multi-line text survive; a sleeping command ends with 124 under `PROCESS_GUARD_AUTO_TIMEOUT=0.5` |
+| A14, A17 | `a14_a17_git_bash_end_to_end` | the same in Git Bash |
+| A15, A18 | `a15_a18_cmd_end_to_end` | the same in `cmd` |
+| A19 | `a19_to_a21_session_start_context` | `injectSteps[0].systemMessage.systemMessage` is `POLICY.md` verbatim, exit 0 |
+| A20 | `a19_to_a21_session_start_context` | the context output has only the key `injectSteps` |
+| A21 | `a19_to_a21_session_start_context` | without `POLICY.md` the output is still valid JSON, exit 0 |
+| A22 | `a22_a23_long_commands` | the longest command that fits the 8000 character line limit is wrapped; one more group of three bytes and a one million byte command are denied with a reason that names the file remedy and no `overwrite`; a wrapper form line longer than the limit passes through unchanged; exit 0 and one JSON object throughout |
+| A23 | `a22_a23_long_commands` | the command at the limit runs end to end in PowerShell, Git Bash and `cmd`, output intact |
+| A24 | `a24_powershell_without_exit_collection` | PowerShell run with `-Command` and no explicit exit: success reads 0, a failing command reads 1 and a deadline reads 1 with `PROCESS_TIMEOUT` on standard error (the documented limit) |
+
+The unit tests in `src/hook.rs` add the Base64 encoder round trip, the pass-through matcher and the decision function.
+
 ## Added
 
 | Id | Test | Observation |
@@ -72,7 +102,7 @@ The helper executable `src/bin/testkit.rs` stands in for every child process: sl
 
 ## Differences from the earlier suite
 
-- Children are the helper executable, not an interpreter. Where the earlier suite read an interpreter's output (a list of arguments, the length of the argument list), the helper prints a JavaScript Object Notation (JSON) array of the arguments and the test compares it exactly. B73 therefore checks that the child receives exactly `--timeout`, in place of an exit code equal to the argument count.
+- Children are the helper executable, not an interpreter. Where the earlier suite read an interpreter's output (a list of arguments, the length of the argument list), the helper prints a JSON array of the arguments and the test compares it exactly. B73 therefore checks that the child receives exactly `--timeout`, in place of an exit code equal to the argument count.
 - G26 asserts the operating system error text `WinError 5`, which the helper prints when the breakaway creation flag is refused.
 - B33 and B34 start helper sleepers rather than `ping.exe`; B54 names the copied executable `kit copy` followed by a u with diaeresis.
 - B55 asserts the exit code only, as the earlier check did in effect; the output bytes are printed for inspection.

@@ -287,7 +287,12 @@ pub struct TempDir {
 impl TempDir {
     /// The prefix may contain spaces and letters outside the basic Latin set.
     pub fn new(prefix: &str) -> TempDir {
-        let base = PathBuf::from(long_path(&std::env::temp_dir()));
+        TempDir::new_in(&std::env::temp_dir(), prefix)
+    }
+    /// Like `new`, with the folder created under `base` instead of the system temporary folder.
+    pub fn new_in(base: &Path, prefix: &str) -> TempDir {
+        std::fs::create_dir_all(base).expect("create the base folder");
+        let base = PathBuf::from(long_path(base));
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
         let name = format!("{}pg{}-{}-{}", prefix, std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed), nanos);
         let path = base.join(name);

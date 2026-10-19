@@ -14,6 +14,7 @@ Include the release or commit, the Windows version, the exact command line or ho
 
 - A process that escapes the job object, or that survives the deadline or the exit of the process that launched the guard.
 - A command that passes the hook mode envelope check without being exactly the documented envelope.
+- A Google Antigravity `run_command` call that reaches the shell through `hook antigravity` without being wrapped, exactly guarded already, or denied.
 - Malformed input to the hook's JavaScript Object Notation (JSON) parser or the Base64 decoder that crashes the guard, hangs it, or changes its decision.
 - Argument or shell quoting that runs a different command from the one given.
 

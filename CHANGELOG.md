@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.5.0
+
+Google Antigravity support (integrated development environment, App and command-line interface).
+
+- `hook antigravity` is a PreToolUse hook for the `run_command` tool. It rewrites `CommandLine` to a call to `process-guard-auto.exe` in the guard's own folder, so every shell command runs under an automatic deadline and process tree cleanup. A command that already has exactly that form, or is a valid guard envelope, passes through unchanged.
+- The hook answers with `allow`, never `auto_approve`, so it does not bypass the user's own review settings. Limit: review prompts and command-text allow or deny lists may see the Base64 form (`process-guard-auto.exe --command-b64 BASE64`) instead of the original command, so an approver cannot read it and a pattern such as `rm -rf` may not match. Google does not document whether policy is evaluated before or after the rewrite, so command-pattern deny lists should not be relied on together with this hook unless verified on the installation. The `reason` is a fixed sentence and does not quote the command.
+- Limit: commands run in a fresh child shell under the wrapper. A command sent to a persistent terminal (`RunPersistent`, `RequestedTerminalID`) no longer changes that shell's state (`cd`, environment variables, virtual environment activation), and a long-running process started this way ends at the wrapper's default deadline of two hours (`PROCESS_GUARD_AUTO_TIMEOUT`).
+- A tool whose name is a string other than `run_command` is allowed without change. A payload without a `toolCall` object that has a string `name` is an unrecognised shape and is denied. Only the plain space, tab, carriage return and line feed characters around a line count as separators when the hook decides whether it is already in the wrapper form; a line with any other whitespace around it (for example a no-break space) is wrapped again.
+- The hook fails closed with `deny` for unreadable or invalid input, an unrecognised payload, a missing `CommandLine`, more than one key that is `CommandLine` in any letter case or a repeated `CommandLine` key (the host's choice between them is not documented), a missing `process-guard-auto.exe`, or an install path with characters outside `A-Z`, `a-z`, `0-9`, colon, slash, period, underscore and hyphen. It always exits with 0 and prints one JavaScript Object Notation (JSON) object, so every failure the hook detects is a decision. A hook that cannot start, exceeds its timeout or crashes is handled by the host in a way Google does not document; verify the installation.
+- Limit: wrapping grows a command by about a third plus the wrapper path, and `cmd.exe` cannot run a line of more than 8191 characters. The hook denies a command whose rewritten line would exceed 8000 characters, about 6,000 bytes of the original, with a reason that tells the agent to write the long content to a file and run the file. A PowerShell command fails above roughly 12,000 characters in any case, because the wrapper encodes it a second time to start PowerShell.
+- Limit: a host that runs the rewritten line with `powershell -Command LINE` and no explicit `exit` reads exit code 1 for any non-zero exit of the wrapper, the deadline code 124 included; the deadline is still reported as `PROCESS_TIMEOUT` on standard error. Appending `; exit $LASTEXITCODE` restores the exact code. Git Bash and `cmd` report it exactly.
+- Limit: the wrapper detects the shell from the process that starts it. PowerShell and `cmd` are recognised; any other parent runs the command in Git Bash, which must be installed at `C:/Program Files/Git`. The behaviour was verified with each shell as the direct parent; Google does not document which shell `run_command` uses on Windows.
+- `hook antigravity-context` prints `POLICY.md` as a SessionStart system message.
+- `examples/antigravity/hooks.json` is a complete hook configuration.
+- 24 new checks (A1 to A24) in `tests/antigravity.rs`, including the rewritten command run in PowerShell, Git Bash and `cmd`. These tests need a temporary or build scratch folder whose path uses only `A-Z`, `a-z`, `0-9`, colon, slash, period, underscore and hyphen, and stop with a message otherwise.
+
 ## 1.4.0
 
 First standalone release under the Apache License, Version 2.0.

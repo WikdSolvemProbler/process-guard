@@ -17,8 +17,15 @@
 //! Formats: `pretooluse` reads `tool_input.command` (or `tool_input.cmd`) and
 //! answers in the PreToolUse format; `cursor` reads `command` and answers in the
 //! beforeShellExecution format; `cursor-context` prints the policy as session context.
+//!
+//! `antigravity` is different: it rewrites instead of only checking. It reads a
+//! Google Antigravity PreToolUse payload, and for the `run_command` tool replaces
+//! `CommandLine` with a call to the automatic wrapper beside this executable, so the
+//! command runs under the guard. Every outcome, denials included, is a JSON decision
+//! on standard output and the exit code is always 0. `antigravity-context` prints the
+//! policy as a SessionStart system message.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Debug)]
 pub enum Json {
@@ -323,7 +330,115 @@ fn policy_text() -> String {
         .unwrap_or_else(|| "POLICY.md not found beside the installed process guard.".into())
 }
 
-/// Run the hook. Returns the process exit code: 0 allows, 2 blocks.
+/// True when every character of `path` is in `[A-Za-z0-9:/._-]`, so the path can
+/// be written without quoting and parse the same in PowerShell, cmd and Git Bash.
+fn plain_path(path: &str) -> bool {
+    path.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'.' | b'_' | b'-'))
+}
+
+/// The longest rewritten `CommandLine` the hook produces, in characters. Wrapping
+/// grows a command by about 4/3 plus the wrapper path, and `cmd.exe` cannot run a
+/// line of more than 8191 characters; the margin leaves room for the host's own
+/// `cmd.exe /d /s /c "` prefix. The hook cannot know which shell the host uses, so
+/// a longer command is denied with an explanation instead of failing with a shell error.
+const MAX_REWRITTEN_LINE: usize = 8000;
+
+/// The command line that runs `command` under the automatic wrapper at `wrapper`.
+pub fn antigravity_wrapped(wrapper: &str, command: &str) -> String {
+    format!("{} --command-b64 {}", wrapper, crate::base64_encode(command.as_bytes()))
+}
+
+/// True when `command` is exactly the wrapper form `<wrapper> --command-b64 BASE64`
+/// with a payload that decodes to a valid command, or a valid guard envelope.
+/// Nothing else counts: trailing text, other separators, another path or a path
+/// in another case are wrapped again.
+pub fn antigravity_guarded(command: &str, wrapper: &str, exe: &str) -> bool {
+    // Shells split on ASCII space, tab and newline only; trimming anything wider
+    // (a no-break space, a vertical tab) would pass a line the wrapper then rejects.
+    let trimmed = command.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    trimmed.strip_prefix(wrapper)
+        .and_then(|r| r.strip_prefix(" --command-b64 "))
+        .map_or(false, |b64| crate::decode_command(b64).is_ok())
+        // valid_envelope trims Unicode whitespace itself; refuse what it would silently strip.
+        || (trimmed.trim().len() == trimmed.len() && valid_envelope(trimmed, exe))
+}
+
+fn antigravity_deny(why: &str) -> String {
+    format!("{{\"decision\":\"deny\",\"reason\":{}}}", quote(&format!(
+        "TIMEOUT_REQUIRED: {} Native tool timeout alone does not guarantee child cleanup.", why)))
+}
+
+/// The one-line JSON decision for a Google Antigravity PreToolUse payload.
+/// `exe` is this executable's path with forward slashes; `wrapper_exists` says
+/// whether `process-guard-auto.exe` is present beside it.
+fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) -> String {
+    let payload = match input.and_then(parse_json) {
+        Some(p) => p,
+        None => return antigravity_deny("the hook payload is missing or is not valid JSON."),
+    };
+    // A payload without a toolCall object that names its tool is not the documented
+    // shape (the schema changed or the hook is miswired); it is denied, not waved through.
+    let call = payload.get("toolCall").filter(|c| matches!(c, Json::Object(_)));
+    match call.and_then(|c| c.get("name")).and_then(Json::as_str) {
+        None => return antigravity_deny("the hook payload has no toolCall object with a string name, so it is not a recognised Antigravity PreToolUse payload."),
+        Some("run_command") => {}
+        Some(_) => return "{\"decision\":\"allow\"}".into(),
+    }
+    // The hook reads the exact key `CommandLine` and rewrites only that key. A host that
+    // matches keys without regard to case, or lets another spelling or a repeated key win,
+    // could run a different command than the one wrapped, so any second candidate is denied.
+    if let Some(Json::Object(pairs)) = call.and_then(|c| c.get("args")) {
+        if pairs.iter().filter(|(k, _)| k.eq_ignore_ascii_case("CommandLine")).count() > 1 {
+            return antigravity_deny("run_command arguments hold ambiguous CommandLine keys (more than one key that is CommandLine in any letter case).");
+        }
+    }
+    let command = match call.and_then(|c| c.get("args")).and_then(|a| a.get("CommandLine")).and_then(Json::as_str) {
+        Some(c) if !c.trim().is_empty() && !c.contains('\0') => c,
+        _ => return antigravity_deny("run_command has no CommandLine, or it is empty or contains NUL."),
+    };
+    let wrapper = match exe.rsplit_once('/') {
+        Some((dir, _)) => format!("{}/process-guard-auto.exe", dir),
+        None => return antigravity_deny("the location of the process guard is unknown."),
+    };
+    if !wrapper_exists {
+        return antigravity_deny(&format!("the automatic wrapper {} is missing beside the process guard.", wrapper));
+    }
+    if !plain_path(&wrapper) {
+        return antigravity_deny("the process guard must be installed in a path with only the characters A-Z, a-z, 0-9, colon, slash, period, underscore and hyphen, so the rewritten command parses the same in every shell.");
+    }
+    if antigravity_guarded(command, &wrapper, exe) {
+        return "{\"decision\":\"allow\"}".into();
+    }
+    let rewritten = antigravity_wrapped(&wrapper, command);
+    if rewritten.len() > MAX_REWRITTEN_LINE {
+        let fixed = antigravity_wrapped(&wrapper, "").len();
+        return antigravity_deny(&format!("the command is too long to run under the guard: wrapping it makes a line of {} characters and the limit is {}, which allows a command of about {} bytes here. Write the long content to a file and run the file.",
+            rewritten.len(), MAX_REWRITTEN_LINE, MAX_REWRITTEN_LINE.saturating_sub(fixed) / 4 * 3));
+    }
+    format!("{{\"decision\":\"allow\",\"reason\":{},\"overwrite\":{{\"CommandLine\":{}}}}}",
+        quote("Command runs under the process guard (automatic deadline and process tree cleanup)."),
+        quote(&rewritten))
+}
+
+/// `hook antigravity`: rewrite a Google Antigravity `run_command` call so the
+/// automatic guard runs it. Every outcome is a JSON decision and the exit code is 0.
+pub fn antigravity(exe: &str) -> i32 {
+    let mut input = String::new();
+    let read = std::io::stdin().take(16 * 1024 * 1024).read_to_string(&mut input).is_ok();
+    let wrapper_exists = exe.rsplit_once('/').map_or(false, |(dir, _)| std::path::Path::new(&format!("{}/process-guard-auto.exe", dir)).is_file());
+    let line = antigravity_decision(exe, if read { Some(&input) } else { None }, wrapper_exists);
+    let _ = writeln!(std::io::stdout(), "{}", line);
+    0
+}
+
+/// `hook antigravity-context`: the policy as a SessionStart system message.
+pub fn antigravity_context() -> i32 {
+    let _ = writeln!(std::io::stdout(), "{{\"injectSteps\":[{{\"systemMessage\":{{\"systemMessage\":{}}}}}]}}", quote(&policy_text()));
+    0
+}
+
+/// Run the hook. Returns the process exit code: 0 allows, 2 blocks (the
+/// `antigravity` vendors always return 0).
 pub fn main(vendor: &str) -> i32 {
     let exe = self_path().unwrap_or_default();
     let policy = exe.rsplit_once("/bin/").map(|(home, _)| format!("{}/POLICY.md", home)).unwrap_or_else(|| "POLICY.md".into());
@@ -332,6 +447,12 @@ pub fn main(vendor: &str) -> i32 {
         Native tool timeout alone does not guarantee child cleanup.", policy);
     if vendor == "powershell-auto" {
         return powershell_auto(&exe);
+    }
+    if vendor == "antigravity" {
+        return antigravity(&exe);
+    }
+    if vendor == "antigravity-context" {
+        return antigravity_context();
     }
     if vendor == "cursor-context" {
         println!("{{\"additional_context\":{}}}", quote(&policy_text()));
@@ -399,6 +520,124 @@ mod tests {
         ] {
             assert!(!valid_envelope(&bad, EXE), "{}", bad);
         }
+    }
+
+    const WRAPPER: &str = "C:/Tools/process-guard/bin/process-guard-auto.exe";
+
+    #[test]
+    fn base64_encoder_round_trips_through_the_decoder() {
+        assert_eq!(crate::base64_encode(b"f"), "Zg==");
+        assert_eq!(crate::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(crate::base64_encode(b"foo"), "Zm9v");
+        assert_eq!(crate::base64_encode(b"foob"), "Zm9vYg==");
+        for text in ["a", "ab", "abc", "abcd", "echo \"q\" 'r' \\ s\nt","echo \u{fc}\u{4e2d}\u{1f600}"] {
+            assert_eq!(crate::decode_command(&crate::base64_encode(text.as_bytes())).ok().as_deref(), Some(text), "{:?}", text);
+        }
+    }
+
+    #[test]
+    fn antigravity_guarded_matches_only_exact_forms() {
+        let good = antigravity_wrapped(WRAPPER, "echo OK");
+        assert_eq!(good, format!("{} --command-b64 ZWNobyBPSw==", WRAPPER));
+        assert!(antigravity_guarded(&good, WRAPPER, EXE));
+        assert!(antigravity_guarded(&format!("  {}\n", good), WRAPPER, EXE));
+        let envelope = format!("{} --timeout 60 --shell powershell --command-b64 ZWNobyBPSw==", EXE);
+        assert!(antigravity_guarded(&envelope, WRAPPER, EXE));
+        for bad in [
+            "echo bad".to_string(),
+            format!("{}; evil", good),
+            format!("{} && evil", good),
+            format!("{} | more", good),
+            format!("{}\nevil", good),
+            format!("echo {}", good),
+            format!("{}  --command-b64 ZWNobyBPSw==", WRAPPER),
+            good.replace(WRAPPER, "c:/tools/process-guard/bin/process-guard-auto.exe"),
+            good.replace(WRAPPER, "C:/Tools/process-guard/bin/other-auto.exe"),
+            good.replace(WRAPPER, &format!("{}.evil", WRAPPER)),
+            good.replace("ZWNobyBPSw==", "ZWNobyBPSw"),
+            good.replace("ZWNobyBPSw==", "////"),
+            good.replace("ZWNobyBPSw==", "IA=="),
+            good.replace("ZWNobyBPSw==", ""),
+            format!("{} --command-b64 ", WRAPPER),
+            format!("{} --shell bash --command-b64 ZWNobyBPSw==", WRAPPER),
+            format!("{}; evil", envelope),
+            // Only ASCII space, tab, CR and LF are separators to a shell.
+            format!("{}\u{a0}", good),
+            format!("\u{a0}{}", good),
+            format!("{}\u{b}", good),
+            format!("{}\u{2028}", good),
+            format!("{}\u{a0}", envelope),
+            format!("\u{b}{}", envelope),
+        ] {
+            assert!(!antigravity_guarded(&bad, WRAPPER, EXE), "{:?}", bad);
+        }
+    }
+
+    fn call(command_json: &str) -> String {
+        format!("{{\"toolCall\":{{\"name\":\"run_command\",\"args\":{{\"CommandLine\":{}}}}},\"stepIdx\":1}}", command_json)
+    }
+
+    fn decide(input: &str) -> Json {
+        parse_json(&antigravity_decision(EXE, Some(input), true)).expect("one JSON object")
+    }
+
+    #[test]
+    fn antigravity_decision_rewrites_allows_and_denies() {
+        // A plain command is rewritten; the original is recoverable from the payload exactly.
+        let original = "echo \"q\" 'r' \\ s\n\u{fc}";
+        let d = decide(&call(&quote(original)));
+        assert_eq!(d.get("decision").and_then(Json::as_str), Some("allow"));
+        let rewritten = d.get("overwrite").and_then(|o| o.get("CommandLine")).and_then(Json::as_str).unwrap();
+        let b64 = rewritten.strip_prefix(&format!("{} --command-b64 ", WRAPPER)).expect("wrapper form");
+        assert_eq!(crate::decode_command(b64).ok().as_deref(), Some(original));
+        assert!(matches!(d.get("overwrite"), Some(Json::Object(pairs)) if pairs.len() == 1));
+        // Fed back, the wrapper form passes unchanged.
+        let again = decide(&call(&quote(rewritten)));
+        assert_eq!(again.get("decision").and_then(Json::as_str), Some("allow"));
+        assert!(again.get("overwrite").is_none());
+        // A tool with another string name is not this hook's business.
+        for input in [r#"{"toolCall":{"name":"view_file","args":{}}}"#, r#"{"toolCall":{"name":"run_command ","args":{}}}"#, r#"{"toolCall":{"name":""}}"#] {
+            let d = decide(input);
+            assert_eq!(d.get("decision").and_then(Json::as_str), Some("allow"), "{}", input);
+            assert!(d.get("overwrite").is_none(), "{}", input);
+        }
+        // Everything that cannot be wrapped safely, or is not a recognised payload, is denied.
+        for input in [
+            "", "not json", "{",
+            "{}", "[]", "null", r#"{"toolCall":null}"#, r#"{"toolCall":[]}"#, r#"{"toolCall":"run_command"}"#,
+            r#"{"toolCall":{"name":7}}"#, r#"{"toolCall":{"name":null}}"#,
+            r#"{"toolCall":{"args":{"CommandLine":"echo a"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{}}}"#,
+            r#"{"toolCall":{"name":"run_command"}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":""}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"  \n"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":7}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"a\u0000b"}}}"#,
+            // A second key that is CommandLine in any case, or a repeated key, is ambiguous.
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi","commandline":"evil"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"COMMANDLINE":"evil","CommandLine":"echo hi"}}}"#,
+            r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"echo hi","CommandLine":"evil"}}}"#,
+        ] {
+            let d = decide(input);
+            assert_eq!(d.get("decision").and_then(Json::as_str), Some("deny"), "{}", input);
+            assert!(d.get("reason").and_then(Json::as_str).map_or(false, |r| r.starts_with("TIMEOUT_REQUIRED")), "{}", input);
+        }
+        let denied = |exe: &str, exists: bool| {
+            parse_json(&antigravity_decision(exe, Some(&call("\"echo hi\"")), exists)).and_then(|d| d.get("decision").and_then(Json::as_str).map(str::to_string))
+        };
+        // The longest command that fits is wrapped; one more group of three bytes is denied with a reason.
+        let room = (MAX_REWRITTEN_LINE - antigravity_wrapped(WRAPPER, "").len()) / 4 * 3;
+        let fits = decide(&call(&quote(&"a".repeat(room))));
+        assert_eq!(fits.get("decision").and_then(Json::as_str), Some("allow"));
+        assert!(fits.get("overwrite").is_some());
+        let over = decide(&call(&quote(&"a".repeat(room + 1))));
+        assert_eq!(over.get("decision").and_then(Json::as_str), Some("deny"));
+        assert!(over.get("overwrite").is_none());
+        assert!(over.get("reason").and_then(Json::as_str).map_or(false, |r| r.contains("too long") && r.contains("file")));
+        assert_eq!(denied(EXE, false).as_deref(), Some("deny"));
+        assert_eq!(denied("C:/Program Files/pg/bin/process-guard.exe", true).as_deref(), Some("deny"));
+        assert_eq!(denied("", true).as_deref(), Some("deny"));
+        assert_eq!(parse_json(&antigravity_decision(EXE, None, true)).and_then(|d| d.get("decision").and_then(Json::as_str).map(str::to_string)).as_deref(), Some("deny"));
     }
 
     #[test]
