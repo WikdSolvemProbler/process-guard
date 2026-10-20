@@ -5,7 +5,8 @@
 //!
 //! One small executable stands in for every child the tests need: sleepers,
 //! exit codes, standard stream relays, argument reporters, markers that record
-//! their process identifier, wide and deep process trees, and bulk output.
+//! their process identifier, wide and deep process trees, bulk output, calls of
+//! the library, and an owner that leaves when told.
 //! The first argument selects the subcommand. A usage error exits with 97.
 //!
 //! Markers are written to a temporary name and renamed into place, so a reader
@@ -240,6 +241,61 @@ fn main() {
             while !marker_present(Path::new(&rest[1])) {
                 if begun.elapsed().as_secs_f64() > limit {
                     eprintln!("testkit: no marker at {}", rest[1]);
+                    exit(WAIT_TIMEOUT_EXIT);
+                }
+                sleep(Duration::from_millis(20));
+            }
+        }
+        "lib-run" => {
+            // The library call `run`, made after DELAY seconds, so the caller can decide
+            // whether this process's parent is still there; the outcome is published.
+            need_at_least(rest, 4, "lib-run RESULT SECONDS DELAY PROGRAM [ARGS...]");
+            let (limit, delay) = (seconds(&rest[1]), seconds(&rest[2]));
+            pause(delay);
+            let outcome = match process_tree_guard::run(&rest[3..], limit) {
+                Ok(code) => format!("ok {}", code),
+                Err(error) => format!("error {}", error),
+            };
+            publish(Path::new(&rest[0]), &outcome);
+        }
+        "lib-shell" => {
+            // The library call `run_shell`, made at once; the outcome is published.
+            need(rest, 4, "lib-shell RESULT SHELL SECONDS BASE64");
+            let shell = process_tree_guard::Shell::from_name(&rest[1]).unwrap_or_else(|| usage(&format!("not a shell: {}", rest[1])));
+            let outcome = match process_tree_guard::run_shell(shell, &rest[3], seconds(&rest[2])) {
+                Ok(code) => format!("ok {}", code),
+                Err(error) => format!("error {}", error),
+            };
+            publish(Path::new(&rest[0]), &outcome);
+        }
+        "lib-auto" => {
+            // The library call `run_auto` with the remaining arguments; the outcome is published.
+            need_at_least(rest, 2, "lib-auto RESULT ARGS...");
+            let outcome = match process_tree_guard::run_auto(&rest[1..]) {
+                Ok(code) => format!("ok {}", code),
+                Err(error) => format!("error {}", error),
+            };
+            publish(Path::new(&rest[0]), &outcome);
+        }
+        "lib-hook" => {
+            // The library call `run_hook` for VENDOR, with this process's standard input
+            // and output; the exit code it returns is published.
+            need(rest, 2, "lib-hook RESULT VENDOR");
+            let code = process_tree_guard::run_hook(&rest[1]);
+            publish(Path::new(&rest[0]), &format!("hook {}", code));
+        }
+        "own-guard" => {
+            // Start PROGRAM, publish its process identifier, and leave only once GO exists,
+            // so the caller can open the program before its owner exits.
+            need_at_least(rest, 4, "own-guard PIDFILE GO MAXSECONDS PROGRAM [ARGS...]");
+            let limit = seconds(&rest[2]);
+            let args: Vec<&str> = rest[4..].iter().map(String::as_str).collect();
+            let child = start(OsStr::new(&rest[3]), &args, 0, true);
+            publish(Path::new(&rest[0]), &child.id().to_string());
+            let begun = Instant::now();
+            while !Path::new(&rest[1]).exists() {
+                if begun.elapsed().as_secs_f64() > limit {
+                    eprintln!("testkit: no go signal at {}", rest[1]);
                     exit(WAIT_TIMEOUT_EXIT);
                 }
                 sleep(Duration::from_millis(20));

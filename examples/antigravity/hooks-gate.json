@@ -1,0 +1,24 @@
+{
+  "process-tree-guard": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Tools/process-tree-guard/libexec/process-tree-guard-gate.exe antigravity",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "process-tree-guard-policy": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "C:/Tools/process-tree-guard/libexec/process-tree-guard-gate.exe antigravity-context"
+      }
+    ]
+  }
+}

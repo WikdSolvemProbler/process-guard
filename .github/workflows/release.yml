@@ -14,6 +14,8 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       PROCESS_TREE_GUARD_TIMING: info
+      # The version resources are linked only for the MSVC target, so a run that did not link them fails.
+      PROCESS_TREE_GUARD_REQUIRE_RESOURCES: '1'
     steps:
       - uses: actions/checkout@v5
       - name: Test
@@ -22,14 +24,55 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp target/release/process-tree-guard.exe LICENSE NOTICE README.md POLICY.md dist/
-          cd dist && sha256sum process-tree-guard.exe > SHA256SUMS && cat SHA256SUMS
+          cp target/release/process-tree-guard.exe target/release/process-tree-guard-deadline.exe target/release/process-tree-guard-gate.exe dist/
+          cp LICENSE NOTICE README.md POLICY.md dist/
+          # The 1.x name is kept through all of 2.x as an alias asset: the same program, copied here
+          # from the program built in this run, never from a file in the build folder.
+          cp target/release/process-tree-guard.exe dist/process-guard.exe
+          cd dist && sha256sum process-tree-guard.exe process-tree-guard-deadline.exe process-tree-guard-gate.exe process-guard.exe > SHA256SUMS && cat SHA256SUMS
       - name: Check the release assets
         shell: bash
         run: |
-          # The release holds one executable and its documentation; the test helper must not be attached.
-          if ls dist | grep -i testkit; then echo "the test helper is in the release assets"; exit 1; fi
-          test -f dist/process-tree-guard.exe
+          # The release holds exactly these files, so nothing else (the test helper least of all) is attached.
+          expected="LICENSE
+          NOTICE
+          POLICY.md
+          README.md
+          SHA256SUMS
+          process-guard.exe
+          process-tree-guard-deadline.exe
+          process-tree-guard-gate.exe
+          process-tree-guard.exe"
+          expected=$(printf '%s\n' "$expected" | sed 's/^ *//' | LC_ALL=C sort)
+          found=$(ls -A dist | LC_ALL=C sort)
+          if [ "$found" != "$expected" ]; then
+            echo "the release assets are not the allow-listed files"
+            echo "expected:"; echo "$expected"
+            echo "found:"; echo "$found"
+            exit 1
+          fi
+          # The alias asset is the same program as the new name, and every executable is listed in SHA256SUMS.
+          cmp dist/process-guard.exe dist/process-tree-guard.exe
+          cd dist && sha256sum --check SHA256SUMS && test "$(wc -l < SHA256SUMS)" -eq 4
+      - name: Check the version resources of the release programs
+        shell: pwsh
+        run: |
+          # Each program in the release shows its own description; the 1.x alias asset is a copy of the full command.
+          $expected = [ordered]@{
+            'process-tree-guard.exe' = 'Process Tree Guard'
+            'process-tree-guard-deadline.exe' = 'Process Tree Guard: Deadline'
+            'process-tree-guard-gate.exe' = 'Process Tree Guard: Gate'
+            'process-guard.exe' = 'Process Tree Guard'
+          }
+          $failed = $false
+          foreach ($name in $expected.Keys) {
+            $info = (Get-Item "dist/$name").VersionInfo
+            "{0}: description '{1}', product '{2}', version '{3}', original name '{4}'" -f $name, $info.FileDescription, $info.ProductName, $info.FileVersion, $info.OriginalFilename
+            if ($info.FileDescription -ne $expected[$name] -or $info.ProductName -ne 'Process Tree Guard' -or [string]::IsNullOrEmpty($info.FileVersion)) {
+              $failed = $true
+            }
+          }
+          if ($failed) { throw 'a release program does not carry its version resource' }
       - name: Publish
         shell: bash
         env:

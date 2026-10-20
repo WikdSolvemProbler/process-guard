@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A32):
+//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A39):
 //! `hook antigravity` rewrites a `run_command` call so the automatic wrapper runs
 //! it, and `hook antigravity-context` prints the policy as a SessionStart message.
-//! Git Bash, Windows PowerShell and cmd are required. The parity table is in
-//! tests/PARITY.md.
+//! The last group runs the hook role (`process-tree-guard-gate`) in both install
+//! layouts, and checks that files are found beside the program and never through
+//! `PATH` or the current folder. Git Bash, Windows PowerShell and cmd are
+//! required. The parity table is in tests/PARITY.md.
 //!
 //! The hook names the automatic wrapper beside the guard it runs from (the one of
 //! the guard's own name, `process-tree-guard` or its 1.x alias `process-guard`), so every
@@ -768,5 +770,311 @@ fn a31_session_context_under_both_names() {
         checks.check("A31", &format!("{}: the policy is the session system message", name),
             out.code == 0 && message.as_deref() == Some(policy), format!("exit {} {}", out.code, out.out()));
     }
+    checks.finish();
+}
+
+// ------------------------------- the hook role and the layouts (A33 to A38)
+
+/// A private tree in a path the hook accepts.
+fn plain_tree(layout: Layout, prefix: &str) -> Tree {
+    Tree::new_in(&plain_base(), layout, prefix)
+}
+
+/// The hook role run as `gate VENDOR`, which equals `process-tree-guard hook VENDOR`.
+fn run_gate(gate: &str, vendor: &str, body: &[u8]) -> Out {
+    let mut command = Command::new(gate);
+    command.arg(vendor);
+    exec_with(command, Opts { input: Some(body.to_vec()), limit_secs: 60, ..Opts::default() })
+}
+
+/// The decision of `gate` for the original command line `original`.
+fn gate_decision(gate: &str, original: &str) -> (Out, Json) {
+    let out = run_gate(gate, "antigravity", call(&json_quote(original)).as_bytes());
+    let parsed = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+    (out, parsed)
+}
+
+/// True when the run exited 0 and printed one JSON object on one line.
+fn one_object(out: &Out) -> bool {
+    out.code == 0 && out.out().ends_with('\n') && !out.out()[..out.out().len() - 1].contains('\n') && matches!(Json::parse(out.out().trim()), Some(Json::Obj(_)))
+}
+
+/// The folder part of a path written with forward slashes.
+fn folder_of(path: &str) -> String {
+    path.rsplit_once('/').map(|(dir, _)| dir.to_string()).expect("a path with a folder")
+}
+
+#[test]
+fn a33_gate_rewrites_to_the_deadline_wrapper_in_its_own_folder() {
+    let mut checks = Checks::new("gate rewrite");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agg-");
+        let gate = tree.exe(ROLES[2]);
+        let wrapper = posix(&tree.exe("process-tree-guard-deadline-auto"));
+        let mut exact = true;
+        let mut shaped = true;
+        let mut detail = String::new();
+        for command in ["echo hi", "echo \"q\" 'r' \\ s", "line one\nline two\n", "  padded with spaces  ", "echo \u{fc}\u{4e2d}\u{1f600}", "dir C:\\Users\\Public & echo $HOME `x`"] {
+            let (out, d) = gate_decision(&gate, command);
+            let line = command_line(&d).unwrap_or("");
+            let keys: Vec<&str> = match &d {
+                Json::Obj(pairs) => pairs.iter().map(|(k, _)| k.as_str()).collect(),
+                _ => vec![],
+            };
+            if decision(&d) != Some("allow") || line != format!("{} --command-b64 {}", wrapper, base64(command.as_bytes())) || decoded_payload(line, &wrapper).as_deref() != Some(command) {
+                exact = false;
+                detail = format!("{:?} -> {}", command, line);
+            }
+            shaped &= one_object(&out) && keys == ["decision", "reason", "overwrite"];
+        }
+        checks.check("A33", &format!("gate in the {}: the rewrite names process-tree-guard-deadline-auto.exe in its own folder and decodes exactly", layout.name()), exact, detail);
+        checks.check("A33", &format!("gate in the {}: the answer is allow with a reason and an overwrite, exit 0, one JSON object", layout.name()), shaped, "");
+
+        // The full command in the same tree names the automatic copy of its own name, in its own folder.
+        let full = tree.exe(ROLES[0]);
+        let out = run_hook(&full, "antigravity", call("\"echo hi\"").as_bytes());
+        let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+        let own = format!("{} --command-b64 {}", posix(&tree.exe("process-tree-guard-auto")), base64(b"echo hi"));
+        checks.check("A33", &format!("the full command in the {}: the rewrite names process-tree-guard-auto.exe in its own folder", layout.name()), command_line(&d) == Some(own.as_str()), command_line(&d).unwrap_or(""));
+    }
+    checks.finish();
+}
+
+#[test]
+fn a34_gate_pass_through_and_near_misses() {
+    let mut checks = Checks::new("gate pass-through");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agp-");
+        let gate = tree.exe(ROLES[2]);
+        let wrapper = posix(&tree.exe("process-tree-guard-deadline-auto"));
+        let folder = folder_of(&wrapper);
+        let b64 = base64(b"echo OK");
+        let wrapped = |path: &str| format!("{} --command-b64 {}", path, b64);
+        let deadline = posix(&tree.exe(ROLES[1]));
+        let front = posix(&tree.exe(ROLES[0]));
+        let mut passes = true;
+        let mut detail = String::new();
+        for line in [
+            wrapped(&wrapper),
+            format!("  {}\n", wrapped(&wrapper)),
+            wrapped(&format!("{}/process-tree-guard-auto.exe", folder)),
+            wrapped(&format!("{}/process-guard-auto.exe", folder)),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}", deadline, b64),
+            format!("& {} --timeout 0.5 --shell bash --command-b64 {}", front, b64),
+            format!("{} --timeout 86400 --shell cmd --command-b64 {}", posix(&text(&tree.bin.join("process-guard.exe"))), b64),
+        ] {
+            let (_, d) = gate_decision(&gate, &line);
+            if decision(&d) != Some("allow") || d.get("overwrite").is_some() {
+                passes = false;
+                detail = line;
+            }
+        }
+        checks.check("A34", &format!("gate in the {}: its wrapper, the full command's wrappers beside it and envelopes of the enforcing programs pass through unchanged", layout.name()), passes, detail);
+
+        let mut near = vec![
+            wrapped(&wrapper.to_uppercase()),
+            wrapped(&wrapper.replace("/libexec/", "/libexec2/").replace("/bin/", "/bin2/")),
+            format!("{}.evil --command-b64 {}", wrapper, b64),
+            format!("{}; evil", wrapped(&wrapper)),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}", posix(&gate), b64),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}; evil", deadline, b64),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}", deadline.to_uppercase(), b64),
+        ];
+        if layout == Layout::Install {
+            // In the install layout the full command's wrapper is in bin, not beside the gate.
+            near.push(wrapped(&posix(&tree.exe("process-tree-guard-auto"))));
+        }
+        let mut rewrapped = true;
+        let mut detail = String::new();
+        for line in &near {
+            let (_, d) = gate_decision(&gate, line);
+            if decision(&d) != Some("allow") || command_line(&d) != Some(wrapped_line(&wrapper, line).as_str()) {
+                rewrapped = false;
+                detail = line.clone();
+            }
+        }
+        checks.check("A34", &format!("gate in the {}: near misses, the gate itself and a wrapper not beside it are wrapped again, whole", layout.name()), rewrapped, detail);
+    }
+    checks.finish();
+}
+
+/// The line the hook produces for `original` with the wrapper at `wrapper`.
+fn wrapped_line(wrapper: &str, original: &str) -> String {
+    format!("{} --command-b64 {}", wrapper, base64(original.as_bytes()))
+}
+
+#[test]
+fn a35_gate_without_its_wrapper_is_denied_by_that_name() {
+    let mut checks = Checks::new("gate missing wrapper");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agm-");
+        let gate = tree.exe(ROLES[2]);
+        // The full command's automatic copy is present (beside the gate too in the flat layout); it does not stand in.
+        tree.remove("process-tree-guard-deadline-auto");
+        let (out, d) = gate_decision(&gate, "echo hi");
+        let (_, other) = gate_decision(&gate, "{\"x\":1}");
+        let view = run_gate(&gate, "antigravity", br#"{"toolCall":{"name":"view_file"}}"#);
+        let view = Json::parse(view.out().trim()).unwrap_or(Json::Null);
+        checks.check("A35", &format!("gate in the {}: without process-tree-guard-deadline-auto.exe the call is denied by that name", layout.name()),
+            one_object(&out) && decision(&d) == Some("deny") && reason(&d).contains("process-tree-guard-deadline-auto.exe") && d.get("overwrite").is_none()
+                && decision(&other) == Some("deny") && decision(&view) == Some("allow"),
+            reason(&d));
+    }
+    checks.finish();
+}
+
+#[test]
+fn a36_files_are_found_beside_the_program_and_never_through_path_or_the_current_folder() {
+    let mut checks = Checks::new("decoys");
+    // A folder with every file the hooks look for, set up as the one a planted file would come from.
+    let decoy = TempDir::new("agd-");
+    for name in ["process-tree-guard-auto", "process-tree-guard-deadline-auto", "process-guard-auto"] {
+        copy_guard(decoy.path(), name);
+    }
+    std::fs::write(decoy.join("POLICY.md"), "DECOY POLICY").expect("write the decoy policy");
+    let search_path = format!("{};{}", decoy.text(), std::env::var("PATH").unwrap_or_default());
+    // Runs a program with the decoy folder first on PATH and as the current folder.
+    let run = |exe: &str, args: &[&str], body: &[u8]| {
+        let mut command = Command::new(exe);
+        command.args(args).env("PATH", &search_path).current_dir(decoy.path());
+        exec_with(command, Opts { input: Some(body.to_vec()), limit_secs: 60, ..Opts::default() })
+    };
+    let programs = [(ROLES[0], "process-tree-guard-auto", vec!["hook"]), (ROLES[2], "process-tree-guard-deadline-auto", vec![])];
+    for layout in LAYOUTS {
+        for (name, own_wrapper, prefix) in &programs {
+            let label = format!("{} in the {}", name, layout.name());
+            let vendor_args = |vendor: &'static str| -> Vec<&'static str> { let mut args = prefix.clone(); args.push(vendor); args };
+
+            // The wrapper beside the program is missing: the decoy copies on PATH and in the current folder are not used.
+            let tree = plain_tree(layout, "agd-");
+            tree.remove(own_wrapper);
+            let out = run(&tree.exe(name), &vendor_args("antigravity"), call("\"echo hi\"").as_bytes());
+            let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+            checks.check("A36", &format!("{}: a missing wrapper is denied; the copies on PATH and in the current folder are not used", label),
+                one_object(&out) && decision(&d) == Some("deny") && reason(&d).contains("missing") && d.get("overwrite").is_none() && !out.out().contains(&posix(&decoy.text())),
+                out.out());
+
+            // The wrapper is present beside the program: the rewrite names that one.
+            let tree = plain_tree(layout, "agd-");
+            let out = run(&tree.exe(name), &vendor_args("antigravity"), call("\"echo hi\"").as_bytes());
+            let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+            let expected = wrapped_line(&posix(&tree.exe(own_wrapper)), "echo hi");
+            checks.check("A36", &format!("{}: the rewrite names the wrapper beside the program, not the decoy", label),
+                one_object(&out) && command_line(&d) == Some(expected.as_str()), out.out());
+
+            // POLICY.md is looked for one folder above the program only; the decoy is not read.
+            let mut seen = true;
+            let mut detail = String::new();
+            for vendor in ["antigravity-context", "cursor-context"] {
+                let out = run(&tree.exe(name), &vendor_args(vendor), b"");
+                let message = Json::parse(out.out().trim()).and_then(|j| {
+                    j.get("additional_context").and_then(Json::as_str).map(str::to_string).or_else(|| match j.get("injectSteps") {
+                        Some(Json::Arr(steps)) if steps.len() == 1 => steps[0].get("systemMessage").and_then(|m| m.get("systemMessage")).and_then(Json::as_str).map(str::to_string),
+                        _ => None,
+                    })
+                });
+                if out.code != 0 || !message.as_deref().map_or(false, |m| m.contains("POLICY.md not found") && !m.contains("DECOY")) {
+                    seen = false;
+                    detail = format!("{} {:?}", vendor, out.out());
+                }
+            }
+            checks.check("A36", &format!("{}: the policy is not read from PATH or the current folder", label), seen, detail);
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn a37_gate_end_to_end_in_both_layouts() {
+    let mut checks = Checks::new("gate end to end");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "age-");
+        let gate = tree.exe(ROLES[2]);
+        let rewrite_with_gate = |original: &str| {
+            let (_, d) = gate_decision(&gate, original);
+            command_line(&d).unwrap_or_else(|| panic!("no overwrite for {:?}", original)).to_string()
+        };
+
+        // The rewritten line keeps its output and exit code in all three shells.
+        let ps = powershell(&rewrite_with_gate("Write-Output (6*7)\nexit 9"), &[]);
+        let sh = bash(&rewrite_with_gate("echo $((6*7)); exit 9"), &[]);
+        let cm = cmd(&rewrite_with_gate("echo 42 & exit /b 9"), &[]);
+        checks.check("A37", &format!("gate in the {}: output and exit code survive in PowerShell, Git Bash and cmd", layout.name()),
+            [&ps, &sh, &cm].iter().all(|o| o.code == 9 && o.out().contains("42")),
+            format!("ps {} {:?} bash {} {:?} cmd {} {:?}", ps.code, ps.err(), sh.code, sh.err(), cm.code, cm.err()));
+
+        // Each deadline variable ends a sleeping command with 124.
+        let line = rewrite_with_gate("sleep 30");
+        for variable in AUTO_TIMEOUT_VARIABLES {
+            let out = bash(&line, &[(variable, "0.5")]);
+            checks.check("A37", &format!("gate in the {}: {} ends a sleeping command with 124", layout.name(), variable), out.code == 124, format!("exit {} {}", out.code, out.err()));
+            bounded(&mut checks, "A37", &out);
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn a38_gate_session_context_is_the_policy_one_folder_above() {
+    let mut checks = Checks::new("gate session context");
+    let policy = "# Policy\nTwo layouts {{BIN}}\n";
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agc-");
+        let gate = tree.exe(ROLES[2]);
+        let message_of = |out: &Out| {
+            Json::parse(out.out().trim())
+                .and_then(|j| match j.get("injectSteps") { Some(Json::Arr(steps)) if steps.len() == 1 => steps[0].get("systemMessage").and_then(|m| m.get("systemMessage")).and_then(Json::as_str).map(str::to_string), _ => None })
+        };
+        let missing = run_gate(&gate, "antigravity-context", b"");
+        checks.check("A38", &format!("gate in the {}: without POLICY.md the output is still valid JSON and exit 0", layout.name()),
+            missing.code == 0 && message_of(&missing).map_or(false, |m| m.contains("POLICY.md not found")), missing.out());
+        std::fs::write(tree.root.join("POLICY.md"), policy).expect("write the policy");
+        let out = run_gate(&gate, "antigravity-context", b"");
+        checks.check("A38", &format!("gate in the {}: the policy in the root is the session system message, verbatim", layout.name()),
+            out.code == 0 && message_of(&out).as_deref() == Some(policy), format!("exit {} {}", out.code, out.out()));
+    }
+    checks.finish();
+}
+
+// ------------------------ the role decides the rules, not the file name (A39)
+
+#[test]
+fn a39_the_rules_follow_the_role_under_the_other_programs_file_names() {
+    let mut checks = Checks::new("renamed programs");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agr-");
+        let wrapper = posix(&tree.exe("process-tree-guard-deadline-auto"));
+        // The hook role under two other file names, one of them a name of the full command.
+        for renamed in ["hookgate", "process-guard"] {
+            let copy = posix(&copy_role(&tree.libexec, ROLES[2], renamed));
+            let label = format!("the hook role as {}.exe in the {}", renamed, layout.name());
+            let (out, d) = gate_decision(&copy, "echo hi");
+            checks.check("A39", &format!("{}: the rewrite names process-tree-guard-deadline-auto.exe in its own folder", label),
+                one_object(&out) && command_line(&d) == Some(wrapped_line(&wrapper, "echo hi").as_str()), out.out());
+            let (_, passed) = gate_decision(&copy, &wrapped_line(&wrapper, "echo hi"));
+            let (_, itself) = gate_decision(&copy, &format!("{} --timeout 60 --shell cmd --command-b64 {}", copy, base64(b"echo hi")));
+            let (_, deadline) = gate_decision(&copy, &format!("{} --timeout 60 --shell cmd --command-b64 {}", posix(&tree.exe(ROLES[1])), base64(b"echo hi")));
+            checks.check("A39", &format!("{}: its wrapper and an envelope of the deadline role pass through; an envelope that names itself is wrapped again", label),
+                decision(&passed) == Some("allow") && passed.get("overwrite").is_none()
+                    && decision(&deadline) == Some("allow") && deadline.get("overwrite").is_none()
+                    && decision(&itself) == Some("allow") && itself.get("overwrite").is_some(),
+                format!("{:?} {:?} {:?}", command_line(&passed), command_line(&deadline), command_line(&itself)));
+        }
+    }
+
+    // The full command under the hook role's file name keeps the rules of an unknown name: the 1.x wrapper alone.
+    let install = plain_tree(Layout::Install, "agr-");
+    let dir = install.bin.clone();
+    let exe = posix(&copy_role(&dir, ROLES[0], ROLES[2]));
+    let legacy = posix(&text(&dir.join("process-guard-auto.exe")));
+    let run = |body: &[u8]| run_hook(&exe, "antigravity", body);
+    let missing = Json::parse(run(call("\"echo hi\"").as_bytes()).out().trim()).unwrap_or(Json::Null);
+    checks.check("A39", "the full command as process-tree-guard-gate.exe: without process-guard-auto.exe the call is denied by that name",
+        decision(&missing) == Some("deny") && reason(&missing).contains("process-guard-auto.exe") && !reason(&missing).contains("deadline"), reason(&missing));
+    copy_guard(&dir, "process-guard-auto");
+    let out = run(call("\"echo hi\"").as_bytes());
+    let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+    checks.check("A39", "the full command as process-tree-guard-gate.exe: the rewrite names process-guard-auto.exe",
+        one_object(&out) && command_line(&d) == Some(wrapped_line(&legacy, "echo hi").as_str()), out.out());
     checks.finish();
 }

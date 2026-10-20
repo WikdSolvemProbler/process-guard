@@ -7,7 +7,9 @@
 //! (JSON) on standard input and allows the command only when it is exactly the
 //! guard envelope:
 //!
-//!     <this executable> --timeout SECONDS --shell powershell|bash|cmd --command-b64 BASE64
+//! ```text
+//! <this executable> --timeout SECONDS --shell powershell|bash|cmd --command-b64 BASE64
+//! ```
 //!
 //! with forward slashes in the executable path, an optional leading `& `, a
 //! timeout above zero and at most 86400, and a payload that decodes to nonempty
@@ -19,6 +21,17 @@
 //! name, the envelope may name either name in the same folder, and the automatic
 //! wrapper is the one of the executable's own name.
 //!
+//! The hook role, `process-tree-guard-gate`, runs the same modes. It never runs a
+//! command itself, so an envelope never names it: the envelope names a program
+//! that enforces the deadline (`process-tree-guard`, `process-guard` or
+//! `process-tree-guard-deadline`) in the gate's own folder or, when the gate is
+//! in a folder named `libexec` (in any letter case), in the `bin` folder beside it. Its automatic
+//! wrapper is `process-tree-guard-deadline-auto` in its own folder. Every path is
+//! built from the gate's own location and never from `PATH`. The rules follow the
+//! program, not its file name: the hook role keeps them under any file name, and
+//! never accepts its own path whatever it is called, while the full command keeps
+//! the rules of its name even when it is called `process-tree-guard-gate`.
+//!
 //! Formats: `pretooluse` reads `tool_input.command` (or `tool_input.cmd`) and
 //! answers in the PreToolUse format; `cursor` reads `command` and answers in the
 //! beforeShellExecution format; `cursor-context` prints the policy as session context.
@@ -29,7 +42,12 @@
 //! wrapper of its own name), so the command runs under the guard. Every outcome, denials included, is a JSON decision
 //! on standard output and the exit code is always 0. `antigravity-context` prints the
 //! policy as a SessionStart system message.
+//!
+//! `powershell-auto` also rewrites: it reads a PreToolUse payload for a PowerShell
+//! tool and replaces `tool_input.command` with a call to the automatic wrapper, so
+//! the command runs under the guard.
 
+use crate::Role;
 use std::io::{Read, Write};
 
 #[derive(Debug)]
@@ -206,11 +224,41 @@ fn family(exe: &str) -> Option<(&str, usize)> {
     NAMES.iter().position(|name| *name == stem).map(|index| (dir, index))
 }
 
+/// The deadline role, which the hook role vouches for.
+const DEADLINE: &str = "process-tree-guard-deadline";
+
+/// The paths a guard envelope may name when the hook runs as the hook role in
+/// `dir`: the programs that enforce a deadline, in `dir` and, in the install
+/// layout (the last folder of `dir` is named `libexec`, in any letter case, as
+/// Windows folder names are not case sensitive), in the `bin` folder beside it, with
+/// the rest of the path as it is spelled. The hook role itself is never among them,
+/// whatever its file name (`exe`), because it would not run the command.
+fn gate_envelope_paths(exe: &str, dir: &str) -> Vec<String> {
+    let mut folders = vec![dir.to_string()];
+    if let Some((root, last)) = dir.rsplit_once('/') {
+        if last.eq_ignore_ascii_case("libexec") {
+            folders.push(format!("{}/bin", root));
+        }
+    }
+    let mut paths = Vec::new();
+    for folder in &folders {
+        for name in [NAMES[0], NAMES[1], DEADLINE] {
+            paths.push(format!("{}/{}.exe", folder, name));
+        }
+    }
+    // Windows paths are not case sensitive, and `exe` keeps the case it was started with.
+    paths.retain(|path| !path.eq_ignore_ascii_case(exe));
+    paths
+}
+
 /// The paths a guard envelope may name when this executable is `exe`: `exe` itself
 /// and, when it is installed under one of the two names, the other name in the
-/// same folder. The other file need not exist; a command that names a missing
-/// program only fails to run.
-fn envelope_paths(exe: &str) -> Vec<String> {
+/// same folder; for the hook role, see `gate_envelope_paths`. The other file need
+/// not exist; a command that names a missing program only fails to run.
+fn envelope_paths(exe: &str, role: Role) -> Vec<String> {
+    if role == Role::Gate {
+        return exe.rsplit_once('/').map_or_else(Vec::new, |(dir, _)| gate_envelope_paths(exe, dir));
+    }
     let mut paths = vec![exe.to_string()];
     if let Some((dir, own)) = family(exe) {
         paths.push(format!("{}/{}.exe", dir, NAMES[1 - own]));
@@ -220,10 +268,15 @@ fn envelope_paths(exe: &str) -> Vec<String> {
 
 /// The automatic wrapper paths beside `exe`: the wrapper of its own name first,
 /// then the other name's. An executable under any other name keeps the 1.x
-/// behaviour: only `process-guard-auto.exe`. None when `exe` has no folder.
-pub fn wrapper_paths(exe: &str) -> Option<Vec<String>> {
+/// behaviour: only `process-guard-auto.exe`. The hook role's own wrapper is
+/// `process-tree-guard-deadline-auto.exe` in its folder, then the two names'
+/// wrappers there. None when `exe` has no folder.
+pub fn wrapper_paths(exe: &str, role: Role) -> Option<Vec<String>> {
     let (dir, _) = exe.rsplit_once('/')?;
     let auto = |name: &str| format!("{}/{}-auto.exe", dir, name);
+    if role == Role::Gate {
+        return Some(vec![auto(DEADLINE), auto(NAMES[0]), auto(NAMES[1])]);
+    }
     Some(match family(exe) {
         Some((_, own)) => vec![auto(NAMES[own]), auto(NAMES[1 - own])],
         None => vec![auto(NAMES[1])],
@@ -232,14 +285,14 @@ pub fn wrapper_paths(exe: &str) -> Option<Vec<String>> {
 
 /// The PowerShell command line that runs `command` under the automatic guard.
 pub fn powershell_wrapped(auto_exe: &str, command: &str) -> String {
-    let utf8 = crate::base64_encode(command.as_bytes());
+    let utf8 = crate::base64::base64_encode(command.as_bytes());
     format!("& '{}' --shell powershell --command-b64 {}; exit $LASTEXITCODE", auto_exe.replace('\'', "''"), utf8)
 }
 
 /// `hook powershell-auto`: rewrite a PowerShell tool call so the automatic
 /// guard runs it. A command that already starts with a guard path is left as is.
-pub fn powershell_auto(exe: &str) -> i32 {
-    let wrappers = match wrapper_paths(exe) {
+pub fn powershell_auto(exe: &str, role: Role) -> i32 {
+    let wrappers = match wrapper_paths(exe, role) {
         Some(paths) => paths,
         None => return 0,
     };
@@ -261,8 +314,8 @@ pub fn powershell_auto(exe: &str) -> i32 {
     let wrapped_already = |wrapper: &String| command.trim()
         .strip_prefix(&format!("& '{}' --shell powershell --command-b64 ", wrapper.replace('\'', "''")))
         .and_then(|r| r.strip_suffix("; exit $LASTEXITCODE"))
-        .map_or(false, |b64| crate::decode_command(b64).is_ok());
-    let already = valid_envelope(&command, exe) || wrappers.iter().any(wrapped_already);
+        .map_or(false, |b64| crate::base64::decode_command(b64).is_ok());
+    let already = valid_envelope(&command, exe, role) || wrappers.iter().any(wrapped_already);
     if already {
         println!("{{}}");
         return 0;
@@ -330,8 +383,8 @@ pub fn self_path() -> Option<String> {
 
 /// True when `command` is exactly the guard envelope for executable `exe`, or for
 /// the same executable under its other name (see `envelope_paths`).
-pub fn valid_envelope(command: &str, exe: &str) -> bool {
-    envelope_paths(exe).iter().any(|path| envelope_for(command, path))
+pub fn valid_envelope(command: &str, exe: &str, role: Role) -> bool {
+    envelope_paths(exe, role).iter().any(|path| envelope_for(command, path))
 }
 
 /// True when `command` is exactly the guard envelope naming the executable `exe`.
@@ -371,13 +424,21 @@ fn envelope_for(command: &str, exe: &str) -> bool {
     if payload.len() - body.len() > 2 || body.is_empty() || !body.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/') {
         return false;
     }
-    crate::decode_command(payload).is_ok()
+    crate::base64::decode_command(payload).is_ok()
 }
 
+/// The policy file of the executable at `exe`: `POLICY.md` in the folder above the
+/// executable's own folder, whatever those folders are called.
+fn policy_path(exe: &str) -> Option<String> {
+    let (dir, _) = exe.rsplit_once('/')?;
+    let (root, _) = dir.rsplit_once('/')?;
+    Some(format!("{}/POLICY.md", root))
+}
+
+/// The text of the policy file found relative to this executable alone.
 fn policy_text() -> String {
-    std::env::current_exe().ok()
-        .and_then(|p| p.parent().and_then(|bin| bin.parent()).map(|home| home.join("POLICY.md")))
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    self_path().as_deref().and_then(policy_path)
+        .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_else(|| "POLICY.md not found beside the installed process guard.".into())
 }
 
@@ -396,7 +457,7 @@ const MAX_REWRITTEN_LINE: usize = 8000;
 
 /// The command line that runs `command` under the automatic wrapper at `wrapper`.
 pub fn antigravity_wrapped(wrapper: &str, command: &str) -> String {
-    format!("{} --command-b64 {}", wrapper, crate::base64_encode(command.as_bytes()))
+    format!("{} --command-b64 {}", wrapper, crate::base64::base64_encode(command.as_bytes()))
 }
 
 /// True when `command` is exactly the wrapper form `<wrapper> --command-b64 BASE64`
@@ -404,17 +465,17 @@ pub fn antigravity_wrapped(wrapper: &str, command: &str) -> String {
 /// wrapper is either name's automatic copy beside `exe`, and the envelope names
 /// either name of the executable. Nothing else counts: trailing text, other
 /// separators, another path or a path in another case are wrapped again.
-pub fn antigravity_guarded(command: &str, exe: &str) -> bool {
+pub fn antigravity_guarded(command: &str, exe: &str, role: Role) -> bool {
     // Shells split on ASCII space, tab and newline only; trimming anything wider
     // (a no-break space, a vertical tab) would pass a line the wrapper then rejects.
     let trimmed = command.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-    wrapper_paths(exe).unwrap_or_default().iter().any(|wrapper| {
+    wrapper_paths(exe, role).unwrap_or_default().iter().any(|wrapper| {
         trimmed.strip_prefix(wrapper.as_str())
             .and_then(|r| r.strip_prefix(" --command-b64 "))
-            .map_or(false, |b64| crate::decode_command(b64).is_ok())
+            .map_or(false, |b64| crate::base64::decode_command(b64).is_ok())
     })
         // valid_envelope trims Unicode whitespace itself; refuse what it would silently strip.
-        || (trimmed.trim().len() == trimmed.len() && valid_envelope(trimmed, exe))
+        || (trimmed.trim().len() == trimmed.len() && valid_envelope(trimmed, exe, role))
 }
 
 fn antigravity_deny(why: &str) -> String {
@@ -434,7 +495,7 @@ fn ambiguous(obj: &Json, key: &str) -> bool {
 /// The one-line JSON decision for a Google Antigravity PreToolUse payload.
 /// `exe` is this executable's path with forward slashes; `wrapper_exists` says
 /// whether the automatic wrapper of its own name is present beside it.
-fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) -> String {
+fn antigravity_decision(exe: &str, role: Role, input: Option<&str>, wrapper_exists: bool) -> String {
     let payload = match input.and_then(parse_json) {
         Some(p) => p,
         None => return antigravity_deny("the hook payload is missing or is not valid JSON."),
@@ -466,7 +527,7 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
         Some(c) if !c.trim().is_empty() && !c.contains('\0') => c,
         _ => return antigravity_deny("run_command has no CommandLine, or it is empty or contains NUL."),
     };
-    let wrapper = match wrapper_paths(exe).and_then(|paths| paths.into_iter().next()) {
+    let wrapper = match wrapper_paths(exe, role).and_then(|paths| paths.into_iter().next()) {
         Some(path) => path,
         None => return antigravity_deny("the location of the process guard is unknown."),
     };
@@ -476,7 +537,7 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
     if !plain_path(&wrapper) {
         return antigravity_deny("the process guard must be installed in a path with only the characters A-Z, a-z, 0-9, colon, slash, period, underscore and hyphen, so the rewritten command parses the same in every shell.");
     }
-    if antigravity_guarded(command, exe) {
+    if antigravity_guarded(command, exe, role) {
         return "{\"decision\":\"allow\"}".into();
     }
     let rewritten = antigravity_wrapped(&wrapper, command);
@@ -492,11 +553,11 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
 
 /// `hook antigravity`: rewrite a Google Antigravity `run_command` call so the
 /// automatic guard runs it. Every outcome is a JSON decision and the exit code is 0.
-pub fn antigravity(exe: &str) -> i32 {
+pub fn antigravity(exe: &str, role: Role) -> i32 {
     let mut input = String::new();
     let read = std::io::stdin().take(16 * 1024 * 1024).read_to_string(&mut input).is_ok();
-    let wrapper_exists = wrapper_paths(exe).and_then(|paths| paths.into_iter().next()).map_or(false, |path| std::path::Path::new(&path).is_file());
-    let line = antigravity_decision(exe, if read { Some(&input) } else { None }, wrapper_exists);
+    let wrapper_exists = wrapper_paths(exe, role).and_then(|paths| paths.into_iter().next()).map_or(false, |path| std::path::Path::new(&path).is_file());
+    let line = antigravity_decision(exe, role, if read { Some(&input) } else { None }, wrapper_exists);
     let _ = writeln!(std::io::stdout(), "{}", line);
     0
 }
@@ -507,19 +568,20 @@ pub fn antigravity_context() -> i32 {
     0
 }
 
-/// Run the hook. Returns the process exit code: 0 allows, 2 blocks (the
-/// `antigravity` vendors always return 0).
-pub fn main(vendor: &str) -> i32 {
+/// Run the hook as `role`: the hook role (`Role::Gate`) or any other program, whose
+/// rules then follow its file name. Returns the process exit code: 0 allows, 2
+/// blocks (the `antigravity` vendors always return 0).
+pub fn main(vendor: &str, role: Role) -> i32 {
     let exe = self_path().unwrap_or_default();
-    let policy = exe.rsplit_once("/bin/").map(|(home, _)| format!("{}/POLICY.md", home)).unwrap_or_else(|| "POLICY.md".into());
+    let policy = policy_path(&exe).unwrap_or_else(|| "POLICY.md".into());
     let reason = format!("TIMEOUT_REQUIRED: execute exactly the process-guard envelope with an explicit finite timeout. \
         No unwrapped commands, prefixes, suffixes, or polling-timeout substitutes. See {}. \
         Native tool timeout alone does not guarantee child cleanup.", policy);
     if vendor == "powershell-auto" {
-        return powershell_auto(&exe);
+        return powershell_auto(&exe, role);
     }
     if vendor == "antigravity" {
-        return antigravity(&exe);
+        return antigravity(&exe, role);
     }
     if vendor == "antigravity-context" {
         return antigravity_context();
@@ -536,7 +598,7 @@ pub fn main(vendor: &str) -> i32 {
             } else {
                 payload.get("tool_input").and_then(|t| t.get("command").or_else(|| t.get("cmd")))
             };
-            command.and_then(Json::as_str).map_or(false, |c| !exe.is_empty() && valid_envelope(c, &exe))
+            command.and_then(Json::as_str).map_or(false, |c| !exe.is_empty() && valid_envelope(c, &exe, role))
         });
     if allowed {
         println!("{}", if vendor == "cursor" { "{\"permission\":\"allow\"}" } else { "{}" });
@@ -554,6 +616,34 @@ pub fn main(vendor: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The role a program has when it is called by `exe`: the hook role only under its own file name.
+    fn role_of(exe: &str) -> Role {
+        if exe.ends_with("/process-tree-guard-gate.exe") { Role::Gate } else { Role::Full }
+    }
+
+    // The rules below are written for programs under their own file names, so these
+    // shadow the functions that take the role explicitly; the checks of a renamed
+    // program call them as `super::...` with the role.
+    fn valid_envelope(command: &str, exe: &str) -> bool {
+        super::valid_envelope(command, exe, role_of(exe))
+    }
+
+    fn envelope_paths(exe: &str) -> Vec<String> {
+        super::envelope_paths(exe, role_of(exe))
+    }
+
+    fn wrapper_paths(exe: &str) -> Option<Vec<String>> {
+        super::wrapper_paths(exe, role_of(exe))
+    }
+
+    fn antigravity_guarded(command: &str, exe: &str) -> bool {
+        super::antigravity_guarded(command, exe, role_of(exe))
+    }
+
+    fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) -> String {
+        super::antigravity_decision(exe, role_of(exe), input, wrapper_exists)
+    }
 
     const EXE: &str = "C:/Tools/process-tree-guard/bin/process-guard.exe";
 
@@ -596,12 +686,12 @@ mod tests {
 
     #[test]
     fn base64_encoder_round_trips_through_the_decoder() {
-        assert_eq!(crate::base64_encode(b"f"), "Zg==");
-        assert_eq!(crate::base64_encode(b"fo"), "Zm8=");
-        assert_eq!(crate::base64_encode(b"foo"), "Zm9v");
-        assert_eq!(crate::base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(crate::base64::base64_encode(b"f"), "Zg==");
+        assert_eq!(crate::base64::base64_encode(b"fo"), "Zm8=");
+        assert_eq!(crate::base64::base64_encode(b"foo"), "Zm9v");
+        assert_eq!(crate::base64::base64_encode(b"foob"), "Zm9vYg==");
         for text in ["a", "ab", "abc", "abcd", "echo \"q\" 'r' \\ s\nt","echo \u{fc}\u{4e2d}\u{1f600}"] {
-            assert_eq!(crate::decode_command(&crate::base64_encode(text.as_bytes())).ok().as_deref(), Some(text), "{:?}", text);
+            assert_eq!(crate::base64::decode_command(&crate::base64::base64_encode(text.as_bytes())).ok().as_deref(), Some(text), "{:?}", text);
         }
     }
 
@@ -683,6 +773,139 @@ mod tests {
         assert!(!valid_envelope(&format!("C:/Tools/pg/bin/process-guard.exe --timeout 5 --shell cmd --command-b64 {}", b64), own));
     }
 
+    const GATE_EXE: &str = "C:/Tools/ptg/libexec/process-tree-guard-gate.exe";
+    const FLAT_GATE_EXE: &str = "C:/Tools/ptg/bin/process-tree-guard-gate.exe";
+
+    #[test]
+    fn the_gate_vouches_for_the_programs_that_enforce_a_deadline() {
+        // Install layout: its own folder, then the bin folder beside libexec. Never itself.
+        let paths = envelope_paths(GATE_EXE);
+        assert_eq!(paths, [
+            "C:/Tools/ptg/libexec/process-tree-guard.exe",
+            "C:/Tools/ptg/libexec/process-guard.exe",
+            "C:/Tools/ptg/libexec/process-tree-guard-deadline.exe",
+            "C:/Tools/ptg/bin/process-tree-guard.exe",
+            "C:/Tools/ptg/bin/process-guard.exe",
+            "C:/Tools/ptg/bin/process-tree-guard-deadline.exe",
+        ]);
+        // Flat layout: its own folder only.
+        assert_eq!(envelope_paths(FLAT_GATE_EXE).len(), 3);
+        assert!(envelope_paths(FLAT_GATE_EXE).iter().all(|p| p.starts_with("C:/Tools/ptg/bin/")));
+        for exe in [GATE_EXE, FLAT_GATE_EXE] {
+            assert!(!envelope_paths(exe).contains(&exe.to_string()));
+            assert!(!valid_envelope(&format!("{} --timeout 60 --shell bash --command-b64 ZWNobyBPSw==", exe), exe));
+        }
+        let b64 = "ZWNobyBPSw==";
+        let line = |path: &str| format!("{} --timeout 60 --shell bash --command-b64 {}", path, b64);
+        assert!(valid_envelope(&line("C:/Tools/ptg/bin/process-tree-guard.exe"), GATE_EXE));
+        assert!(valid_envelope(&line("C:/Tools/ptg/libexec/process-tree-guard-deadline.exe"), GATE_EXE));
+        for bad in [
+            "C:/Tools/ptg/bin/process-tree-guard-auto.exe",
+            "C:/Tools/ptg/other/process-tree-guard.exe",
+            "C:/Tools/ptg/bin/PROCESS-TREE-GUARD.EXE",
+            "C:/Tools/ptg/libexec/process-tree-guard-deadline-auto.exe",
+            "C:/Tools/ptg/bin/process-tree-guard.exe.evil",
+            "C:/Tools/other/bin/process-tree-guard.exe",
+        ] {
+            assert!(!valid_envelope(&line(bad), GATE_EXE), "{}", bad);
+        }
+        // The flat gate does not reach into a sibling bin folder.
+        assert!(!valid_envelope(&line("C:/Tools/ptg/libexec/process-tree-guard.exe"), FLAT_GATE_EXE));
+        // Windows folder names are not case sensitive: libexec is recognised in any letter case, and
+        // the rest of the path is kept as the gate was started.
+        for folder in ["LIBEXEC", "LibExec", "Libexec"] {
+            let gate = format!("C:/Tools/ptg/{}/process-tree-guard-gate.exe", folder);
+            assert_eq!(envelope_paths(&gate).len(), 6, "{}", gate);
+            assert!(valid_envelope(&line("C:/Tools/ptg/bin/process-tree-guard.exe"), &gate), "{}", gate);
+            assert!(valid_envelope(&line(&format!("C:/Tools/ptg/{}/process-tree-guard-deadline.exe", folder)), &gate), "{}", gate);
+        }
+        // A folder that only contains or starts or ends with the word is not libexec.
+        for folder in ["libexec2", "xlibexec", "my-libexec", "libexe", "libexec "] {
+            let gate = format!("C:/Tools/ptg/{}/process-tree-guard-gate.exe", folder);
+            assert_eq!(envelope_paths(&gate).len(), 3, "{}", gate);
+            assert!(!valid_envelope(&line("C:/Tools/ptg/bin/process-tree-guard.exe"), &gate), "{}", gate);
+        }
+        // Another file name keeps its own path only, as before.
+        assert_eq!(envelope_paths("C:/Tools/ptg/libexec/other.exe"), vec!["C:/Tools/ptg/libexec/other.exe".to_string()]);
+    }
+
+    #[test]
+    fn the_rules_follow_the_role_not_the_file_name() {
+        let b64 = "ZWNobyBPSw==";
+        let line = |path: &str| format!("{} --timeout 60 --shell bash --command-b64 {}", path, b64);
+        // The hook role under other names, one of them a name of the full command: still the gate's
+        // rules, and never itself.
+        for renamed in [
+            "C:/Tools/ptg/libexec/hookgate.exe",
+            "C:/Tools/ptg/libexec/process-guard.exe",
+            "C:/Tools/ptg/libexec/process-tree-guard-deadline.exe",
+            "C:/Tools/ptg/libexec/process-tree-guard-gate-auto.exe",
+        ] {
+            let paths = super::envelope_paths(renamed, Role::Gate);
+            assert!(!paths.contains(&renamed.to_string()), "{}", renamed);
+            assert!(!super::valid_envelope(&line(renamed), renamed, Role::Gate), "{}", renamed);
+            assert!(super::valid_envelope(&line("C:/Tools/ptg/bin/process-tree-guard.exe"), renamed, Role::Gate), "{}", renamed);
+            assert_eq!(super::wrapper_paths(renamed, Role::Gate).and_then(|w| w.into_iter().next()).as_deref(),
+                Some("C:/Tools/ptg/libexec/process-tree-guard-deadline-auto.exe"), "{}", renamed);
+        }
+        // Started under another letter case, the hook role still never vouches for its own path.
+        let cased = "C:/Tools/ptg/libexec/Process-Tree-Guard-Deadline.exe";
+        assert!(!super::valid_envelope(&line("C:/Tools/ptg/libexec/process-tree-guard-deadline.exe"), cased, Role::Gate));
+        assert!(!super::valid_envelope(&line(cased), cased, Role::Gate));
+        assert!(super::valid_envelope(&line("C:/Tools/ptg/bin/process-tree-guard.exe"), cased, Role::Gate));
+        // The deadline role's path is among the others, and only the hook role's own path leaves the list.
+        assert_eq!(super::envelope_paths("C:/Tools/ptg/libexec/process-tree-guard-deadline.exe", Role::Gate).len(), 5);
+        assert_eq!(super::envelope_paths("C:/Tools/ptg/libexec/hookgate.exe", Role::Gate).len(), 6);
+        // A program that is not the hook role keeps the rules of its name, even under the hook role's file name.
+        assert_eq!(super::envelope_paths(GATE_EXE, Role::Full), vec![GATE_EXE.to_string()]);
+        assert!(super::valid_envelope(&line(GATE_EXE), GATE_EXE, Role::Full));
+        assert_eq!(super::wrapper_paths(GATE_EXE, Role::Full), Some(vec!["C:/Tools/ptg/libexec/process-guard-auto.exe".to_string()]));
+        // No folder: the hook role vouches for nothing.
+        assert!(super::envelope_paths("gate.exe", Role::Gate).is_empty());
+    }
+
+    #[test]
+    fn the_policy_file_is_one_folder_above_the_executables_folder() {
+        for (exe, policy) in [
+            ("C:/Tools/ptg/bin/process-tree-guard.exe", Some("C:/Tools/ptg/POLICY.md")),
+            ("C:/Tools/ptg/libexec/process-tree-guard-gate.exe", Some("C:/Tools/ptg/POLICY.md")),
+            // A folder called bin or libexec earlier in the path does not move the policy file.
+            ("C:/Tools/bin/ptg/libexec/process-tree-guard-gate.exe", Some("C:/Tools/bin/ptg/POLICY.md")),
+            ("C:/Tools/libexec/ptg/bin/process-tree-guard.exe", Some("C:/Tools/libexec/ptg/POLICY.md")),
+            // A folder with neither name.
+            ("C:/Tools/ptg/flat/process-tree-guard-gate.exe", Some("C:/Tools/ptg/POLICY.md")),
+            ("C:/gate.exe", None),
+            ("gate.exe", None),
+        ] {
+            assert_eq!(policy_path(exe).as_deref(), policy, "{}", exe);
+        }
+    }
+
+    #[test]
+    fn the_gate_rewrites_to_the_automatic_deadline_role_in_its_own_folder() {
+        assert_eq!(wrapper_paths(GATE_EXE), Some(vec![
+            "C:/Tools/ptg/libexec/process-tree-guard-deadline-auto.exe".to_string(),
+            "C:/Tools/ptg/libexec/process-tree-guard-auto.exe".to_string(),
+            "C:/Tools/ptg/libexec/process-guard-auto.exe".to_string(),
+        ]));
+        let own = "C:/Tools/ptg/libexec/process-tree-guard-deadline-auto.exe";
+        let input = call(&quote("echo hi"));
+        let d = parse_json(&antigravity_decision(GATE_EXE, Some(&input), true)).expect("one JSON object");
+        let line = d.get("overwrite").and_then(|o| o.get("CommandLine")).and_then(Json::as_str).unwrap();
+        assert_eq!(line, antigravity_wrapped(own, "echo hi"));
+        // The wrapper forms of all three families pass through unchanged.
+        for wrapper in wrapper_paths(GATE_EXE).unwrap() {
+            let input = call(&quote(&antigravity_wrapped(&wrapper, "echo hi")));
+            let d = parse_json(&antigravity_decision(GATE_EXE, Some(&input), true)).unwrap();
+            assert_eq!(d.get("decision").and_then(Json::as_str), Some("allow"), "{}", wrapper);
+            assert!(d.get("overwrite").is_none(), "{}", wrapper);
+        }
+        // A missing wrapper is reported by the gate's own wrapper name.
+        let missing = parse_json(&antigravity_decision(GATE_EXE, Some(&call("\"echo hi\"")), false)).unwrap();
+        assert_eq!(missing.get("decision").and_then(Json::as_str), Some("deny"));
+        assert!(missing.get("reason").and_then(Json::as_str).map_or(false, |r| r.contains("process-tree-guard-deadline-auto.exe")));
+    }
+
     #[test]
     fn antigravity_guarded_accepts_both_names_wrappers_and_envelopes() {
         let b64 = "ZWNobyBPSw==";
@@ -742,7 +965,7 @@ mod tests {
         assert_eq!(d.get("decision").and_then(Json::as_str), Some("allow"));
         let rewritten = d.get("overwrite").and_then(|o| o.get("CommandLine")).and_then(Json::as_str).unwrap();
         let b64 = rewritten.strip_prefix(&format!("{} --command-b64 ", WRAPPER)).expect("wrapper form");
-        assert_eq!(crate::decode_command(b64).ok().as_deref(), Some(original));
+        assert_eq!(crate::base64::decode_command(b64).ok().as_deref(), Some(original));
         assert!(matches!(d.get("overwrite"), Some(Json::Object(pairs)) if pairs.len() == 1));
         // Fed back, the wrapper form passes unchanged.
         let again = decide(&call(&quote(rewritten)));

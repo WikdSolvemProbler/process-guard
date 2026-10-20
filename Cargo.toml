@@ -1,6 +1,6 @@
 [package]
 name = "process-tree-guard"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 edition = "2021"
 description = "Windows process tree deadline: runs one command under a job object and kills the whole tree at a finite timeout."
 license = "Apache-2.0"
@@ -9,10 +9,26 @@ readme = "README.md"
 keywords = ["windows", "process", "timeout", "job-object", "sandbox"]
 categories = ["command-line-utilities", "os::windows-apis"]
 publish = false
+build = "build.rs"
 
+[lib]
+name = "process_tree_guard"
+path = "src/lib.rs"
+
+# The full command, installed in bin.
 [[bin]]
 name = "process-tree-guard"
 path = "src/main.rs"
+
+# The deadline role, installed in libexec.
+[[bin]]
+name = "process-tree-guard-deadline"
+path = "src/bin/process-tree-guard-deadline.rs"
+
+# The hook role, installed in libexec.
+[[bin]]
+name = "process-tree-guard-gate"
+path = "src/bin/process-tree-guard-gate.rs"
 
 [profile.release]
 opt-level = 3

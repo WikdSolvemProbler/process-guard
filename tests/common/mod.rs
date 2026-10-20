@@ -25,9 +25,11 @@ extern "system" {
     fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut c_void;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
 }
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 0x102;
 
@@ -56,9 +58,12 @@ pub fn text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// A binary path recorded at compile time. When the tests were compiled on
-/// another machine and copied here, that path does not exist, so the binary
-/// of the same name in the folder above this test executable is used.
+/// A binary path recorded at compile time by cargo for the binary it built in
+/// this run. When the tests were compiled on another machine and copied here,
+/// that path does not exist, so the binary of the same name in the folder above
+/// this test executable is used. No file is ever found by a name written in the
+/// tests, so a stale file left in the build folder by an earlier version (for
+/// example a process-guard.exe) is never picked up.
 fn built(recorded: &str) -> PathBuf {
     let path = PathBuf::from(recorded);
     if path.is_file() {
@@ -96,6 +101,99 @@ pub fn copy_guard(dir: &Path, name: &str) -> String {
 pub fn testkit() -> &'static str {
     static TESTKIT: OnceLock<String> = OnceLock::new();
     TESTKIT.get_or_init(|| long_path(&built(env!("CARGO_BIN_EXE_testkit"))))
+}
+
+// ------------------------------------------------------- role programs, layouts
+
+/// The three programs the crate builds: the full command, the deadline role and
+/// the hook role.
+pub const ROLES: [&str; 3] = ["process-tree-guard", "process-tree-guard-deadline", "process-tree-guard-gate"];
+
+/// The built program of this name (one of ROLES), exactly as cargo built it in
+/// this run. Unlike `guard()`, it is not replaced by PROCESS_TREE_GUARD_EXE.
+pub fn role(name: &str) -> &'static str {
+    static PATHS: OnceLock<[String; 3]> = OnceLock::new();
+    let paths = PATHS.get_or_init(|| [
+        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard"))),
+        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-deadline"))),
+        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-gate"))),
+    ]);
+    let index = ROLES.iter().position(|known| *known == name).unwrap_or_else(|| panic!("{} is not a program of this crate", name));
+    &paths[index]
+}
+
+/// A copy of the built program `role_name` in `dir` named `<file_name>.exe`; returns its Windows path text.
+pub fn copy_role(dir: &Path, role_name: &str, file_name: &str) -> String {
+    let target = dir.join(format!("{}.exe", file_name));
+    std::fs::copy(role(role_name), &target).unwrap_or_else(|e| panic!("cannot copy {} to {}: {}", role_name, target.display(), e));
+    text(&target)
+}
+
+/// Where the programs are installed. `Install` puts the full command in `bin` and
+/// the two roles in `libexec`; `Flat` puts every program in one folder, `bin`.
+/// `POLICY.md`, when there is one, is in the root either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    Install,
+    Flat,
+}
+
+pub const LAYOUTS: [Layout; 2] = [Layout::Install, Layout::Flat];
+
+impl Layout {
+    pub fn name(self) -> &'static str {
+        match self {
+            Layout::Install => "install layout",
+            Layout::Flat => "flat layout",
+        }
+    }
+}
+
+/// A private tree holding every program in one of the layouts: the full command
+/// and its automatic copy, the deadline role and its automatic copy, and the gate.
+pub struct Tree {
+    _root: TempDir,
+    pub layout: Layout,
+    pub root: PathBuf,
+    /// The folder of the full command and its automatic copy.
+    pub bin: PathBuf,
+    /// The folder of the deadline role, its automatic copy and the gate.
+    pub libexec: PathBuf,
+}
+
+impl Tree {
+    pub fn new(layout: Layout, prefix: &str) -> Tree {
+        Tree::new_in(&std::env::temp_dir(), layout, prefix)
+    }
+
+    /// Like `new`, with the tree made under `base`.
+    pub fn new_in(base: &Path, layout: Layout, prefix: &str) -> Tree {
+        let root = TempDir::new_in(base, prefix);
+        let bin = root.join("bin");
+        let libexec = if layout == Layout::Install { root.join("libexec") } else { bin.clone() };
+        for dir in [&bin, &libexec] {
+            std::fs::create_dir_all(dir).expect("create a program folder");
+        }
+        let root_path = root.path().to_path_buf();
+        let tree = Tree { _root: root, layout, root: root_path, bin, libexec };
+        copy_role(&tree.bin, ROLES[0], ROLES[0]);
+        copy_role(&tree.bin, ROLES[0], "process-tree-guard-auto");
+        copy_role(&tree.libexec, ROLES[1], ROLES[1]);
+        copy_role(&tree.libexec, ROLES[1], "process-tree-guard-deadline-auto");
+        copy_role(&tree.libexec, ROLES[2], ROLES[2]);
+        tree
+    }
+
+    /// The Windows path of `<name>.exe` in the folder that holds it in this layout.
+    pub fn exe(&self, name: &str) -> String {
+        let folder = if name == ROLES[0] || name == "process-tree-guard-auto" { &self.bin } else { &self.libexec };
+        text(&folder.join(format!("{}.exe", name)))
+    }
+
+    /// Remove `<name>.exe` from its folder.
+    pub fn remove(&self, name: &str) {
+        std::fs::remove_file(self.exe(name)).unwrap_or_else(|e| panic!("cannot remove {}: {}", name, e));
+    }
 }
 
 pub const BASH: &str = "C:/Program Files/Git/bin/bash.exe";
@@ -296,6 +394,38 @@ pub fn alive(id: u32) -> bool {
     }
 }
 
+/// A handle to a process that is not a child of the test, opened while the
+/// process is running, so that its exit code can be read after it has ended.
+pub struct Watched {
+    handle: *mut c_void,
+}
+
+impl Watched {
+    /// None when the process cannot be opened.
+    pub fn open(id: u32) -> Option<Watched> {
+        let handle = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+        if handle.is_null() { None } else { Some(Watched { handle }) }
+    }
+
+    /// The exit code, once the process has ended; None if it is still running after `secs` seconds.
+    pub fn exit_code(&self, secs: u64) -> Option<u32> {
+        let milliseconds = secs.saturating_mul(1000).min(u32::MAX as u64 - 1) as u32;
+        unsafe {
+            if WaitForSingleObject(self.handle, milliseconds) != WAIT_OBJECT_0 {
+                return None;
+            }
+            let mut code = 0u32;
+            if GetExitCodeProcess(self.handle, &mut code) == 0 { None } else { Some(code) }
+        }
+    }
+}
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
 pub fn count_alive(ids: &[u32]) -> usize {
     ids.iter().filter(|id| alive(**id)).count()
 }
@@ -386,6 +516,12 @@ pub fn wait_for_file(path: &Path, secs: f64) -> bool {
         thread::sleep(Duration::from_millis(20));
     }
     true
+}
+
+/// The text of a file that a child publishes by renaming it into place, once it
+/// exists; None when it has not appeared within `secs` seconds.
+pub fn published(path: &Path, secs: f64) -> Option<String> {
+    wait_for_file(path, secs).then(|| std::fs::read_to_string(path).unwrap_or_default())
 }
 
 /// Wait until a folder holds at least `count` marker files.
@@ -626,6 +762,164 @@ impl<'a> Reader<'a> {
     }
 }
 
+// ---------------------------------------------------------- version resources
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryW(name: *const u16) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn BeginUpdateResourceW(filename: *const u16, delete_existing: i32) -> *mut c_void;
+    fn UpdateResourceW(update: *mut c_void, kind: *const u16, name: *const u16, language: u16, data: *const c_void, size: u32) -> i32;
+    fn EndUpdateResourceW(update: *mut c_void, discard: i32) -> i32;
+}
+
+type SizeFn = unsafe extern "system" fn(*const u16, *mut u32) -> u32;
+type InfoFn = unsafe extern "system" fn(*const u16, u32, u32, *mut c_void) -> i32;
+type QueryFn = unsafe extern "system" fn(*const c_void, *const u16, *mut *mut c_void, *mut u32) -> i32;
+
+/// GetFileVersionInfoSizeW, GetFileVersionInfoW and VerQueryValueW from version.dll in
+/// the system folder. They are loaded when first used, so the tests link on every
+/// toolchain, including those that ship no import library for version.dll.
+struct VersionApi {
+    size: SizeFn,
+    info: InfoFn,
+    query: QueryFn,
+}
+
+fn version_api() -> &'static VersionApi {
+    static API: OnceLock<VersionApi> = OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+        let module = LoadLibraryW(wide(&format!(r"{}\System32\version.dll", system)).as_ptr());
+        assert!(!module.is_null(), "version.dll cannot be loaded");
+        let find = |name: &[u8]| {
+            let address = GetProcAddress(module, name.as_ptr());
+            assert!(!address.is_null(), "{} is not in version.dll", String::from_utf8_lossy(&name[..name.len() - 1]));
+            address
+        };
+        VersionApi {
+            size: std::mem::transmute::<*mut c_void, SizeFn>(find(b"GetFileVersionInfoSizeW\0")),
+            info: std::mem::transmute::<*mut c_void, InfoFn>(find(b"GetFileVersionInfoW\0")),
+            query: std::mem::transmute::<*mut c_void, QueryFn>(find(b"VerQueryValueW\0")),
+        }
+    })
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// The version resource of an executable, read with the system calls Explorer
+/// and Task Manager use: GetFileVersionInfoW and VerQueryValueW.
+pub struct VersionInfo {
+    block: Vec<u8>,
+}
+
+impl VersionInfo {
+    /// None when the file has no version resource.
+    pub fn read(path: &str) -> Option<VersionInfo> {
+        let name = wide(path);
+        unsafe {
+            let mut handle = 0u32;
+            let size = (version_api().size)(name.as_ptr(), &mut handle);
+            if size == 0 {
+                return None;
+            }
+            let mut block = vec![0u8; size as usize];
+            if (version_api().info)(name.as_ptr(), 0, size, block.as_mut_ptr() as *mut c_void) == 0 {
+                return None;
+            }
+            Some(VersionInfo { block })
+        }
+    }
+
+    /// The bytes VerQueryValueW finds for `sub_block`, in the block, with the item count it reports.
+    fn query(&self, sub_block: &str) -> Option<(Vec<u8>, u32)> {
+        let name = wide(sub_block);
+        unsafe {
+            let mut found: *mut c_void = std::ptr::null_mut();
+            let mut length = 0u32;
+            if (version_api().query)(self.block.as_ptr() as *const c_void, name.as_ptr(), &mut found, &mut length) == 0 || found.is_null() {
+                return None;
+            }
+            let start = (found as usize).checked_sub(self.block.as_ptr() as usize)?;
+            if start > self.block.len() {
+                return None;
+            }
+            Some((self.block[start..].to_vec(), length))
+        }
+    }
+
+    /// The first language and code page pair of `\VarFileInfo\Translation`.
+    pub fn translation(&self) -> Option<(u16, u16)> {
+        let (bytes, length) = self.query("\\VarFileInfo\\Translation")?;
+        if length < 4 || bytes.len() < 4 {
+            return None;
+        }
+        Some((u16::from_le_bytes([bytes[0], bytes[1]]), u16::from_le_bytes([bytes[2], bytes[3]])))
+    }
+
+    /// A string of the first string table, such as `FileDescription`; None when it is not there.
+    pub fn string(&self, name: &str) -> Option<String> {
+        let (language, code_page) = self.translation()?;
+        let (bytes, length) = self.query(&format!("\\StringFileInfo\\{:04x}{:04x}\\{}", language, code_page, name))?;
+        let units: Vec<u16> = bytes.chunks_exact(2).take(length as usize).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+        let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
+        Some(String::from_utf16_lossy(&units[..end]))
+    }
+
+    /// The thirteen words of VS_FIXEDFILEINFO.
+    pub fn fixed(&self) -> Option<[u32; 13]> {
+        let (bytes, length) = self.query("\\")?;
+        if length < 52 || bytes.len() < 52 {
+            return None;
+        }
+        let mut words = [0u32; 13];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = u32::from_le_bytes([bytes[4 * index], bytes[4 * index + 1], bytes[4 * index + 2], bytes[4 * index + 3]]);
+        }
+        Some(words)
+    }
+}
+
+/// Replace the version resource (RT_VERSION, name 1, US English) of the executable at `path` with `data`.
+pub fn set_version_resource(path: &Path, data: &[u8]) -> bool {
+    let name = wide(&text(path));
+    unsafe {
+        let update = BeginUpdateResourceW(name.as_ptr(), 0);
+        if update.is_null() {
+            return false;
+        }
+        let added = UpdateResourceW(update, 16usize as *const u16, 1usize as *const u16, 0x0409, data.as_ptr() as *const c_void, data.len() as u32);
+        let ended = EndUpdateResourceW(update, if added == 0 { 1 } else { 0 });
+        added != 0 && ended != 0
+    }
+}
+
+/// The resources of a `.res` file as (type, name, data), for the numbered (ordinal)
+/// types and names only; None when the file is not well formed. The first entry,
+/// the empty resource that starts every `.res` file, is checked and left out.
+pub fn parse_res(bytes: &[u8]) -> Option<Vec<(u16, u16, Vec<u8>)>> {
+    const EMPTY: [u8; 32] = [0, 0, 0, 0, 32, 0, 0, 0, 0xFF, 0xFF, 0, 0, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    if bytes.get(..32)? != EMPTY {
+        return None;
+    }
+    let word = |at: usize| bytes.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+    let half = |at: usize| bytes.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let mut found = Vec::new();
+    let mut at = 32;
+    while at < bytes.len() {
+        let (size, header) = (word(at)?, word(at + 4)?);
+        if header != 32 || half(at + 8)? != 0xFFFF || half(at + 12)? != 0xFFFF {
+            return None;
+        }
+        let data = bytes.get(at + header..at + header + size)?.to_vec();
+        found.push((half(at + 10)?, half(at + 14)?, data));
+        at += header + (size + 3) / 4 * 4;
+    }
+    if at == bytes.len() { Some(found) } else { None }
+}
+
 // -------------------------------------------------------------------- checks
 
 /// Whether timing bounds are asserted, given the values of PROCESS_TREE_GUARD_TIMING
@@ -680,6 +974,13 @@ impl Checks {
     }
     pub fn info(&self, line: impl Display) {
         println!("INFO {}", line);
+    }
+    /// A line that must show on a plain `cargo test`: it is written straight to
+    /// standard error, which the test harness does not capture, where `info` is hidden
+    /// unless the run is made with `--nocapture`.
+    pub fn notice(&self, line: impl Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "NOTICE {}", line);
     }
     pub fn finish(self) {
         if !self.failed.is_empty() {

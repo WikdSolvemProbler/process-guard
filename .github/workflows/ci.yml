@@ -16,9 +16,30 @@ jobs:
       CARGO_TERM_COLOR: never
       # Shared runners are too noisy for the timing bounds; they are reported, not asserted.
       PROCESS_TREE_GUARD_TIMING: info
+      # The version resources are linked only for the MSVC target, so a run that did not link them fails.
+      PROCESS_TREE_GUARD_REQUIRE_RESOURCES: '1'
     steps:
       - uses: actions/checkout@v5
       - name: Build
         run: cargo build --release --locked
+      - name: Check the version resources of the built programs
+        shell: pwsh
+        run: |
+          $expected = [ordered]@{
+            'process-tree-guard.exe' = 'Process Tree Guard'
+            'process-tree-guard-deadline.exe' = 'Process Tree Guard: Deadline'
+            'process-tree-guard-gate.exe' = 'Process Tree Guard: Gate'
+          }
+          $failed = $false
+          foreach ($name in $expected.Keys) {
+            $info = (Get-Item "target/release/$name").VersionInfo
+            "{0}: description '{1}', product '{2}', version '{3}', original name '{4}'" -f $name, $info.FileDescription, $info.ProductName, $info.FileVersion, $info.OriginalFilename
+            if ($info.FileDescription -ne $expected[$name] -or $info.ProductName -ne 'Process Tree Guard' -or $info.OriginalFilename -ne $name -or [string]::IsNullOrEmpty($info.FileVersion)) {
+              $failed = $true
+            }
+          }
+          if ($failed) { throw 'a program does not carry its version resource' }
       - name: Test
         run: cargo test --release --locked --no-fail-fast
+      - name: Version resource checks, shown
+        run: cargo test --release --locked --test guard g39 -- --nocapture

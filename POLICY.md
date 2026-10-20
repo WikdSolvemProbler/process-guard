@@ -1,6 +1,6 @@
 # Process deadlines and bounded searches
 
-This policy is installed at {{POLICY}}. The programs it names are in {{BIN}}.
+This policy is installed at {{POLICY}}. The programs it names are in {{BIN}}, the folder that holds `process-tree-guard.exe` and `process-tree-guard-auto.exe`.
 
 Every command or process launched by a person or an automated agent must end within a finite wall-clock deadline that ends its whole process tree. No unlimited servers and no detached work. Do not bypass, disable, weaken, or route around this requirement through another shell, language, tool, remote session, scheduled task, service, or executable path.
 
@@ -20,7 +20,7 @@ Anything else is refused.
 
 People can run `process-tree-guard --timeout SECONDS -- program arguments` from any terminal. Exit code 124 means the deadline passed; 125 means a guard error or that the launching process exited.
 
-The earlier names `process-guard` and `process-guard-auto`, and the variables PROCESS_GUARD_AUTO_TIMEOUT and HARNESS_AUTO_TIMEOUT, are accepted as aliases through all of version 2 and carry the same rule. Name the files that exist in {{BIN}}: where an installation keeps only the earlier names, write `process-guard.exe` and `process-guard-auto.exe` in place of the names above.
+The earlier names `process-guard` and `process-guard-auto`, and the variables PROCESS_GUARD_AUTO_TIMEOUT and HARNESS_AUTO_TIMEOUT, are accepted as aliases through all of version 2 and carry the same rule. Name the files that exist in {{BIN}}: where an installation keeps only the earlier names, write `process-guard.exe` and `process-guard-auto.exe` in place of the names above; where it keeps only the deadline role, write `process-tree-guard-deadline.exe` and `process-tree-guard-deadline-auto.exe`, which behave the same way.
 
 ## Searches
 

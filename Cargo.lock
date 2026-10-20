@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "process-tree-guard"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
