@@ -69,13 +69,27 @@ fn built(recorded: &str) -> PathBuf {
     exe.parent().and_then(Path::parent).expect("test executable folder").join(name)
 }
 
-/// The guard under test: the built binary, or the one named by PROCESS_GUARD_EXE.
+/// The two program names of the guard: the 2.0 name, and the 1.x name kept as an
+/// alias through 2.x. Each also has an automatic copy, the same name with `-auto`.
+pub const NAMES: [&str; 2] = ["process-tree-guard", "process-guard"];
+
+/// The guard under test: the built binary, or the one named by
+/// PROCESS_TREE_GUARD_EXE, else by the 1.x name PROCESS_GUARD_EXE. The tests never
+/// depend on the name of this file; they copy it to the names they need.
 pub fn guard() -> &'static str {
     static GUARD: OnceLock<String> = OnceLock::new();
     GUARD.get_or_init(|| {
-        let raw = std::env::var_os("PROCESS_GUARD_EXE").map(PathBuf::from).unwrap_or_else(|| built(env!("CARGO_BIN_EXE_process-guard")));
+        let named = std::env::var_os("PROCESS_TREE_GUARD_EXE").or_else(|| std::env::var_os("PROCESS_GUARD_EXE")).map(PathBuf::from);
+        let raw = named.unwrap_or_else(|| built(env!("CARGO_BIN_EXE_process-tree-guard")));
         long_path(&raw)
     })
+}
+
+/// A copy of the guard in `dir` named `<name>.exe`; returns its Windows path text.
+pub fn copy_guard(dir: &Path, name: &str) -> String {
+    let target = dir.join(format!("{}.exe", name));
+    std::fs::copy(guard(), &target).unwrap_or_else(|e| panic!("cannot copy the guard to {}: {}", target.display(), e));
+    text(&target)
 }
 
 /// The helper executable that stands in for every child process.
@@ -215,6 +229,19 @@ pub fn run_status(mut command: Command, limit_secs: u64) -> u32 {
             panic!("{:?} did not finish within {} seconds", command.get_program(), limit_secs);
         }
     }
+}
+
+/// The environment variables that set the automatic deadline, in the order the
+/// guard reads them.
+pub const AUTO_TIMEOUT_VARIABLES: [&str; 3] = ["PROCESS_TREE_GUARD_AUTO_TIMEOUT", "PROCESS_GUARD_AUTO_TIMEOUT", "HARNESS_AUTO_TIMEOUT"];
+
+/// Remove the automatic deadline variables from a command's environment, so the
+/// settings of the machine running the tests cannot change what a check sees.
+pub fn without_deadline_variables(command: &mut Command) -> &mut Command {
+    for name in AUTO_TIMEOUT_VARIABLES {
+        command.env_remove(name);
+    }
+    command
 }
 
 pub fn guard_cmd(args: &[&str]) -> Command {
@@ -601,10 +628,18 @@ impl<'a> Reader<'a> {
 
 // -------------------------------------------------------------------- checks
 
-/// Timing bounds are asserted unless PROCESS_GUARD_TIMING is set to "info",
-/// which a loaded machine can use to report them without failing the run.
+/// Whether timing bounds are asserted, given the values of PROCESS_TREE_GUARD_TIMING
+/// and of the 1.x name PROCESS_GUARD_TIMING. The first one that is set decides;
+/// "info" reports the bounds without failing, as a loaded machine needs.
+pub fn timing_strict_for(new_name: Option<&str>, old_name: Option<&str>) -> bool {
+    new_name.or(old_name).map_or(true, |value| !value.eq_ignore_ascii_case("info"))
+}
+
+/// Timing bounds are asserted unless PROCESS_TREE_GUARD_TIMING, else
+/// PROCESS_GUARD_TIMING, is set to "info".
 pub fn timing_strict() -> bool {
-    std::env::var("PROCESS_GUARD_TIMING").map_or(true, |value| !value.eq_ignore_ascii_case("info"))
+    let (new_name, old_name) = (std::env::var("PROCESS_TREE_GUARD_TIMING").ok(), std::env::var("PROCESS_GUARD_TIMING").ok());
+    timing_strict_for(new_name.as_deref(), old_name.as_deref())
 }
 
 pub fn median(values: &mut [f64]) -> f64 {

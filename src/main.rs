@@ -7,6 +7,11 @@
 //! when the job closes. Exit codes: the child's own code; 124 on timeout; 125
 //! for any guard error or when the process that launched the guard exits. The
 //! guard never exits with 2, because 2 blocks a host hook event.
+//!
+//! The program is `process-tree-guard`. The 1.x name `process-guard` is an alias
+//! through all of 2.x: the same executable under either name, or under either
+//! name with `-auto` added, behaves identically, because only the program name's
+//! ending is read.
 
 use std::ffi::c_void;
 use std::process::exit;
@@ -14,7 +19,7 @@ use std::process::exit;
 mod hook;
 
 const MAX_SECONDS: f64 = 86400.0;
-const USAGE: &str = "usage: process-guard --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])";
+const USAGE: &str = "usage: process-tree-guard --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])";
 
 type Handle = *mut c_void;
 type Bool = i32;
@@ -752,14 +757,24 @@ fn parent_image() -> String {
     }
 }
 
-/// `process-guard auto [--timeout SECONDS] [--shell powershell|bash|cmd] [--] COMMAND...`
+/// The environment variables that set the automatic deadline, in the order they
+/// are read: the 2.0 name, the 1.x name (an alias through 2.x), then the legacy
+/// host name. The first one that is set is used.
+const AUTO_TIMEOUT_VARIABLES: [&str; 3] = ["PROCESS_TREE_GUARD_AUTO_TIMEOUT", "PROCESS_GUARD_AUTO_TIMEOUT", "HARNESS_AUTO_TIMEOUT"];
+
+/// The value of the first of AUTO_TIMEOUT_VARIABLES that `lookup` finds.
+fn auto_timeout_setting(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    AUTO_TIMEOUT_VARIABLES.iter().find_map(|name| lookup(name))
+}
+
+/// `process-tree-guard auto [--timeout SECONDS] [--shell powershell|bash|cmd] [--] COMMAND...`
 ///
 /// The automatic wrapper a host puts in front of every shell command. One
 /// remaining argument is a command line for a shell: the shell named by
 /// --shell, otherwise the same kind of shell that launched the guard (Git
 /// Bash when unknown). Several remaining arguments are a program and its
-/// arguments. The deadline is --timeout, else PROCESS_GUARD_AUTO_TIMEOUT, else
-/// the legacy name HARNESS_AUTO_TIMEOUT, else two hours. The host's own
+/// arguments. The deadline is --timeout, else the first of
+/// AUTO_TIMEOUT_VARIABLES that is set, else two hours. The host's own
 /// per-call timeout still applies: when the host kills the process that
 /// launched the guard, the guard kills the whole tree.
 fn auto(skip: usize) -> Result<u32, GuardError> {
@@ -768,7 +783,7 @@ fn auto(skip: usize) -> Result<u32, GuardError> {
     for arg in std::env::args_os().skip(skip) {
         args.push(arg.into_string().map_err(|_| GuardError("arguments must be valid Unicode".into()))?);
     }
-    let mut timeout: Option<String> = std::env::var("PROCESS_GUARD_AUTO_TIMEOUT").or_else(|_| std::env::var("HARNESS_AUTO_TIMEOUT")).ok();
+    let mut timeout: Option<String> = auto_timeout_setting(|name| std::env::var(name).ok());
     let mut shell: Option<String> = None;
     let mut encoded: Option<String> = None;
     let mut i = 0;
@@ -841,7 +856,9 @@ fn main() {
     trace("start");
     let mut args = std::env::args_os().skip(1);
     // Installed under a name ending in "-auto", the binary is the automatic
-    // wrapper itself, so a host can name it as a single program path.
+    // wrapper itself, so a host can name it as a single program path. Only the
+    // ending is read, so process-tree-guard-auto and the 1.x alias
+    // process-guard-auto select it alike.
     let auto_by_name = std::env::current_exe().ok()
         .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase()))
         .map_or(false, |s| s.ends_with("-auto"));
@@ -902,6 +919,18 @@ mod tests {
         for bad in ["0", "-1", "nan", "inf", "86401", "x", ""] {
             assert!(duration(bad).is_err(), "{}", bad);
         }
+    }
+
+    #[test]
+    fn automatic_deadline_variables_are_read_in_order() {
+        let set = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(auto_timeout_setting(set(&[])), None);
+        assert_eq!(auto_timeout_setting(set(&[("HARNESS_AUTO_TIMEOUT", "3")])).as_deref(), Some("3"));
+        assert_eq!(auto_timeout_setting(set(&[("HARNESS_AUTO_TIMEOUT", "3"), ("PROCESS_GUARD_AUTO_TIMEOUT", "2")])).as_deref(), Some("2"));
+        assert_eq!(auto_timeout_setting(set(&[("PROCESS_GUARD_AUTO_TIMEOUT", "2"), ("HARNESS_AUTO_TIMEOUT", "3"), ("PROCESS_TREE_GUARD_AUTO_TIMEOUT", "1")])).as_deref(), Some("1"));
+        assert_eq!(auto_timeout_setting(set(&[("PROCESS_TREE_GUARD_AUTO_TIMEOUT", ""), ("PROCESS_GUARD_AUTO_TIMEOUT", "2")])).as_deref(), Some(""));
     }
 
     #[test]

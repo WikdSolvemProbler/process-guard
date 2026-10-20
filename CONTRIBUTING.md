@@ -10,9 +10,10 @@ Issues and pull requests are welcome.
 
 ## Rules for changes
 
-- `cargo test --release` passes. On a busy machine, `PROCESS_GUARD_TIMING=info` reports the timing bounds instead of asserting them; say so in the pull request if you used it.
+- `cargo test --release` passes. On a busy machine, `PROCESS_TREE_GUARD_TIMING=info` reports the timing bounds instead of asserting them; say so in the pull request if you used it.
 - No new dependencies. The guard uses only the Rust standard library and direct Windows system calls, so that the whole program can be reviewed in one sitting.
 - A change in behaviour comes with a test, and a new check gets the next identifier in its series (`G`, `U`, `B` or `A`) and a row in `tests/PARITY.md`.
+- Tests do not depend on the file name of the built guard. They copy it to the names they need (`process-tree-guard` and the 1.x alias `process-guard`, each with an `-auto` copy where the check needs one) in a temporary folder.
 - The README is updated when a flag, exit code, guarantee or limit changes.
 
 ## License of contributions

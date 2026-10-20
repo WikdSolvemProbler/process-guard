@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! `process-guard hook VENDOR`: the command envelope check for agent shell tools.
+//! `process-tree-guard hook VENDOR`: the command envelope check for agent shell tools.
 //!
 //! Reads the host's pre-execution hook payload as JavaScript Object Notation
 //! (JSON) on standard input and allows the command only when it is exactly the
@@ -14,14 +14,19 @@
 //! UTF-8 with no NUL. Anything else is denied with exit code 2, which is how a
 //! host hook blocks a tool call; this is the one place the guard uses exit 2 on purpose.
 //!
+//! The executable has two names, `process-tree-guard` and the 1.x alias
+//! `process-guard`, kept through all of 2.x. When it is installed under either
+//! name, the envelope may name either name in the same folder, and the automatic
+//! wrapper is the one of the executable's own name.
+//!
 //! Formats: `pretooluse` reads `tool_input.command` (or `tool_input.cmd`) and
 //! answers in the PreToolUse format; `cursor` reads `command` and answers in the
 //! beforeShellExecution format; `cursor-context` prints the policy as session context.
 //!
 //! `antigravity` is different: it rewrites instead of only checking. It reads a
 //! Google Antigravity PreToolUse payload, and for the `run_command` tool replaces
-//! `CommandLine` with a call to the automatic wrapper beside this executable, so the
-//! command runs under the guard. Every outcome, denials included, is a JSON decision
+//! `CommandLine` with a call to the automatic wrapper beside this executable (the
+//! wrapper of its own name), so the command runs under the guard. Every outcome, denials included, is a JSON decision
 //! on standard output and the exit code is always 0. `antigravity-context` prints the
 //! policy as a SessionStart system message.
 
@@ -188,6 +193,43 @@ pub fn to_json(value: &Json) -> String {
     }
 }
 
+/// The two names of the one executable, the 2.0 name first. `process-guard` is the
+/// 1.x name, an alias through all of 2.x; each name also has an automatic copy, the
+/// same name with `-auto` added.
+const NAMES: [&str; 2] = ["process-tree-guard", "process-guard"];
+
+/// The folder of `exe` and the index in NAMES of its program name, when it has one.
+fn family(exe: &str) -> Option<(&str, usize)> {
+    let (dir, file) = exe.rsplit_once('/')?;
+    let lower = file.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe")?;
+    NAMES.iter().position(|name| *name == stem).map(|index| (dir, index))
+}
+
+/// The paths a guard envelope may name when this executable is `exe`: `exe` itself
+/// and, when it is installed under one of the two names, the other name in the
+/// same folder. The other file need not exist; a command that names a missing
+/// program only fails to run.
+fn envelope_paths(exe: &str) -> Vec<String> {
+    let mut paths = vec![exe.to_string()];
+    if let Some((dir, own)) = family(exe) {
+        paths.push(format!("{}/{}.exe", dir, NAMES[1 - own]));
+    }
+    paths
+}
+
+/// The automatic wrapper paths beside `exe`: the wrapper of its own name first,
+/// then the other name's. An executable under any other name keeps the 1.x
+/// behaviour: only `process-guard-auto.exe`. None when `exe` has no folder.
+pub fn wrapper_paths(exe: &str) -> Option<Vec<String>> {
+    let (dir, _) = exe.rsplit_once('/')?;
+    let auto = |name: &str| format!("{}/{}-auto.exe", dir, name);
+    Some(match family(exe) {
+        Some((_, own)) => vec![auto(NAMES[own]), auto(NAMES[1 - own])],
+        None => vec![auto(NAMES[1])],
+    })
+}
+
 /// The PowerShell command line that runs `command` under the automatic guard.
 pub fn powershell_wrapped(auto_exe: &str, command: &str) -> String {
     let utf8 = crate::base64_encode(command.as_bytes());
@@ -197,10 +239,11 @@ pub fn powershell_wrapped(auto_exe: &str, command: &str) -> String {
 /// `hook powershell-auto`: rewrite a PowerShell tool call so the automatic
 /// guard runs it. A command that already starts with a guard path is left as is.
 pub fn powershell_auto(exe: &str) -> i32 {
-    let auto_exe = match exe.rsplit_once('/') {
-        Some((dir, _)) => format!("{}/process-guard-auto.exe", dir),
+    let wrappers = match wrapper_paths(exe) {
+        Some(paths) => paths,
         None => return 0,
     };
+    let auto_exe = wrappers[0].clone();
     let mut input = String::new();
     if std::io::stdin().take(16 * 1024 * 1024).read_to_string(&mut input).is_err() {
         return 0;
@@ -212,12 +255,14 @@ pub fn powershell_auto(exe: &str) -> i32 {
         None => return 0,
     };
     // Pass through unchanged only what is already exactly guarded: this hook's
-    // own wrapping, or a valid envelope. Anything else, including a command that
-    // merely starts with a guard path, is wrapped again (a double guard is harmless).
-    let already = valid_envelope(&command, exe) || command.trim()
-        .strip_prefix(&format!("& '{}' --shell powershell --command-b64 ", auto_exe.replace('\'', "''")))
+    // own wrapping (with either name's wrapper), or a valid envelope. Anything
+    // else, including a command that merely starts with a guard path, is wrapped
+    // again (a double guard is harmless).
+    let wrapped_already = |wrapper: &String| command.trim()
+        .strip_prefix(&format!("& '{}' --shell powershell --command-b64 ", wrapper.replace('\'', "''")))
         .and_then(|r| r.strip_suffix("; exit $LASTEXITCODE"))
         .map_or(false, |b64| crate::decode_command(b64).is_ok());
+    let already = valid_envelope(&command, exe) || wrappers.iter().any(wrapped_already);
     if already {
         println!("{{}}");
         return 0;
@@ -283,8 +328,14 @@ pub fn self_path() -> Option<String> {
     Some(text.strip_prefix("//?/").unwrap_or(&text).to_string())
 }
 
-/// True when `command` is exactly the guard envelope for executable `exe`.
+/// True when `command` is exactly the guard envelope for executable `exe`, or for
+/// the same executable under its other name (see `envelope_paths`).
 pub fn valid_envelope(command: &str, exe: &str) -> bool {
+    envelope_paths(exe).iter().any(|path| envelope_for(command, path))
+}
+
+/// True when `command` is exactly the guard envelope naming the executable `exe`.
+fn envelope_for(command: &str, exe: &str) -> bool {
     let mut rest = command.trim();
     if let Some(r) = rest.strip_prefix("& ") {
         rest = r;
@@ -349,16 +400,19 @@ pub fn antigravity_wrapped(wrapper: &str, command: &str) -> String {
 }
 
 /// True when `command` is exactly the wrapper form `<wrapper> --command-b64 BASE64`
-/// with a payload that decodes to a valid command, or a valid guard envelope.
-/// Nothing else counts: trailing text, other separators, another path or a path
-/// in another case are wrapped again.
-pub fn antigravity_guarded(command: &str, wrapper: &str, exe: &str) -> bool {
+/// with a payload that decodes to a valid command, or a valid guard envelope. The
+/// wrapper is either name's automatic copy beside `exe`, and the envelope names
+/// either name of the executable. Nothing else counts: trailing text, other
+/// separators, another path or a path in another case are wrapped again.
+pub fn antigravity_guarded(command: &str, exe: &str) -> bool {
     // Shells split on ASCII space, tab and newline only; trimming anything wider
     // (a no-break space, a vertical tab) would pass a line the wrapper then rejects.
     let trimmed = command.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
-    trimmed.strip_prefix(wrapper)
-        .and_then(|r| r.strip_prefix(" --command-b64 "))
-        .map_or(false, |b64| crate::decode_command(b64).is_ok())
+    wrapper_paths(exe).unwrap_or_default().iter().any(|wrapper| {
+        trimmed.strip_prefix(wrapper.as_str())
+            .and_then(|r| r.strip_prefix(" --command-b64 "))
+            .map_or(false, |b64| crate::decode_command(b64).is_ok())
+    })
         // valid_envelope trims Unicode whitespace itself; refuse what it would silently strip.
         || (trimmed.trim().len() == trimmed.len() && valid_envelope(trimmed, exe))
 }
@@ -379,7 +433,7 @@ fn ambiguous(obj: &Json, key: &str) -> bool {
 
 /// The one-line JSON decision for a Google Antigravity PreToolUse payload.
 /// `exe` is this executable's path with forward slashes; `wrapper_exists` says
-/// whether `process-guard-auto.exe` is present beside it.
+/// whether the automatic wrapper of its own name is present beside it.
 fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) -> String {
     let payload = match input.and_then(parse_json) {
         Some(p) => p,
@@ -412,8 +466,8 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
         Some(c) if !c.trim().is_empty() && !c.contains('\0') => c,
         _ => return antigravity_deny("run_command has no CommandLine, or it is empty or contains NUL."),
     };
-    let wrapper = match exe.rsplit_once('/') {
-        Some((dir, _)) => format!("{}/process-guard-auto.exe", dir),
+    let wrapper = match wrapper_paths(exe).and_then(|paths| paths.into_iter().next()) {
+        Some(path) => path,
         None => return antigravity_deny("the location of the process guard is unknown."),
     };
     if !wrapper_exists {
@@ -422,7 +476,7 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
     if !plain_path(&wrapper) {
         return antigravity_deny("the process guard must be installed in a path with only the characters A-Z, a-z, 0-9, colon, slash, period, underscore and hyphen, so the rewritten command parses the same in every shell.");
     }
-    if antigravity_guarded(command, &wrapper, exe) {
+    if antigravity_guarded(command, exe) {
         return "{\"decision\":\"allow\"}".into();
     }
     let rewritten = antigravity_wrapped(&wrapper, command);
@@ -441,7 +495,7 @@ fn antigravity_decision(exe: &str, input: Option<&str>, wrapper_exists: bool) ->
 pub fn antigravity(exe: &str) -> i32 {
     let mut input = String::new();
     let read = std::io::stdin().take(16 * 1024 * 1024).read_to_string(&mut input).is_ok();
-    let wrapper_exists = exe.rsplit_once('/').map_or(false, |(dir, _)| std::path::Path::new(&format!("{}/process-guard-auto.exe", dir)).is_file());
+    let wrapper_exists = wrapper_paths(exe).and_then(|paths| paths.into_iter().next()).map_or(false, |path| std::path::Path::new(&path).is_file());
     let line = antigravity_decision(exe, if read { Some(&input) } else { None }, wrapper_exists);
     let _ = writeln!(std::io::stdout(), "{}", line);
     0
@@ -501,7 +555,7 @@ pub fn main(vendor: &str) -> i32 {
 mod tests {
     use super::*;
 
-    const EXE: &str = "C:/Tools/process-guard/bin/process-guard.exe";
+    const EXE: &str = "C:/Tools/process-tree-guard/bin/process-guard.exe";
 
     #[test]
     fn envelope_accepts_only_the_exact_form() {
@@ -528,8 +582,8 @@ mod tests {
             good.replace(b64, "ZWNobyBPSw"),
             good.replace(b64, "ZWNobyBPSw==="),
             good.replace("powershell", "zsh"),
-            good.replace(EXE, "C:/Tools/process-guard/bin/process-guard.exe.evil"),
-            good.replace(EXE, "c:/tools/process-guard/bin/process-guard.exe"),
+            good.replace(EXE, "C:/Tools/process-tree-guard/bin/process-guard.exe.evil"),
+            good.replace(EXE, "c:/tools/process-tree-guard/bin/process-guard.exe"),
             good.replace("--shell powershell", "--shell  powershell"),
             format!("{} | more", good),
             format!("{} --extra", good),
@@ -538,7 +592,7 @@ mod tests {
         }
     }
 
-    const WRAPPER: &str = "C:/Tools/process-guard/bin/process-guard-auto.exe";
+    const WRAPPER: &str = "C:/Tools/process-tree-guard/bin/process-guard-auto.exe";
 
     #[test]
     fn base64_encoder_round_trips_through_the_decoder() {
@@ -555,10 +609,10 @@ mod tests {
     fn antigravity_guarded_matches_only_exact_forms() {
         let good = antigravity_wrapped(WRAPPER, "echo OK");
         assert_eq!(good, format!("{} --command-b64 ZWNobyBPSw==", WRAPPER));
-        assert!(antigravity_guarded(&good, WRAPPER, EXE));
-        assert!(antigravity_guarded(&format!("  {}\n", good), WRAPPER, EXE));
+        assert!(antigravity_guarded(&good, EXE));
+        assert!(antigravity_guarded(&format!("  {}\n", good), EXE));
         let envelope = format!("{} --timeout 60 --shell powershell --command-b64 ZWNobyBPSw==", EXE);
-        assert!(antigravity_guarded(&envelope, WRAPPER, EXE));
+        assert!(antigravity_guarded(&envelope, EXE));
         for bad in [
             "echo bad".to_string(),
             format!("{}; evil", good),
@@ -567,8 +621,8 @@ mod tests {
             format!("{}\nevil", good),
             format!("echo {}", good),
             format!("{}  --command-b64 ZWNobyBPSw==", WRAPPER),
-            good.replace(WRAPPER, "c:/tools/process-guard/bin/process-guard-auto.exe"),
-            good.replace(WRAPPER, "C:/Tools/process-guard/bin/other-auto.exe"),
+            good.replace(WRAPPER, "c:/tools/process-tree-guard/bin/process-guard-auto.exe"),
+            good.replace(WRAPPER, "C:/Tools/process-tree-guard/bin/other-auto.exe"),
             good.replace(WRAPPER, &format!("{}.evil", WRAPPER)),
             good.replace("ZWNobyBPSw==", "ZWNobyBPSw"),
             good.replace("ZWNobyBPSw==", "////"),
@@ -585,8 +639,91 @@ mod tests {
             format!("{}\u{a0}", envelope),
             format!("\u{b}{}", envelope),
         ] {
-            assert!(!antigravity_guarded(&bad, WRAPPER, EXE), "{:?}", bad);
+            assert!(!antigravity_guarded(&bad, EXE), "{:?}", bad);
         }
+    }
+
+    const TREE_EXE: &str = "C:/Tools/process-tree-guard/bin/process-tree-guard.exe";
+    const TREE_WRAPPER: &str = "C:/Tools/process-tree-guard/bin/process-tree-guard-auto.exe";
+
+    #[test]
+    fn both_names_are_one_family() {
+        assert_eq!(wrapper_paths(EXE), Some(vec![WRAPPER.to_string(), TREE_WRAPPER.to_string()]));
+        assert_eq!(wrapper_paths(TREE_EXE), Some(vec![TREE_WRAPPER.to_string(), WRAPPER.to_string()]));
+        // Another name keeps the 1.x wrapper alone; a path without a folder has no wrapper.
+        assert_eq!(wrapper_paths("C:/Tools/pg/bin/other.exe"), Some(vec!["C:/Tools/pg/bin/process-guard-auto.exe".to_string()]));
+        assert_eq!(wrapper_paths("process-guard.exe"), None);
+        assert_eq!(envelope_paths(EXE), vec![EXE.to_string(), TREE_EXE.to_string()]);
+        assert_eq!(envelope_paths(TREE_EXE), vec![TREE_EXE.to_string(), EXE.to_string()]);
+        assert_eq!(envelope_paths("C:/Tools/pg/bin/other.exe"), vec!["C:/Tools/pg/bin/other.exe".to_string()]);
+        // The automatic copies are not envelope names.
+        assert_eq!(envelope_paths(WRAPPER).len(), 1);
+    }
+
+    #[test]
+    fn envelope_accepts_either_name_in_the_same_folder_only() {
+        let b64 = "ZWNobyBPSw==";
+        for (exe, other) in [(EXE, TREE_EXE), (TREE_EXE, EXE)] {
+            assert!(valid_envelope(&format!("{} --timeout 60 --shell bash --command-b64 {}", exe, b64), exe));
+            assert!(valid_envelope(&format!("& {} --timeout 60 --shell bash --command-b64 {}", other, b64), exe));
+            for bad in [
+                other.replace("/bin/", "/other/"),
+                other.to_uppercase(),
+                other.replace(".exe", "-auto.exe"),
+                format!("{}.evil", other),
+                other.replace("process-", "xprocess-"),
+            ] {
+                let line = format!("{} --timeout 60 --shell bash --command-b64 {}", bad, b64);
+                assert!(!valid_envelope(&line, exe), "{}", line);
+            }
+        }
+        // An executable under any other name allows only its own path.
+        let own = "C:/Tools/pg/bin/other.exe";
+        assert!(valid_envelope(&format!("{} --timeout 5 --shell cmd --command-b64 {}", own, b64), own));
+        assert!(!valid_envelope(&format!("C:/Tools/pg/bin/process-guard.exe --timeout 5 --shell cmd --command-b64 {}", b64), own));
+    }
+
+    #[test]
+    fn antigravity_guarded_accepts_both_names_wrappers_and_envelopes() {
+        let b64 = "ZWNobyBPSw==";
+        for exe in [EXE, TREE_EXE] {
+            for wrapper in [WRAPPER, TREE_WRAPPER] {
+                assert!(antigravity_guarded(&format!("{} --command-b64 {}", wrapper, b64), exe), "{} {}", exe, wrapper);
+            }
+            for path in [EXE, TREE_EXE] {
+                assert!(antigravity_guarded(&format!("{} --timeout 60 --shell powershell --command-b64 {}", path, b64), exe), "{} {}", exe, path);
+            }
+            for bad in [
+                format!("{} --command-b64 {}", WRAPPER.to_uppercase(), b64),
+                format!("{} --command-b64 {}", TREE_WRAPPER.replace("/bin/", "/other/"), b64),
+                format!("{}.evil --command-b64 {}", TREE_WRAPPER, b64),
+                format!("{} --command-b64 {}; evil", TREE_WRAPPER, b64),
+            ] {
+                assert!(!antigravity_guarded(&bad, exe), "{}", bad);
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_decision_uses_the_wrapper_of_its_own_name() {
+        let decide_for = |exe: &str, original: &str| {
+            let input = call(&quote(original));
+            parse_json(&antigravity_decision(exe, Some(&input), true)).expect("one JSON object")
+        };
+        for (exe, wrapper) in [(EXE, WRAPPER), (TREE_EXE, TREE_WRAPPER)] {
+            let d = decide_for(exe, "echo hi");
+            let line = d.get("overwrite").and_then(|o| o.get("CommandLine")).and_then(Json::as_str).unwrap();
+            assert_eq!(line, antigravity_wrapped(wrapper, "echo hi"));
+            // The other name's wrapper passes through unchanged.
+            let other = if wrapper == WRAPPER { TREE_WRAPPER } else { WRAPPER };
+            let d = decide_for(exe, &antigravity_wrapped(other, "echo hi"));
+            assert_eq!(d.get("decision").and_then(Json::as_str), Some("allow"));
+            assert!(d.get("overwrite").is_none());
+        }
+        // A missing wrapper is reported by its own name.
+        let missing = parse_json(&antigravity_decision(TREE_EXE, Some(&call("\"echo hi\"")), false)).unwrap();
+        assert_eq!(missing.get("decision").and_then(Json::as_str), Some("deny"));
+        assert!(missing.get("reason").and_then(Json::as_str).map_or(false, |r| r.contains("process-tree-guard-auto.exe")));
     }
 
     fn call(command_json: &str) -> String {

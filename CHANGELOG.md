@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.0.0-alpha.1
+
+The project and the program are renamed from process-guard to process-tree-guard. This is the first step toward 2.0.0; behaviour is otherwise unchanged.
+
+- The package and the primary executable are `process-tree-guard`. Its automatic mode is the same executable under a name ending in `-auto`, as before: `process-tree-guard-auto.exe`.
+- Compatibility aliases, kept through all of 2.x and removed in 3.0: the same executable installed as `process-guard.exe` or `process-guard-auto.exe` behaves identically to the new names. The name is the only thing read, so a name ending in `-auto` selects automatic mode under either family.
+- Every `hook` subcommand works under both names. The envelope check accepts an envelope that names the executable it runs from or the same executable under its other name in the same folder. `hook antigravity` wraps with the automatic copy of its own name family (`process-tree-guard-auto.exe` for `process-tree-guard.exe`, `process-guard-auto.exe` for `process-guard.exe`; any other file name keeps the 1.x behaviour and uses `process-guard-auto.exe` alone), requires that copy to be present, and passes through unchanged a line already in the wrapper form of either family or already a valid envelope of either name.
+- The automatic deadline is read from `PROCESS_TREE_GUARD_AUTO_TIMEOUT`, then `PROCESS_GUARD_AUTO_TIMEOUT`, then `HARNESS_AUTO_TIMEOUT`; the first one that is set is used. The tests read `PROCESS_TREE_GUARD_TIMING`, then `PROCESS_GUARD_TIMING`, and `PROCESS_TREE_GUARD_EXE`, then `PROCESS_GUARD_EXE`, in the same way.
+- Unchanged: the deadlines, the 86400 second `--timeout` maximum, exit codes 124 and 125, containment, every existing check, and the messages on standard error (`PROCESS_TIMEOUT`, `PROCESS_OWNER_EXITED`, the `PROCESS_GUARD_ERROR` prefix and the hook denial text). The only wording that changes is the program name in the `--help` usage line.
+- Releases attach the one executable `process-tree-guard.exe`, with its documentation files (`LICENSE`, `NOTICE`, `README.md` and `POLICY.md`) and `SHA256SUMS`; the test helper is not part of a release, and the release workflow stops if it is.
+- 24 new checks: G29 to G34 (both binary names, and the order of the timing variables), U14 to U18 (both automatic names, the `auto` subcommand, the order of the deadline variables, the PowerShell hook under both names), B117 to B122 (hook mode under both names, and its denial text) and A26 to A32 (the Google Antigravity hook under both names, and under another file name). The existing checks run against the new names.
+
 ## 1.5.1
 
 - `hook antigravity` also denies a payload with more than one `toolCall` key, or a `toolCall` object with more than one `name` or `args` key, in any letter case or repeated (check A25). Before, the hook read the last exact match, and a host that chose another candidate could run a command the hook had not checked. The rule applies whatever tool the payload names.

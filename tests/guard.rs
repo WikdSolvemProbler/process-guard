@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the process guard binary (inventory G1 to G27).
+//! Behaviour tests for the process guard binary (inventory G1 to G34).
 //!
-//! They run the built guard, or the one named by PROCESS_GUARD_EXE, through
-//! timeouts, descendant cleanup, owner exit, breakaway refusal, all three
-//! shells, standard streams and argument quoting. The helper executable stands
-//! in for every child. The parity table is in tests/PARITY.md.
+//! They run the built guard, or the one named by PROCESS_TREE_GUARD_EXE (the 1.x
+//! name PROCESS_GUARD_EXE also works), through timeouts, descendant cleanup,
+//! owner exit, breakaway refusal, all three shells, standard streams and argument
+//! quoting, and under both of its program names. The helper executable stands in
+//! for every child. The parity table is in tests/PARITY.md.
 
 mod common;
 
 use common::*;
+use std::process::Command;
 
 fn reject(checks: &mut Checks, id: &str, name: &str, args: &[&str]) {
     let result = run_guard(args);
@@ -196,4 +198,83 @@ fn g27_cmd_files_rejected() {
     let result = guarded("5", &[&text(&script)]);
     assert_eq!(result.code, 125, "{}", result.err());
     assert!(result.err().contains(".cmd/.bat"), "stderr: {}", result.err());
+}
+
+// ------------------------------------------------- the two program names (G29 to G34)
+
+/// A private folder holding the guard under the given program name.
+fn named_copy(name: &str) -> (TempDir, String) {
+    let dir = TempDir::new("gn-");
+    let exe = copy_guard(dir.path(), name);
+    (dir, exe)
+}
+
+fn run_named(exe: &str, args: &[&str], input: Option<&[u8]>) -> Out {
+    let mut command = Command::new(exe);
+    command.args(args);
+    exec_with(command, Opts { input: input.map(|i| i.to_vec()), ..Opts::default() })
+}
+
+#[test]
+fn g29_to_g33_both_names_behave_identically() {
+    let mut checks = Checks::new("both program names");
+    for name in NAMES {
+        let (_dir, exe) = named_copy(name);
+
+        let result = run_named(&exe, &["--timeout", "5", "--", testkit(), "relay", "7"], Some(b"input-stream"));
+        checks.check("G29", &format!("{}: exit code, standard input and standard error", name),
+            result.code == 7 && result.out().contains("input-stream") && result.err().contains("error-stream"),
+            format!("exit {} {}", result.code, result.err().trim()));
+
+        let result = run_named(&exe, &["--timeout", ".3", "--", testkit(), "sleep", "10"], None);
+        checks.check("G30", &format!("{}: deadline ends the command with 124", name),
+            result.code == 124 && result.err().contains("PROCESS_TIMEOUT"), format!("exit {} {}", result.code, result.err().trim()));
+
+        let dir = TempDir::new("g31-");
+        let marker = dir.join("pid.txt");
+        let marker_text = text(&marker);
+        let result = run_named(&exe, &["--timeout", "5", "--", testkit(), "spawn", "0", "30", testkit(), "mark", &marker_text, "20"], None);
+        let child = read_id(&marker);
+        checks.check("G31", &format!("{}: a descendant is dead when the guard returns on a deadline", name),
+            result.code == 124 && child.map_or(false, |c| !alive(c)), format!("exit {} child {:?}", result.code, child));
+
+        let none = run_named(&exe, &[], None);
+        let bogus = run_named(&exe, &["--bogus", "1"], None);
+        let help = run_named(&exe, &["--help"], None);
+        checks.check("G32", &format!("{}: errors exit 125, help exits 0", name),
+            none.code == 125 && bogus.code == 125 && help.code == 0 && help.out().contains("--timeout"),
+            format!("none {} bogus {} help {}", none.code, bogus.code, help.code));
+
+        let mut shells_ok = true;
+        let mut detail = String::new();
+        for (shell_name, command) in [("powershell", "Write-Output 'guard-ok'"), ("bash", "printf 'guard-ok\n'"), ("cmd", "echo guard-ok")] {
+            let result = run_named(&exe, &["--timeout", "20", "--shell", shell_name, "--command-b64", &base64(command.as_bytes())], None);
+            if result.code != 0 || !result.out().contains("guard-ok") {
+                shells_ok = false;
+                detail = format!("{} exit {} {}", shell_name, result.code, result.err().trim());
+            }
+        }
+        checks.check("G33", &format!("{}: PowerShell, Git Bash and cmd payloads run", name), shells_ok, detail);
+    }
+    checks.finish();
+}
+
+#[test]
+fn g34_timing_variables_are_read_in_order() {
+    let mut checks = Checks::new("timing variables");
+    let cases: [(Option<&str>, Option<&str>, bool); 8] = [
+        (None, None, true),
+        (None, Some("info"), false),
+        (None, Some("INFO"), false),
+        (None, Some("strict"), true),
+        (Some("info"), None, false),
+        (Some("info"), Some("strict"), false),
+        (Some("strict"), Some("info"), true),
+        (Some(""), Some("info"), true),
+    ];
+    for (new_name, old_name, strict) in cases {
+        checks.check("G34", &format!("PROCESS_TREE_GUARD_TIMING {:?}, PROCESS_GUARD_TIMING {:?}", new_name, old_name),
+            timing_strict_for(new_name, old_name) == strict, format!("expected strict {}", strict));
+    }
+    checks.finish();
 }

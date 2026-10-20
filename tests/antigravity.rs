@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A24):
+//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A32):
 //! `hook antigravity` rewrites a `run_command` call so the automatic wrapper runs
 //! it, and `hook antigravity-context` prints the policy as a SessionStart message.
 //! Git Bash, Windows PowerShell and cmd are required. The parity table is in
 //! tests/PARITY.md.
 //!
-//! The hook names the automatic wrapper beside the guard it runs from, so every
+//! The hook names the automatic wrapper beside the guard it runs from (the one of
+//! the guard's own name, `process-tree-guard` or its 1.x alias `process-guard`), so every
 //! test copies the guard into a private `bin` folder and nothing is written next
 //! to the build. That folder is made under the build's scratch folder or the
 //! temporary folder, whichever has a path of only A-Z a-z 0-9 : / . _ - (the
@@ -20,8 +21,8 @@ use common::*;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
 
-/// A private install: `<root>/bin/process-guard.exe` and, unless left out,
-/// `<root>/bin/process-guard-auto.exe`, with forward slash spellings of both.
+/// A private install: `<root>/bin/<name>.exe` and, unless left out,
+/// `<root>/bin/<name>-auto.exe`, with forward slash spellings of both.
 struct Install {
     _root: TempDir,
     hook: String,
@@ -49,15 +50,20 @@ fn plain_base() -> std::path::PathBuf {
     );
 }
 
+/// An install under the 2.0 name.
 fn make_install(prefix: &str, with_auto: bool) -> Install {
+    make_install_as(prefix, NAMES[0], with_auto)
+}
+
+/// An install under the given program name, with or without its automatic copy.
+fn make_install_as(prefix: &str, name: &str, with_auto: bool) -> Install {
     let root = TempDir::new_in(&plain_base(), prefix);
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).expect("create the bin folder");
-    let hook = text(&bin.join("process-guard.exe"));
-    let auto = text(&bin.join("process-guard-auto.exe"));
-    std::fs::copy(guard(), &hook).expect("copy the guard");
+    let hook = copy_guard(&bin, name);
+    let auto = text(&bin.join(format!("{}-auto.exe", name)));
     if with_auto {
-        std::fs::copy(guard(), &auto).expect("copy the wrapper");
+        copy_guard(&bin, &format!("{}-auto", name));
     }
     Install { _root: root, hook: posix(&hook), auto: posix(&auto) }
 }
@@ -353,7 +359,7 @@ fn a01_to_a12_hook_decisions() {
     let d = missing.ask("A9", call("\"echo hi\"").as_bytes());
     let other = missing.ask("A9", br#"{"toolCall":{"name":"view_file"}}"#);
     checks.check("A9", "a missing automatic wrapper is denied",
-        decision(&d) == Some("deny") && reason(&d).contains("missing") && reason(&d).contains("process-guard-auto.exe") && d.get("overwrite").is_none() && decision(&other) == Some("allow"),
+        decision(&d) == Some("deny") && reason(&d).contains("missing") && reason(&d).contains("process-tree-guard-auto.exe") && d.get("overwrite").is_none() && decision(&other) == Some("allow"),
         reason(&d));
     s.runs.extend(missing.runs);
 
@@ -395,7 +401,7 @@ fn rewrite(install: &Install, original: &str) -> String {
     command_line(&d).unwrap_or_else(|| panic!("no overwrite for {:?}: {}", original, out.out())).to_string()
 }
 
-const AUTO_TIMEOUT: &str = "PROCESS_GUARD_AUTO_TIMEOUT";
+const AUTO_TIMEOUT: &str = "PROCESS_TREE_GUARD_AUTO_TIMEOUT";
 
 /// The rewritten line run as a PowerShell command, with `exit $LASTEXITCODE` appended
 /// when `collect_exit` is true. The hook does not add that suffix: under
@@ -405,6 +411,7 @@ fn powershell_with(line: &str, collect_exit: bool, env: &[(&str, &str)]) -> Out 
     let mut command = Command::new("powershell.exe");
     let text = if collect_exit { format!("{}; exit $LASTEXITCODE", line) } else { line.to_string() };
     command.arg("-NoProfile").arg("-Command").arg(text);
+    without_deadline_variables(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -420,6 +427,7 @@ fn bash(line: &str, env: &[(&str, &str)]) -> Out {
     assert!(std::path::Path::new(BASH).exists(), "Git Bash is required at {}", BASH);
     let mut command = Command::new(BASH);
     command.args(["--noprofile", "--norc", "-c", line]);
+    without_deadline_variables(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -429,6 +437,7 @@ fn bash(line: &str, env: &[(&str, &str)]) -> Out {
 fn cmd(line: &str, env: &[(&str, &str)]) -> Out {
     let mut command = Command::new("cmd.exe");
     command.raw_arg(format!("/d /s /c \"{}\"", line));
+    without_deadline_variables(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -593,5 +602,171 @@ fn a19_to_a21_session_start_context() {
     checks.check("A21", "a missing policy file still gives valid JSON and exit 0",
         out.code == 0 && message.map_or(false, |m| m.contains("POLICY.md not found")),
         format!("exit {} {}", out.code, out.out()));
+    checks.finish();
+}
+
+// ------------------------------------------- the two program names (A26 to A32)
+
+fn other_name(name: &str) -> &'static str {
+    NAMES.iter().find(|n| **n != name).copied().expect("two names")
+}
+
+/// The decision for `original` as the hook of `install` returns it.
+fn decide(label: &str, session: &mut Session, original: &str) -> Json {
+    session.ask(label, call(&json_quote(original)).as_bytes())
+}
+
+#[test]
+fn a26_a28_name_families() {
+    let mut checks = Checks::new("antigravity program names");
+    for name in NAMES {
+        let other = other_name(name);
+        let install = make_install_as("agn-", name, true);
+        let mut s = Session::new(&install);
+
+        // A26: the rewrite names the automatic wrapper of the guard's own name, and the payload is exact.
+        let command = "echo \"q\" 'r' \\ s\n\u{fc}";
+        let d = decide("A26", &mut s, command);
+        let line = command_line(&d).unwrap_or("");
+        checks.check("A26", &format!("{}: the rewrite names {}-auto.exe", name, name),
+            decision(&d) == Some("allow") && line == s.wrapped(command) && line.contains(&format!("/{}-auto.exe ", name)) && !line.contains(&format!("/{}-auto.exe ", other)),
+            line);
+
+        // A27: both names' wrapper forms and envelopes pass through unchanged; near misses are wrapped again.
+        let b64 = base64(b"echo OK");
+        let bin = install.hook.rsplit_once('/').map(|(dir, _)| dir.to_string()).unwrap();
+        let own_wrapper = format!("{}/{}-auto.exe", bin, name);
+        let other_wrapper = format!("{}/{}-auto.exe", bin, other);
+        let other_exe = format!("{}/{}.exe", bin, other);
+        let mut passes = true;
+        let mut detail = String::new();
+        for line in [
+            format!("{} --command-b64 {}", own_wrapper, b64),
+            format!("{} --command-b64 {}", other_wrapper, b64),
+            format!("  {} --command-b64 {}\n", other_wrapper, b64),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}", install.hook, b64),
+            format!("& {} --timeout 0.5 --shell bash --command-b64 {}", other_exe, b64),
+        ] {
+            let d = decide("A27", &mut s, &line);
+            if decision(&d) != Some("allow") || d.get("overwrite").is_some() {
+                passes = false;
+                detail = line;
+            }
+        }
+        checks.check("A27", &format!("{}: both names' wrapper forms and envelopes pass through unchanged", name), passes, detail);
+        let mut rewrapped = true;
+        let mut detail = String::new();
+        for line in [
+            format!("{} --command-b64 {}", other_wrapper.to_uppercase(), b64),
+            format!("{} --command-b64 {}", other_wrapper.replace("/bin/", "/bin2/"), b64),
+            format!("{}.evil --command-b64 {}", other_wrapper, b64),
+            format!("{} --command-b64 {}; evil", other_wrapper, b64),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}", other_exe.to_uppercase(), b64),
+            format!("{} --timeout 60 --shell powershell --command-b64 {}; evil", other_exe, b64),
+        ] {
+            let d = decide("A27", &mut s, &line);
+            if decision(&d) != Some("allow") || command_line(&d) != Some(s.wrapped(&line).as_str()) {
+                rewrapped = false;
+                detail = line;
+            }
+        }
+        checks.check("A27", &format!("{}: near misses of the other name are wrapped again", name), rewrapped, detail);
+
+        // A28: the wrapper of the guard's own name must be present; the other name's copy does not stand in for it.
+        let lone = make_install_as("agn-miss-", name, false);
+        let lone_bin = std::path::Path::new(&lone.hook).parent().unwrap().to_path_buf();
+        copy_guard(&lone_bin, &format!("{}-auto", other));
+        let mut missing = Session::new(&lone);
+        let d = decide("A28", &mut missing, "echo hi");
+        let passed = decide("A28", &mut missing, &format!("{}/{}-auto.exe --command-b64 {}", posix(&text(&lone_bin)), other, b64));
+        let view = missing.ask("A28", br#"{"toolCall":{"name":"view_file"}}"#);
+        checks.check("A28", &format!("{}: without {}-auto.exe the call is denied by that name, though {}-auto.exe is present", name, name, other),
+            decision(&d) == Some("deny") && reason(&d).contains(&format!("{}-auto.exe", name)) && d.get("overwrite").is_none()
+                && decision(&passed) == Some("deny") && decision(&view) == Some("allow"),
+            reason(&d));
+        s.runs.extend(missing.runs);
+
+        let bad: Vec<String> = s.runs.iter().filter(|r| r.1 != 0 || !matches!(Json::parse(r.2.trim()), Some(Json::Obj(_)))).map(|r| format!("{} exit {}", r.0, r.1)).collect();
+        checks.check("A26", &format!("{}: exit 0 and one JSON object in every run", name), bad.is_empty(), format!("{:?}", bad));
+    }
+    checks.finish();
+}
+
+#[test]
+fn a32_other_file_names_keep_the_1x_wrapper() {
+    let mut checks = Checks::new("antigravity other file names");
+    // A guard under a file name that is neither program name uses process-guard-auto.exe, as in 1.x.
+    let install = make_install_as("agn-pg-", "pg", false);
+    let bin = std::path::Path::new(&install.hook).parent().unwrap().to_path_buf();
+    let legacy = format!("{}/process-guard-auto.exe", posix(&text(&bin)));
+    let b64 = base64(b"echo OK");
+
+    // With only the 2.0 automatic copy beside it the call is denied, naming the 1.x wrapper.
+    copy_guard(&bin, "process-tree-guard-auto");
+    let mut s = Session::new(&install);
+    let d = decide("A32", &mut s, "echo hi");
+    let tree_form = decide("A32", &mut s, &format!("{}/process-tree-guard-auto.exe --command-b64 {}", posix(&text(&bin)), b64));
+    checks.check("A32", "pg.exe: with only process-tree-guard-auto.exe beside it the call is denied and the reason names process-guard-auto.exe",
+        decision(&d) == Some("deny") && reason(&d).contains("process-guard-auto.exe") && !reason(&d).contains("process-tree-guard-auto.exe") && d.get("overwrite").is_none() && decision(&tree_form) == Some("deny"),
+        reason(&d));
+
+    // With the 1.x copy present the rewrite names it; the 2.0 wrapper form is not recognised and is wrapped again.
+    copy_guard(&bin, "process-guard-auto");
+    let mut s = Session { auto: legacy.clone(), ..Session::new(&install) };
+    let command = "echo hi";
+    let d = decide("A32", &mut s, command);
+    checks.check("A32", "pg.exe: the rewrite names process-guard-auto.exe",
+        decision(&d) == Some("allow") && command_line(&d) == Some(s.wrapped(command).as_str()), command_line(&d).unwrap_or(""));
+    let own = format!("{} --command-b64 {}", legacy, b64);
+    let d = decide("A32", &mut s, &own);
+    checks.check("A32", "pg.exe: the 1.x wrapper form passes through unchanged", decision(&d) == Some("allow") && d.get("overwrite").is_none(), command_line(&d).unwrap_or(""));
+    let tree = format!("{}/process-tree-guard-auto.exe --command-b64 {}", posix(&text(&bin)), b64);
+    let d = decide("A32", &mut s, &tree);
+    checks.check("A32", "pg.exe: the 2.0 wrapper form is wrapped again", decision(&d) == Some("allow") && command_line(&d) == Some(s.wrapped(&tree).as_str()), command_line(&d).unwrap_or(""));
+
+    let bad: Vec<String> = s.runs.iter().filter(|r| r.1 != 0 || !matches!(Json::parse(r.2.trim()), Some(Json::Obj(_)))).map(|r| format!("{} exit {}", r.0, r.1)).collect();
+    checks.check("A32", "pg.exe: exit 0 and one JSON object in every run", bad.is_empty(), format!("{:?}", bad));
+    checks.finish();
+}
+
+#[test]
+fn a29_a30_end_to_end_under_both_names() {
+    let mut checks = Checks::new("antigravity end to end, both names");
+    for name in NAMES {
+        let install = make_install_as("agn-e2e-", name, true);
+
+        // A29: the rewritten line keeps its output and exit code in all three shells.
+        let ps = powershell(&rewrite(&install, "Write-Output (6*7)\nexit 9"), &[]);
+        let sh = bash(&rewrite(&install, "echo $((6*7)); exit 9"), &[]);
+        let cm = cmd(&rewrite(&install, "echo 42 & exit /b 9"), &[]);
+        checks.check("A29", &format!("{}: output and exit code survive in PowerShell, Git Bash and cmd", name),
+            [&ps, &sh, &cm].iter().all(|o| o.code == 9 && o.out().contains("42")),
+            format!("ps {} {:?} bash {} {:?} cmd {} {:?}", ps.code, ps.err(), sh.code, sh.err(), cm.code, cm.err()));
+
+        // A30: each deadline variable ends a sleeping command with 124.
+        let line = rewrite(&install, "sleep 30");
+        for variable in AUTO_TIMEOUT_VARIABLES {
+            let out = bash(&line, &[(variable, "0.5")]);
+            checks.check("A30", &format!("{}: {} ends a sleeping command with 124", name, variable), out.code == 124, format!("exit {} {}", out.code, out.err()));
+            bounded(&mut checks, "A30", &out);
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn a31_session_context_under_both_names() {
+    let mut checks = Checks::new("antigravity session context, both names");
+    let policy = "# Policy\nTwo names {{BIN}}\n";
+    for name in NAMES {
+        let install = make_install_as("agn-ctx-", name, true);
+        let root = std::path::Path::new(&install.hook).parent().and_then(|bin| bin.parent()).expect("install root").to_path_buf();
+        std::fs::write(root.join("POLICY.md"), policy).expect("write the policy");
+        let out = run_hook(&install.hook, "antigravity-context", b"");
+        let message = Json::parse(out.out().trim())
+            .and_then(|j| match j.get("injectSteps") { Some(Json::Arr(steps)) if steps.len() == 1 => steps[0].get("systemMessage").and_then(|m| m.get("systemMessage")).and_then(Json::as_str).map(str::to_string), _ => None });
+        checks.check("A31", &format!("{}: the policy is the session system message", name),
+            out.code == 0 && message.as_deref() == Some(policy), format!("exit {} {}", out.code, out.out()));
+    }
     checks.finish();
 }

@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Shiller
 
 //! Behaviour tests for automatic mode: the wrapper a host puts in front of every
-//! shell command (inventory U1 to U13). Git Bash, Windows PowerShell and cmd are
+//! shell command (inventory U1 to U18). Git Bash, Windows PowerShell and cmd are
 //! required. The parity table is in tests/PARITY.md.
 
 mod common;
@@ -10,19 +10,23 @@ mod common;
 use common::*;
 use std::process::{Command, Stdio};
 
-/// A copy of the guard under the name that selects automatic mode.
-fn auto_copy() -> (TempDir, String) {
+/// A copy of the guard under the name that selects automatic mode for the given program name.
+fn auto_copy_of(name: &str) -> (TempDir, String) {
     let dir = TempDir::new("auto-");
-    let path = dir.join("process-guard-auto.exe");
-    std::fs::copy(guard(), &path).expect("copy the guard");
-    let path = text(&path);
+    let path = copy_guard(dir.path(), &format!("{}-auto", name));
     (dir, path)
+}
+
+/// A copy of the guard under the 2.0 name that selects automatic mode.
+fn auto_copy() -> (TempDir, String) {
+    auto_copy_of(NAMES[0])
 }
 
 fn bash(line: &str, input: Option<&[u8]>, env: &[(&str, &str)]) -> Out {
     assert!(std::path::Path::new(BASH).exists(), "Git Bash is required at {}", BASH);
     let mut command = Command::new(BASH);
     command.args(["--noprofile", "--norc", "-c", line]);
+    without_deadline_variables(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -76,7 +80,7 @@ fn u05_stdin_and_exit_code_pass_through_like_a_hook() {
 #[test]
 fn u06_default_deadline_from_environment() {
     let (_dir, auto) = auto_copy();
-    let result = bash(&format!("'{}' 'sleep 30'", posix(&auto)), None, &[("PROCESS_GUARD_AUTO_TIMEOUT", "0.5")]);
+    let result = bash(&format!("'{}' 'sleep 30'", posix(&auto)), None, &[("PROCESS_TREE_GUARD_AUTO_TIMEOUT", "0.5")]);
     assert_eq!(result.code, 124, "{}", result.err());
     if timing_strict() {
         assert!(result.elapsed.as_secs_f64() < 10.0, "took {:?}", result.elapsed);
@@ -145,10 +149,8 @@ fn u09_powershell_hook_rewrites_and_the_rewrite_runs() {
     let dir = TempDir::new("u9-");
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let hook_exe = text(&bin.join("process-guard.exe"));
-    let auto_exe = text(&bin.join("process-guard-auto.exe"));
-    std::fs::copy(guard(), &hook_exe).unwrap();
-    std::fs::copy(guard(), &auto_exe).unwrap();
+    let hook_exe = copy_guard(&bin, NAMES[0]);
+    let auto_exe = copy_guard(&bin, &format!("{}-auto", NAMES[0]));
     let auto_posix = posix(&auto_exe);
     let run_hook = |body: &str| {
         let mut command = Command::new(&hook_exe);
@@ -204,6 +206,129 @@ fn u10_to_u13_errors_return_125() {
         command.args(args);
         let result = exec(command);
         checks.check(id, &format!("arguments {:?}", args), result.code == 125, format!("exit {}", result.code));
+    }
+    checks.finish();
+}
+
+// ------------------------------------------- the two program names (U14 to U18)
+
+#[test]
+fn u14_to_u16_both_automatic_names() {
+    let mut checks = Checks::new("both automatic names");
+    for name in NAMES {
+        let (_dir, auto) = auto_copy_of(name);
+
+        // U14: a command string runs in the shell of its launcher (Git Bash here).
+        let result = bash(&format!("'{}' 'echo \"$((6*7))\"; exit 3'", posix(&auto)), None, &[]);
+        checks.check("U14", &format!("{}-auto: command string from Git Bash", name),
+            result.code == 3 && result.out().contains("42"), format!("exit {} {}", result.code, result.err().trim()));
+
+        // U15: a program and its arguments, and the argument error.
+        let mut command = Command::new(&auto);
+        command.args([testkit(), "args-exit", "5", "a b", "\"q\""]);
+        let result = exec(command);
+        let decoded = Json::parse(result.out().trim()).and_then(|j| j.strings());
+        let none = exec(Command::new(&auto));
+        checks.check("U15", &format!("{}-auto: program and arguments, and no arguments is 125", name),
+            result.code == 5 && decoded == Some(vec!["a b".to_string(), "\"q\"".to_string()]) && none.code == 125,
+            format!("exit {} {:?} no arguments {}", result.code, result.out(), none.code));
+
+        // U16: the `auto` subcommand of the plain name.
+        let dir = TempDir::new("u16-");
+        let plain = copy_guard(dir.path(), name);
+        let result = bash(&format!("'{}' auto 'echo sub-ok'", posix(&plain)), None, &[]);
+        checks.check("U16", &format!("{}: the auto subcommand", name),
+            result.code == 0 && result.out().contains("sub-ok"), format!("exit {} {}", result.code, result.err().trim()));
+    }
+    checks.finish();
+}
+
+/// Run a three second sleeper under an automatic copy with exactly these deadline variables set.
+fn sleeper_with(auto: &str, env: &[(&str, &str)]) -> Out {
+    let mut command = Command::new(auto);
+    command.args([testkit(), "sleep", "3"]);
+    without_deadline_variables(&mut command);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    exec(command)
+}
+
+#[test]
+fn u17_deadline_variables_are_read_in_order() {
+    let [new_name, old_name, legacy] = AUTO_TIMEOUT_VARIABLES;
+    let mut checks = Checks::new("deadline variable order");
+    // A short value that is read ends the sleeper with 124; a long one lets it finish with 0.
+    let cases: [(&str, Vec<(&str, &str)>, u32); 7] = [
+        ("the 2.0 name beats both older names", vec![(new_name, "0.5"), (old_name, "60"), (legacy, "60")], 124),
+        ("the 2.0 name beats shorter older names", vec![(new_name, "60"), (old_name, "0.5"), (legacy, "0.5")], 0),
+        ("the 1.x name beats the legacy name", vec![(old_name, "0.5"), (legacy, "60")], 124),
+        ("the 1.x name beats a shorter legacy name", vec![(old_name, "60"), (legacy, "0.5")], 0),
+        ("the 2.0 name alone", vec![(new_name, "0.5")], 124),
+        ("the 1.x name alone", vec![(old_name, "0.5")], 124),
+        ("the legacy name alone", vec![(legacy, "0.5")], 124),
+    ];
+    let (_tree_dir, tree_auto) = auto_copy_of(NAMES[0]);
+    for (name, env, expected) in &cases {
+        let result = sleeper_with(&tree_auto, env);
+        checks.check("U17", &format!("{}-auto: {}", NAMES[0], name), result.code == *expected, format!("exit {} {}", result.code, result.err().trim()));
+    }
+    // The 1.x automatic name reads the same order; the deadline cases are enough to show it.
+    let (_old_dir, old_auto) = auto_copy_of(NAMES[1]);
+    for (name, env, expected) in cases.iter().filter(|case| case.2 == 124) {
+        let result = sleeper_with(&old_auto, env);
+        checks.check("U17", &format!("{}-auto: {}", NAMES[1], name), result.code == *expected, format!("exit {} {}", result.code, result.err().trim()));
+    }
+    checks.finish();
+}
+
+#[test]
+fn u18_powershell_hook_under_both_names() {
+    let mut checks = Checks::new("PowerShell hook under both names");
+    for name in NAMES {
+        let other = NAMES.iter().find(|n| **n != name).copied().unwrap();
+        let dir = TempDir::new("u18-");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let hook_exe = copy_guard(&bin, name);
+        let auto_posix = posix(&copy_guard(&bin, &format!("{}-auto", name)));
+        let other_auto_posix = posix(&text(&bin.join(format!("{}-auto.exe", other))));
+        let other_exe_posix = posix(&text(&bin.join(format!("{}.exe", other))));
+        let run_hook = |command_json: &str| {
+            let mut command = Command::new(&hook_exe);
+            command.args(["hook", "powershell-auto"]);
+            let body = payload("bypassPermissions", command_json);
+            exec_with(command, Opts { input: Some(body.into_bytes()), limit_secs: 30, ..Opts::default() })
+        };
+        let rewritten_of = |out: &Out| {
+            Json::parse(out.out().trim())
+                .and_then(|j| j.get("hookSpecificOutput").and_then(|o| o.get("updatedInput")).and_then(|u| u.get("command")).and_then(Json::as_str).map(str::to_string))
+        };
+        let passes = |out: &Out| out.code == 0 && Json::parse(out.out().trim()).map_or(false, |j| j.is_empty_object());
+
+        // The rewrite names the wrapper of the executable's own name and runs with output and exit code intact.
+        let a = run_hook(r#""Write-Output ('ü' + (6*7)); exit 9""#);
+        let command = rewritten_of(&a).unwrap_or_default();
+        let mut shell_command = Command::new("powershell.exe");
+        shell_command.arg("-NoProfile").arg("-Command").arg(&command);
+        let ran = exec_with(shell_command, Opts::default());
+        checks.check("U18", &format!("{}: the rewrite names {}-auto.exe and runs", name, name),
+            command.starts_with(&format!("& '{}'", auto_posix)) && ran.code == 9 && ran.out().contains("42"),
+            format!("{} -> exit {} {}", command, ran.code, ran.out().trim()));
+
+        // Its own wrapping, the other name's wrapping and an envelope of either name pass through unchanged.
+        let b64 = base64(b"echo OK");
+        let own_wrapped = command.clone();
+        let other_wrapped = own_wrapped.replacen(&auto_posix, &other_auto_posix, 1);
+        let envelope_other = format!("{} --timeout 60 --shell powershell --command-b64 {}", other_exe_posix, b64);
+        let envelope_own = format!("{} --timeout 60 --shell powershell --command-b64 {}", posix(&hook_exe), b64);
+        let all_pass = [own_wrapped, other_wrapped, envelope_other, envelope_own].iter().all(|c| passes(&run_hook(&json_quote(c))));
+        checks.check("U18", &format!("{}: both names' wrappers and envelopes pass through unchanged", name), all_pass, "");
+
+        // A near miss (the wrapper path in capitals) is wrapped again.
+        let near = run_hook(&json_quote(&format!("& '{}' --shell powershell --command-b64 {}; exit $LASTEXITCODE", auto_posix.to_uppercase(), b64)));
+        checks.check("U18", &format!("{}: a wrapper path in another case is wrapped again", name),
+            rewritten_of(&near).map_or(false, |c| c.starts_with(&format!("& '{}'", auto_posix))), near.out());
     }
     checks.finish();
 }

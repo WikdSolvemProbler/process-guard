@@ -1,17 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Edge case and efficiency battery for the process guard (inventory B1 to B116):
+//! Edge case and efficiency battery for the process guard (inventory B1 to B122):
 //! exit codes across the 32 bit range, timeout precision, wide and deep process
 //! trees, escape attempts, nested guards, missing standard handles, bulk output,
-//! argument and shell quoting, concurrency, launch overhead, and hook mode attacks.
+//! argument and shell quoting, concurrency, launch overhead, hook mode attacks,
+//! and hook mode under both program names.
 //!
 //! Sizes are in mebibytes (MiB), and hook payloads are JavaScript Object
 //! Notation (JSON).
 //!
 //! Every test takes one lock, so the checks run one at a time whatever the test
 //! thread count, and timing bounds are measured on an otherwise quiet guard.
-//! Bounds on time and load are asserted unless PROCESS_GUARD_TIMING is "info".
+//! Bounds on time and load are asserted unless PROCESS_TREE_GUARD_TIMING (or its
+//! 1.x name PROCESS_GUARD_TIMING) is "info".
 //! The parity table is in tests/PARITY.md.
 
 mod common;
@@ -338,7 +340,7 @@ fn b74_concurrent_guards() {
     let wrong: Vec<(usize, u32)> = codes.iter().enumerate().filter(|(i, c)| **c != (*i as u32) % 50).map(|(i, c)| (i, *c)).collect();
     let ids: Vec<u32> = (0..64).flat_map(|index| ids_in(&dir.join(&index.to_string()))).collect();
     let running = count_alive(&ids);
-    // Exit codes and orphans are correctness checks, so they are asserted whatever PROCESS_GUARD_TIMING says.
+    // Exit codes and orphans are correctness checks, so they are asserted whatever the timing variable says.
     checks.check(
         "B74",
         "64 concurrent guards: every exit code right, no orphans",
@@ -538,5 +540,113 @@ fn b104_to_b116_hook_mode_fails_closed() {
 
     let result = run_guard_input(&["--timeout", "10", "--", guard(), "hook", "pretooluse"], pre("x").as_bytes());
     checks.check("B116", "hook run under the guard: exit 2 passes through to the host", result.code == 2, detail(&result));
+    checks.finish();
+}
+
+// ------------------------------------------------ 15. hook mode under both names
+
+/// A private folder holding the guard under `name`; returns it with the executable's path.
+fn named_install(name: &str) -> (TempDir, String) {
+    let dir = TempDir::new("bn-");
+    let exe = copy_guard(dir.path(), name);
+    (dir, exe)
+}
+
+fn hook_as(exe: &str, vendor: &str, input: &[u8]) -> Out {
+    let mut command = Command::new(exe);
+    command.args(["hook", vendor]);
+    exec_with(command, Opts { input: Some(input.to_vec()), ..Opts::default() })
+}
+
+/// The envelope that names `path`, with forward slashes.
+fn envelope_at(path: &str) -> String {
+    format!("{} --timeout 60 --shell powershell --command-b64 {}", posix(path), base64(b"echo OK"))
+}
+
+#[test]
+fn b117_to_b118_hook_accepts_either_name_in_its_own_folder() {
+    let _serial = serial();
+    let mut checks = Checks::new("hook names");
+    for name in NAMES {
+        let (dir, exe) = named_install(name);
+        let other = NAMES.iter().find(|n| **n != name).copied().unwrap();
+        let other_exe = text(&dir.join(&format!("{}.exe", other)));
+        for (label, path) in [("its own path", exe.as_str()), ("the other name beside it", other_exe.as_str())] {
+            let good = envelope_at(path);
+            let result = hook_as(&exe, "pretooluse", pre(&good).as_bytes());
+            checks.check("B117", &format!("{}: pretooluse allows {}", name, label),
+                result.code == 0 && Json::parse(result.out().trim()).map_or(false, |j| j.is_empty_object()), format!("{} stdout {:?}", detail(&result), result.out().trim()));
+            let by_prefix = pre(&format!("& {}", good));
+            let result = hook_as(&exe, "pretooluse", by_prefix.as_bytes());
+            checks.check("B117", &format!("{}: pretooluse allows {} after an ampersand", name, label), result.code == 0, detail(&result));
+            let cursor = String::from("{\"command\":") + &json_quote(&good) + "}";
+            let result = hook_as(&exe, "cursor", cursor.as_bytes());
+            let expected = Json::Obj(vec![("permission".to_string(), Json::Str("allow".to_string()))]);
+            checks.check("B118", &format!("{}: cursor allows {}", name, label),
+                result.code == 0 && Json::parse(result.out().trim()) == Some(expected), format!("{} stdout {:?}", detail(&result), result.out().trim()));
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn b119_hook_denies_other_paths_and_lookalikes() {
+    let _serial = serial();
+    let mut checks = Checks::new("hook name attacks");
+    let (stray_dir, _) = named_install(NAMES[0]);
+    let stray_other = copy_guard(stray_dir.path(), NAMES[1]);
+    for name in NAMES {
+        let (dir, exe) = named_install(name);
+        let attacks: Vec<(&str, String)> = vec![
+            ("either name in another folder", envelope_at(&stray_other)),
+            ("the same name in another folder", envelope_at(&text(&stray_dir.join(&format!("{}.exe", name))))),
+            ("the automatic copy of the 2.0 name", envelope_at(&text(&dir.join("process-tree-guard-auto.exe")))),
+            ("the automatic copy of the 1.x name", envelope_at(&text(&dir.join("process-guard-auto.exe")))),
+            ("the 1.x name in capitals", envelope_at(&text(&dir.join("PROCESS-GUARD.EXE")))),
+            ("the 2.0 name in capitals", envelope_at(&text(&dir.join("PROCESS-TREE-GUARD.EXE")))),
+            ("a name that only starts like the 2.0 name", envelope_at(&text(&dir.join("process-tree-guard2.exe")))),
+            ("a name that only ends like the 1.x name", envelope_at(&text(&dir.join("xprocess-guard.exe")))),
+            ("the other name with a suffix", format!("{}.bak --timeout 60 --shell powershell --command-b64 {}", posix(&text(&dir.join("process-guard.exe"))), base64(b"echo OK"))),
+        ];
+        for (label, attack) in &attacks {
+            let one = hook_as(&exe, "pretooluse", pre(attack).as_bytes());
+            let two = hook_as(&exe, "cursor", (String::from("{\"command\":") + &json_quote(attack) + "}").as_bytes());
+            checks.check("B119", &format!("{}: hook rejects {}", name, label), one.code == 2 && two.code == 2, format!("pretooluse {} cursor {}", one.code, two.code));
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn b120_to_b121_context_and_exit_code_under_both_names() {
+    let _serial = serial();
+    let mut checks = Checks::new("hook names, context and exit code");
+    for name in NAMES {
+        let (_dir, exe) = named_install(name);
+        let result = hook_as(&exe, "cursor-context", b"");
+        let has_context = Json::parse(result.out().trim()).map_or(false, |j| j.get("additional_context").is_some());
+        checks.check("B120", &format!("{}: hook cursor-context prints JSON", name), result.code == 0 && has_context, detail(&result));
+
+        let mut command = Command::new(&exe);
+        command.args(["--timeout", "10", "--", &exe, "hook", "pretooluse"]);
+        let result = exec_with(command, Opts { input: Some(pre("x").into_bytes()), ..Opts::default() });
+        checks.check("B121", &format!("{}: hook run under the guard: exit 2 passes through to the host", name), result.code == 2, detail(&result));
+    }
+    checks.finish();
+}
+
+#[test]
+fn b122_denial_text_is_unchanged_under_both_names() {
+    let _serial = serial();
+    let mut checks = Checks::new("hook denial text");
+    const SENTENCE: &str = "TIMEOUT_REQUIRED: execute exactly the process-guard envelope with an explicit finite timeout.";
+    for name in NAMES {
+        let (_dir, exe) = named_install(name);
+        let one = hook_as(&exe, "pretooluse", pre("x").as_bytes());
+        let two = hook_as(&exe, "cursor", b"{\"command\":\"x\"}");
+        checks.check("B122", &format!("{}: pretooluse and cursor denials keep the 1.x sentence on standard error and in the JSON reason", name),
+            one.code == 2 && two.code == 2 && one.err().contains(SENTENCE) && two.err().contains(SENTENCE) && one.out().contains(SENTENCE) && two.out().contains(SENTENCE),
+            format!("pretooluse {:?} {:?} cursor {:?} {:?}", one.err(), one.out(), two.err(), two.out()));
+    }
     checks.finish();
 }

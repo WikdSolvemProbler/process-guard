@@ -15,7 +15,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
       # Shared runners are too noisy for the timing bounds; they are reported, not asserted.
-      PROCESS_GUARD_TIMING: info
+      PROCESS_TREE_GUARD_TIMING: info
     steps:
       - uses: actions/checkout@v5
       - name: Build
