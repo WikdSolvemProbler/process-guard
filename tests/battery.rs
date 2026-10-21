@@ -1196,8 +1196,14 @@ fn b135_no_more_instances_of_the_channel_can_be_made_and_its_access_list_is_for_
     let whoami = exec(who);
     let sid = whoami.out().trim().rsplit(',').next().unwrap_or("").trim_matches('"').to_string();
     let sddl = extendable(&[], "10", &[testkit(), "pipe-sddl", "env"]);
+    // The text form writes the built-in Administrator and Guest accounts of this computer by their aliases, LA and LG.
+    let account = match sid.rsplit('-').next() {
+        Some("500") => "LA".to_string(),
+        Some("501") => "LG".to_string(),
+        _ => sid.clone(),
+    };
     checks.check("B135", "the access list is one entry, for the current user's identifier, and is protected",
-        sid.starts_with("S-1-") && sddl.out().trim() == format!("D:P(A;;0x12019b;;;{})", sid), format!("{} / {}", sid, detail(&sddl)));
+        sid.starts_with("S-1-") && sddl.out().trim() == format!("D:P(A;;0x12019b;;;{})", account), format!("{} as {}: {:?} / {}", sid, account, sddl.out().trim(), detail(&sddl)));
     // The rights are read, write and synchronize: the right to make another instance is not among them.
     checks.check("B135", "the rights in the list do not include creating another instance of the pipe", 0x12019bu32 & 0x4 == 0, "0x12019b has no FILE_CREATE_PIPE_INSTANCE");
     checks.finish();
