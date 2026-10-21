@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A39):
+//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A41):
 //! `hook antigravity` rewrites a `run_command` call so the automatic wrapper runs
 //! it, and `hook antigravity-context` prints the policy as a SessionStart message.
 //! The last group runs the hook role (`process-tree-guard-gate`) in both install
@@ -1076,5 +1076,80 @@ fn a39_the_rules_follow_the_role_under_the_other_programs_file_names() {
     let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
     checks.check("A39", "the full command as process-tree-guard-gate.exe: the rewrite names process-guard-auto.exe",
         one_object(&out) && command_line(&d) == Some(wrapped_line(&legacy, "echo hi").as_str()), out.out());
+    checks.finish();
+}
+
+// -------------------------------------- an extendable launch is not an envelope (A40)
+
+#[test]
+fn a40_a_command_with_the_extendable_option_is_not_an_envelope() {
+    let mut checks = Checks::new("extendable launch");
+    let body = base64(b"echo hi");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "age-");
+        let gate = tree.exe(ROLES[2]);
+        let full_exe = tree.exe(ROLES[0]);
+        let full = posix(&full_exe);
+        let deadline = posix(&tree.exe(ROLES[1]));
+        for (name, program) in [("the full command", full.clone()), ("the deadline role", deadline)] {
+            let launch = format!("{} --extendable --timeout 60 --shell cmd --command-b64 {}", program, body);
+            // The antigravity hooks pass an exact envelope through; this line is wrapped again, whole, so it runs under the automatic deadline.
+            let from_full = run_hook(&full_exe, "antigravity", call(&json_quote(&launch)).as_bytes());
+            let from_gate = run_gate(&gate, "antigravity", call(&json_quote(&launch)).as_bytes());
+            for (hook_name, out) in [("the full command's hook", from_full), ("the gate", from_gate)] {
+                let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+                checks.check("A40", &format!("{} in the {}: an envelope of {} with --extendable is wrapped again, not passed through", hook_name, layout.name(), name),
+                    one_object(&out) && decision(&d) == Some("allow") && d.get("overwrite").is_some(), out.out());
+            }
+            // The hooks that only allow or deny, deny it.
+            let payload = format!("{{\"tool_input\":{{\"command\":{}}}}}", json_quote(&launch));
+            let by_gate = run_gate(&gate, "pretooluse", payload.as_bytes());
+            let by_full = run_hook(&full_exe, "pretooluse", payload.as_bytes());
+            checks.check("A40", &format!("pretooluse in the {} denies an envelope of {} with --extendable, for the gate and the full command", layout.name(), name),
+                by_gate.code == 2 && by_full.code == 2 && by_gate.out().contains("\"permissionDecision\":\"deny\"") && by_full.out().contains("\"permissionDecision\":\"deny\""),
+                format!("exit {} {} / exit {} {}", by_gate.code, by_gate.out(), by_full.code, by_full.out()));
+        }
+        // The same line without the option is a valid envelope and passes through, so the option is what changes the decision.
+        let plain_line = format!("{} --timeout 60 --shell cmd --command-b64 {}", full, body);
+        let (out, d) = gate_decision(&gate, &plain_line);
+        checks.check("A40", &format!("the same envelope without --extendable passes through in the {}", layout.name()),
+            one_object(&out) && decision(&d) == Some("allow") && d.get("overwrite").is_none(), out.out());
+    }
+    checks.finish();
+}
+
+// -------------- a hook's decision does not depend on its standard streams being readable (A41)
+
+#[test]
+fn a41_a_denial_exits_2_whether_or_not_its_output_can_be_written() {
+    let mut checks = Checks::new("closed streams");
+    // A host that blocks a tool call on exit code 2 reads any other status as a non-blocking error and lets the command run,
+    // so a denial that cannot be written must still exit 2: with panic = abort, a failed print would end the program with a
+    // crash code (0xC0000409) instead. The helper starts the program with a standard output (or a standard error) whose reader
+    // has already gone and an empty standard input, which every denying vendor denies.
+    let tree = plain_tree(Layout::Install, "agc-");
+    let run = |program: &str, helper: &str, args: &[&str]| -> Option<u64> {
+        let mut command = Command::new(testkit());
+        command.arg(helper).arg(program).args(args);
+        exec(command).out().lines().find_map(|line| line.strip_prefix("exit ")?.trim().parse::<u64>().ok())
+    };
+    let (full, gate) = (tree.exe(ROLES[0]), tree.exe(ROLES[2]));
+    for helper in ["run-closed-stdout", "run-closed-stderr"] {
+        let closed = if helper == "run-closed-stdout" { "standard output" } else { "standard error" };
+        for vendor in ["pretooluse", "cursor"] {
+            let by_full = run(&full, helper, &["hook", vendor]);
+            let by_gate = run(&gate, helper, &[vendor]);
+            checks.check("A41", &format!("{} with a {} nobody can write to: the full command and the gate exit 2", vendor, closed),
+                by_full == Some(2) && by_gate == Some(2), format!("{:?} / {:?}", by_full, by_gate));
+        }
+        let default = run(&gate, helper, &[]);
+        checks.check("A41", &format!("the gate without a vendor, with a {} nobody can write to: exit 2", closed), default == Some(2), format!("{:?}", default));
+    }
+    // The vendors that always allow or rewrite exit 0 whatever their output does.
+    for vendor in ["antigravity", "antigravity-context", "cursor-context", "powershell-auto"] {
+        let by_full = run(&full, "run-closed-stdout", &["hook", vendor]);
+        let by_gate = run(&gate, "run-closed-stdout", &[vendor]);
+        checks.check("A41", &format!("{} with a standard output nobody can write to: exit 0", vendor), by_full == Some(0) && by_gate == Some(0), format!("{:?} / {:?}", by_full, by_gate));
+    }
     checks.finish();
 }

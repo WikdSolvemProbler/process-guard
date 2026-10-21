@@ -8,6 +8,8 @@ Issues and pull requests are welcome.
 - A stable Rust toolchain for the Microsoft Visual C++ (MSVC) target, with the Visual Studio Build Tools. Make it the default toolchain of the machine that runs the tests: the version resources of the programs are linked only for that target, so on a GNU's Not Unix (GNU) toolchain the check G39 cannot run. It prints a `NOTICE` line to standard error when it is skipped, which shows on a plain `cargo test`, and it fails instead when `CI` or `PROCESS_TREE_GUARD_REQUIRE_RESOURCES` is set; set the second one on your machine to make sure the suite covers the resources.
 - Git Bash, Windows PowerShell and `cmd.exe`, which the tests use.
 
+The library and the programs build with the Rust version that `rust-version` in `Cargo.toml` declares (1.78), and the continuous integration job `minimum-rust` checks that on every change; the tests are run with the current stable toolchain only. A change that needs a newer Rust raises `rust-version` in the same commit, and says so in the changelog.
+
 ## Rules for changes
 
 - `cargo test --release` passes. On a busy machine, `PROCESS_TREE_GUARD_TIMING=info` reports the timing bounds instead of asserting them; say so in the pull request if you used it.

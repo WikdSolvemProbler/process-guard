@@ -4,13 +4,27 @@
 //! The command line forms: `--timeout SECONDS ...` and automatic mode.
 
 use crate::base64::{base64_encode, decode_command};
-use crate::engine::{parent_image, run_job, which};
-use crate::{GuardError, Shell, MAX_SECONDS};
+use crate::engine::{parent_image, run_job, run_job_with, run_library_job, which, RunMode};
+use crate::extend::{escape, image_of, iso8601, request_held, Settings, Target, DEFAULT_MAX_EXTENSION};
+use crate::{GuardError, Role, Shell, MAX_SECONDS};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::UNIX_EPOCH;
 
-pub const USAGE: &str = "usage: process-tree-guard --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])";
+pub const USAGE: &str = "usage: process-tree-guard [--extendable [--max-extension SECONDS] [--extension-log PATH]] --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])\n       process-tree-guard extend SECONDS";
+
+/// What `process-tree-guard-contain -h` prints.
+pub const CONTAIN_USAGE: &str = "usage: process-tree-guard-contain --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])  (runs only inside an extendable run of process-tree-guard; the timeout is a request to that run)";
 
 /// What `process-tree-guard-gate -h` prints: the gate takes no deadline, only a vendor.
 pub const GATE_USAGE: &str = "usage: process-tree-guard-gate [VENDOR]  (VENDOR: pretooluse, cursor, cursor-context, antigravity, antigravity-context or powershell-auto; reads the hook payload on standard input; the default is pretooluse)";
+
+/// Print a line on standard output, and go on if it cannot be written: with panic = abort, a
+/// reader that has gone must not turn the exit code of a finished request into a crash
+/// (Common Weakness Enumeration, CWE-248 and CWE-703).
+pub fn say(text: &str) {
+    let _ = writeln!(std::io::stdout(), "{}", text);
+}
 
 /// Seconds that are finite, greater than zero and at most MAX_SECONDS.
 pub fn check_seconds(seconds: f64) -> Result<f64, GuardError> {
@@ -46,12 +60,19 @@ struct Options {
     shell: Option<String>,
     command_b64: Option<String>,
     command: Vec<String>,
+    extendable: bool,
+    max_extension: Option<String>,
+    extension_log: Option<String>,
 }
 
 /// Parse the argument list. Errors become exit 125, never 2. `-h` and `--help`
-/// stop the parse and ask for the usage text.
-fn parse(args: Vec<String>) -> Result<Options, GuardError> {
-    let mut options = Options { help: false, timeout: None, shell: None, command_b64: None, command: Vec::new() };
+/// stop the parse and ask for the usage text. The extension options are read only
+/// when `extension_options` is true (the full command and the deadline role).
+fn parse(args: Vec<String>, extension_options: bool) -> Result<Options, GuardError> {
+    let mut options = Options {
+        help: false, timeout: None, shell: None, command_b64: None, command: Vec::new(),
+        extendable: false, max_extension: None, extension_log: None,
+    };
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -63,11 +84,21 @@ fn parse(args: Vec<String>) -> Result<Options, GuardError> {
             options.help = true;
             break;
         }
+        if arg == "--extendable" && extension_options {
+            options.extendable = true;
+            i += 1;
+            continue;
+        }
         let (key, inline) = match arg.split_once('=') {
             Some((k, v)) => (k.to_string(), Some(v.to_string())),
             None => (arg.clone(), None),
         };
-        if !["--timeout", "--shell", "--command-b64"].contains(&key.as_str()) {
+        let known: &[&str] = if extension_options {
+            &["--timeout", "--shell", "--command-b64", "--max-extension", "--extension-log"]
+        } else {
+            &["--timeout", "--shell", "--command-b64"]
+        };
+        if !known.contains(&key.as_str()) {
             return Err(GuardError(format!("unrecognized arguments: {}", key)));
         }
         let value = match inline {
@@ -86,6 +117,8 @@ fn parse(args: Vec<String>) -> Result<Options, GuardError> {
                 options.shell = Some(value)
             }
             "--command-b64" => options.command_b64 = Some(value),
+            "--max-extension" => options.max_extension = Some(value),
+            "--extension-log" => options.extension_log = Some(value),
             _ => return Err(GuardError(format!("unrecognized arguments: {}", key))),
         }
         i += 1;
@@ -93,16 +126,54 @@ fn parse(args: Vec<String>) -> Result<Options, GuardError> {
     Ok(options)
 }
 
-/// `--timeout SECONDS (--shell SHELL --command-b64 BASE64 | [--] COMMAND [ARGS...])`,
-/// with `args` the arguments after the program name.
-pub fn run_args(args: Vec<String>) -> Result<u32, GuardError> {
-    let options = parse(args)?;
+/// The settings of an extendable run, from its launch arguments alone: never from
+/// the environment, so nothing a child sets can raise the cap.
+fn extension_settings(options: &Options, timeout: f64) -> Result<Option<Settings>, GuardError> {
+    if !options.extendable {
+        if options.max_extension.is_some() || options.extension_log.is_some() {
+            return Err(GuardError("--max-extension and --extension-log need --extendable".into()));
+        }
+        return Ok(None);
+    }
+    let seconds_option = |name: &str, text: &Option<String>, default: f64| -> Result<f64, GuardError> {
+        match text {
+            Some(text) => {
+                let value: f64 = text.trim().parse().map_err(|_| GuardError(format!("{} must be a number", name)))?;
+                if !value.is_finite() || value <= 0.0 || value > MAX_SECONDS {
+                    return Err(GuardError(format!("{} must be greater than zero and at most 86400 seconds", name)));
+                }
+                Ok(value)
+            }
+            None => Ok(default),
+        }
+    };
+    let max_seconds = seconds_option("--max-extension", &options.max_extension, DEFAULT_MAX_EXTENSION)?;
+    // The run's own deadline is a first request: it must fit under the cap like any other.
+    if timeout > max_seconds {
+        return Err(GuardError(format!("--timeout ({}) is over --max-extension ({}); raise --max-extension, at most 86400 seconds",
+            crate::engine::format_seconds(timeout), crate::engine::format_seconds(max_seconds))));
+    }
+    let log_path = match &options.extension_log {
+        Some(path) if path.is_empty() => return Err(GuardError("--extension-log needs a path".into())),
+        Some(path) => Some(PathBuf::from(path)),
+        None => None,
+    };
+    Ok(Some(Settings { max_seconds, log_path }))
+}
+
+/// `[--extendable ...] --timeout SECONDS (--shell SHELL --command-b64 BASE64 | [--] COMMAND [ARGS...])`,
+/// with `args` the arguments after the program name. The contain role takes no
+/// extension options: its deadline is a request to the run that encloses it.
+pub fn run_args(args: Vec<String>, role: Role) -> Result<u32, GuardError> {
+    let contain = role == Role::Contain;
+    let options = parse(args, !contain)?;
     if options.help {
-        println!("{}", USAGE);
+        say(if contain { CONTAIN_USAGE } else { USAGE });
         return Ok(0);
     }
-    let timeout = options.timeout.ok_or_else(|| GuardError("the following arguments are required: --timeout".into()))?;
+    let timeout = options.timeout.clone().ok_or_else(|| GuardError("the following arguments are required: --timeout".into()))?;
     let seconds = duration(&timeout)?;
+    let extendable = extension_settings(&options, seconds)?;
     let mut raw_tail: Option<String> = None;
     let child: Vec<String> = if let Some(shell) = options.shell {
         let encoded = match (&options.command_b64, options.command.is_empty()) {
@@ -128,7 +199,25 @@ pub fn run_args(args: Vec<String>) -> Result<u32, GuardError> {
         }
         child
     };
-    run_job(&child, seconds, raw_tail.as_deref(), false)
+    run_job_with(&child, seconds, raw_tail.as_deref(), false, &RunMode { extendable, require_channel: contain, library: false })
+}
+
+/// `extend SECONDS`: ask the enclosing extendable run to hold the deadline of the
+/// process that ran this program (its parent, since this program ends at once)
+/// for SECONDS from now. Prints the deadline that was granted and the process held.
+/// The number is sent as it is: the run refuses, and logs, one it will not grant.
+pub fn extend_command(args: Vec<String>) -> Result<u32, GuardError> {
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
+        say(USAGE);
+        return Ok(0);
+    }
+    let [seconds] = <[String; 1]>::try_from(args).map_err(|_| GuardError("usage: process-tree-guard extend SECONDS".into()))?;
+    let seconds: f64 = seconds.trim().parse().map_err(|_| GuardError("extend: SECONDS must be a number".into()))?;
+    let (grant, held) = request_held(Target::Parent, 0, seconds)?;
+    let until = grant.until.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    say(&format!("PROCESS_TREE_GUARD_GRANTED: seconds={} deadline={} held={} image=\"{}\"",
+        crate::engine::format_seconds(grant.seconds), iso8601(until), held, escape(&image_of(held))));
+    Ok(0)
 }
 
 /// Default hard deadline for `auto` mode: two hours, the longest any host shell call may run.
@@ -156,6 +245,12 @@ fn auto_timeout_setting(lookup: impl Fn(&str) -> Option<String>) -> Option<Strin
 /// per-call timeout still applies: when the host kills the process that
 /// launched the guard, the guard kills the whole tree.
 pub fn auto(args: Vec<String>) -> Result<u32, GuardError> {
+    auto_with(args, false)
+}
+
+/// `auto`, for the program (`library` false) or for the library call `run_auto` (`library`
+/// true), whose process goes on when the call returns.
+pub fn auto_with(args: Vec<String>, library: bool) -> Result<u32, GuardError> {
     let mut timeout: Option<String> = auto_timeout_setting(|name| std::env::var(name).ok());
     let mut shell: Option<String> = None;
     let mut encoded: Option<String> = None;
@@ -166,6 +261,9 @@ pub fn auto(args: Vec<String>) -> Result<u32, GuardError> {
             "--shell" if i + 1 < args.len() => { shell = Some(args[i + 1].clone()); i += 2; }
             "--command-b64" if i + 1 < args.len() => { encoded = Some(decode_command(&args[i + 1])?); i += 2; }
             "--" => { i += 1; break; }
+            "--extendable" | "--max-extension" | "--extension-log" => {
+                return Err(GuardError("auto: automatic mode is never extendable".into()));
+            }
             _ => break,
         }
     }
@@ -173,6 +271,9 @@ pub fn auto(args: Vec<String>) -> Result<u32, GuardError> {
     let seconds = match timeout {
         Some(t) => duration(&t)?,
         None => AUTO_DEFAULT_SECONDS,
+    };
+    let run = |argv: &[String], tail: Option<&str>| {
+        if library { run_library_job(argv, seconds, tail, true) } else { run_job(argv, seconds, tail, true) }
     };
     if let Some(command) = encoded {
         if !rest.is_empty() {
@@ -184,7 +285,7 @@ pub fn auto(args: Vec<String>) -> Result<u32, GuardError> {
         return Err(GuardError("auto: a command is required".into()));
     }
     if rest.len() > 1 {
-        return run_job(&rest, seconds, None, true);
+        return run(&rest, None);
     }
     let command = rest[0].clone();
     if command.trim().is_empty() || command.contains('\0') {
@@ -209,7 +310,7 @@ pub fn auto(args: Vec<String>) -> Result<u32, GuardError> {
     if shell == Shell::PowerShell && parent_is_powershell && !parent.is_empty() {
         child[0] = parent.clone();
     }
-    run_job(&child, seconds, tail.as_deref(), true)
+    run(&child, tail.as_deref())
 }
 
 #[cfg(test)]
@@ -243,15 +344,60 @@ mod tests {
 
     #[test]
     fn argument_errors_never_exit_two() {
-        assert!(parse(vec!["--bogus".into(), "1".into()]).is_err());
-        assert!(matches!(parse(vec!["--bogus".into()]), Err(GuardError(m)) if m.starts_with("unrecognized")));
-        assert!(parse(vec!["--shell".into(), "zsh".into()]).is_err());
-        assert!(parse(vec!["--timeout".into()]).is_err());
-        let ok = parse(vec!["--timeout=5".into(), "--".into(), "x".into()]).ok().unwrap();
+        assert!(parse(vec!["--bogus".into(), "1".into()], true).is_err());
+        assert!(matches!(parse(vec!["--bogus".into()], true), Err(GuardError(m)) if m.starts_with("unrecognized")));
+        assert!(parse(vec!["--shell".into(), "zsh".into()], true).is_err());
+        assert!(parse(vec!["--timeout".into()], true).is_err());
+        let ok = parse(vec!["--timeout=5".into(), "--".into(), "x".into()], true).ok().unwrap();
         assert_eq!(ok.timeout.as_deref(), Some("5"));
         assert_eq!(ok.command, vec!["--".to_string(), "x".to_string()]);
-        assert!(parse(vec!["--help".into()]).ok().unwrap().help);
-        assert!(parse(vec!["-h".into(), "--bogus".into()]).ok().unwrap().help);
+        assert!(parse(vec!["--help".into()], true).ok().unwrap().help);
+        assert!(parse(vec!["-h".into(), "--bogus".into()], true).ok().unwrap().help);
+    }
+
+    fn words(line: &str) -> Vec<String> {
+        line.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn extension_options_are_read_from_the_arguments_only() {
+        let ok = parse(words("--extendable --max-extension 60 --extension-log a.log --timeout 5 -- x"), true).ok().unwrap();
+        assert!(ok.extendable);
+        assert_eq!(ok.max_extension.as_deref(), Some("60"));
+        assert_eq!(ok.extension_log.as_deref(), Some("a.log"));
+        assert_eq!(extension_settings(&ok, 5.0).ok().flatten().map(|s| s.max_seconds), Some(60.0));
+        // An option after the command belongs to the command.
+        let after = parse(words("--timeout 5 -- x --extendable"), true).ok().unwrap();
+        assert!(!after.extendable);
+        // Not for the contain role, and not without --extendable.
+        for line in ["--extendable --timeout 5 x", "--max-extension 5 --timeout 5 x", "--extension-log a --timeout 5 x"] {
+            assert!(parse(words(line), false).is_err(), "{}", line);
+        }
+        for line in ["--max-extension 60 --timeout 5 x", "--extension-log a.log --timeout 5 x"] {
+            let options = parse(words(line), true).ok().unwrap();
+            assert!(extension_settings(&options, 5.0).is_err(), "{}", line);
+        }
+    }
+
+    #[test]
+    fn the_cap_has_a_default_and_bounds_and_covers_the_run_itself() {
+        let settings = |line: &str, timeout: f64| extension_settings(&parse(words(line), true).ok().unwrap(), timeout);
+        assert_eq!(settings("--extendable", 5.0).ok().flatten().map(|s| s.max_seconds), Some(DEFAULT_MAX_EXTENSION));
+        assert_eq!(settings("--extendable --max-extension 86400", 86400.0).ok().flatten().map(|s| s.max_seconds), Some(86400.0));
+        for bad in ["0", "-1", "nan", "inf", "86401", "x", ""] {
+            assert!(settings(&format!("--extendable --max-extension={}", bad), 5.0).is_err(), "{}", bad);
+        }
+        assert!(settings("--extendable", 21600.0).is_ok());
+        assert!(settings("--extendable", 21601.0).is_err(), "the run's own deadline is over the default cap");
+        assert!(settings("--extendable --max-extension 10", 10.5).is_err());
+        assert!(settings("--extendable --extension-log=", 5.0).is_err());
+    }
+
+    #[test]
+    fn there_is_no_option_for_a_total_lifetime() {
+        // The only limit on a request is the cap; a run that is renewed within it is renewed for as long as it is.
+        assert!(parse(words("--extendable --max-total 600 --timeout 5 x"), true).is_err());
+        assert!(parse(words("--max-total=600 --timeout 5 x"), true).is_err());
     }
 
     #[test]

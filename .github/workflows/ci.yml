@@ -29,6 +29,7 @@ jobs:
             'process-tree-guard.exe' = 'Process Tree Guard'
             'process-tree-guard-deadline.exe' = 'Process Tree Guard: Deadline'
             'process-tree-guard-gate.exe' = 'Process Tree Guard: Gate'
+            'process-tree-guard-contain.exe' = 'Process Tree Guard: Contain'
           }
           $failed = $false
           foreach ($name in $expected.Keys) {
@@ -43,3 +44,22 @@ jobs:
         run: cargo test --release --locked --no-fail-fast
       - name: Version resource checks, shown
         run: cargo test --release --locked --test guard g39 -- --nocapture
+
+  # The lowest Rust version the crate declares in Cargo.toml (rust-version) is the one checked here,
+  # so the declaration cannot drift from what builds.
+  minimum-rust:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the declared Rust version
+        shell: pwsh
+        run: |
+          $declared = (Select-String -Path Cargo.toml -Pattern '^rust-version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          "declared rust-version: $declared"
+          rustup toolchain install $declared --profile minimal --target x86_64-pc-windows-msvc
+          "RUST_MSRV=$declared" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Check the library and the programs
+        run: cargo "+$env:RUST_MSRV" check --release --locked --lib --bins

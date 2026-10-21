@@ -500,3 +500,39 @@ fn u22_a_missing_automatic_copy_is_named_in_the_rewrite_and_the_command_does_not
     }
     checks.finish();
 }
+
+// ------------------------------------------------ extension and automatic mode (U23)
+
+#[test]
+fn u23_automatic_mode_is_never_extendable_and_asks_the_run_that_encloses_it() {
+    let mut checks = Checks::new("automatic mode and extension");
+    let (_dir, auto) = auto_copy();
+    let shown = |result: &Out| format!("exit {} {} {}", result.code, result.out().trim(), result.err().trim());
+    // The extension options are refused in automatic mode, by the file name and by the subcommand.
+    for option in ["--extendable", "--max-extension", "--extension-log"] {
+        let named = exec(guard_cmd_of(&auto, &[option, "5", "echo", "SHOULD_NOT_RUN"]));
+        let subcommand = run_guard(&["auto", option, "5", "echo", "SHOULD_NOT_RUN"]);
+        checks.check("U23", &format!("{} is refused in automatic mode, by name and by the auto subcommand", option),
+            named.code == 125 && subcommand.code == 125 && !named.out().contains("SHOULD_NOT_RUN") && !subcommand.out().contains("SHOULD_NOT_RUN")
+                && named.err().contains("never extendable"), format!("{} / {}", shown(&named), shown(&subcommand)));
+    }
+    // Outside an extendable run it has no channel variable; the command sees none.
+    let plain = exec(guard_cmd_of(&auto, &["--timeout", "10", testkit(), "env", CHANNEL_VARIABLE]));
+    checks.check("U23", "outside an extendable run automatic mode sets no channel variable", plain.code == 0 && plain.out().trim() == "unset", shown(&plain));
+    // Inside one, its start is a request for its deadline, like any guard's.
+    let over = extendable(&["--max-extension", "5"], "5", &[&auto, "--timeout", "20", testkit(), "print", "SHOULD_NOT_RUN"]);
+    checks.check("U23", "inside an extendable run a deadline over the cap is refused with 125 and the command never runs",
+        over.code == 125 && !over.out().contains("SHOULD_NOT_RUN") && extension_lines(&over.err()).iter().any(|l| l.contains("decision=refused")), shown(&over));
+    let within = extendable(&["--max-extension", "5"], "5", &[&auto, "--timeout", "3", testkit(), "args-exit", "5", "x"]);
+    let lines = extension_lines(&within.err());
+    checks.check("U23", "inside an extendable run a deadline within the cap is granted, logged, and the command runs with its exit code",
+        within.code == 5 && lines.len() == 1 && lines[0].contains("requested=3 granted=3 decision=granted"), shown(&within));
+    checks.finish();
+}
+
+/// A command that runs the program at `exe` with `args`.
+fn guard_cmd_of(exe: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(exe);
+    command.args(args);
+    command
+}

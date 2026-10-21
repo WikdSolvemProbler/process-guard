@@ -10,20 +10,22 @@
 //!
 //! # Programs
 //!
-//! The crate builds three programs, each a thin `main` over this library:
+//! The crate builds four programs, each a thin `main` over this library:
 //!
 //! | Program | Role | Entry point |
 //! |---|---|---|
 //! | `process-tree-guard` | the full command: every mode | [`main_full`] |
 //! | `process-tree-guard-deadline` | the deadline role: `--timeout` and automatic mode | [`main_deadline`] |
 //! | `process-tree-guard-gate` | the hook role: `process-tree-guard-gate VENDOR` takes the vendors and formats of `process-tree-guard hook VENDOR` | [`main_gate`] |
+//! | `process-tree-guard-contain` | the contain role: `--timeout` inside an extendable run, as a request to it | [`main_contain`] |
 //!
 //! The 1.x names `process-guard` and `process-guard-auto` are aliases of
 //! `process-tree-guard` through all of 2.x. Dispatch is by the program's file
 //! name: a name ending in `-auto` selects automatic mode in the full command and
 //! in the deadline role, and the 1.x names behave exactly as the 2.0 names. The hook role is the
 //! exception: it is the hook role under any file name, because the program
-//! decides its rules (see [`main_gate`]).
+//! decides its rules (see [`main_gate`]). So is the contain role, which has no
+//! automatic mode (see [`main_contain`]).
 //!
 //! # Where files are found
 //!
@@ -39,6 +41,7 @@
 //! <root>/libexec/process-tree-guard-deadline.exe
 //! <root>/libexec/process-tree-guard-deadline-auto.exe
 //! <root>/libexec/process-tree-guard-gate.exe
+//! <root>/libexec/process-tree-guard-contain.exe
 //! <root>/POLICY.md
 //! ```
 //!
@@ -63,7 +66,9 @@
 //! The command inherits the caller's standard input, output and error handles, and
 //! runs in the caller's console when it has one, so its output appears where the
 //! caller's own output does. The notices `PROCESS_TIMEOUT` and `PROCESS_OWNER_EXITED`
-//! are written to the caller's standard error, as the programs write them.
+//! are written to the caller's standard error, as the programs write them, once the tree has ended (a
+//! standard error that nobody reads cannot keep the tree alive, and the write is
+//! abandoned after half a second).
 //!
 //! The command inherits more than those three. The command is created with handle
 //! inheritance on and without a list of handles, so every handle of the caller that
@@ -73,6 +78,45 @@
 //! opened through Rust's standard library already are), or start the
 //! `process-tree-guard` program as a child, so that it chooses what that child
 //! inherits.
+//!
+//! # Extendable runs
+//!
+//! `process-tree-guard --extendable --timeout SECONDS COMMAND...` runs the command
+//! in a job whose deadline can be held up by the processes in it. The guard serves
+//! a private named pipe and passes its name to the command in
+//! `PROCESS_TREE_GUARD_CHANNEL`. A process in the job calls [`extend`] (or runs
+//! `process-tree-guard extend SECONDS`) to ask that its deadline be held for that
+//! many seconds from now, at most `--max-extension` (21,600, six hours, unless the
+//! guard's launch arguments say otherwise, and never more than 86,400). The guard
+//! verifies the process before it answers, keeps the hold on the process's handle,
+//! ends the hold when the process exits, and logs every request, grant and
+//! refusal; a request after the deadline is refused. The run ends, with exit code 124, at the latest of its own `--timeout`
+//! deadline and the holds of live processes; a run whose processes renew in time goes on
+//! for as long as they do, and each renewal is capped and logged. While the audit file named by `--extension-log` cannot
+//! take lines, the run grants nothing. With no audit file, standard error is the only
+//! record: a grant stands only once its line has been written there, and a run whose
+//! standard error is closed or is the null device does not start. A guard started inside an extendable
+//! run, whatever its role, asks for its own `--timeout` as it starts, and exits
+//! with 125 when the run refuses. A library call ([`run`], [`run_shell`] or [`run_auto`])
+//! made by a process in the run is such a guard in a process that goes on, so the hold
+//! its start makes on the calling process is ended when the call returns, by a release
+//! request that the run logs as `decision=released` and does not count against the
+//! process's share of the rate limit. Each call is one request against that share, 12 per
+//! process in any 10 seconds: a host that makes more calls than that inside a run has the
+//! rest refused with a [`GuardError`] ("too many requests from this process; try again
+//! later"), and their commands do not run. Each call has a hold of its own, and so has
+//! [`extend`]: calls that overlap, from threads of one process, do not replace or release
+//! one another's holds, and the run waits for the latest of them. A run without `--extendable` has no channel of its
+//! own, sets no environment variable for its command and keeps the clock of
+//! 2.0.0-alpha.2. The following differ from that version in every run, whether or not it is extendable (the changelog lists each): the notices
+//! are written after the tree has ended (see above), and the trace lines with them; each line on standard error is written with one
+//! call, and a standard error or standard output whose reader has gone does not end the guard with a crash in
+//! any mode, the hook modes included, so the exit code is kept (a denial by a hook stays 2); a guard whose environment has
+//! `PROCESS_TREE_GUARD_CHANNEL` naming a live channel asks that run for its deadline (a
+//! value that is not the name of a channel, or names one that is gone, is read as no
+//! run around the guard, and the guard keeps its own fixed deadline); the extension
+//! options without `--extendable` are refused with a message of their own; and the usage text names
+//! `extend` and the extension options. See the README.
 //!
 //! # The owner rule
 //!
@@ -94,8 +138,11 @@
 mod base64;
 mod cli;
 mod engine;
+mod extend;
 mod hook;
 mod sys;
+
+pub use extend::{Grant, CHANNEL_VARIABLE, DEFAULT_MAX_EXTENSION};
 
 use std::ffi::OsString;
 use std::fmt;
@@ -127,6 +174,7 @@ impl std::error::Error for GuardError {}
 /// A shell the guard can run an encoded command line in. PowerShell and `cmd` are
 /// found as the `PATH` search for a command finds them, as in 1.x.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Shell {
     /// `pwsh.exe` when the `PATH` search finds one, otherwise `powershell.exe`.
     PowerShell,
@@ -157,13 +205,15 @@ impl Shell {
 /// zero and at most [`MAX_SECONDS`]. Returns the command's exit code, 124 when
 /// the deadline passed, or 125 when the owner exited: the owner is the calling
 /// process's parent (see the owner rule in the crate documentation). When that
-/// parent has already exited the call is an error, or returns 125 at once.
+/// parent has already exited the call is an error, or returns 125 at once. Inside an
+/// extendable run the call asks the run for `seconds` first (an error if the run refuses),
+/// and the hold it makes is ended when the call returns; see the crate documentation.
 pub fn run(command: &[String], seconds: f64) -> Result<u32, GuardError> {
     cli::check_seconds(seconds)?;
     if command.is_empty() {
         return Err(GuardError("a command is required".into()));
     }
-    engine::run_job(command, seconds, None, false)
+    engine::run_library_job(command, seconds, None, false)
 }
 
 /// Run the Base64 encoded UTF-8 command text `command_b64` in `shell`, under the
@@ -174,7 +224,7 @@ pub fn run_shell(shell: Shell, command_b64: &str, seconds: f64) -> Result<u32, G
     cli::check_seconds(seconds)?;
     let command = base64::decode_command(command_b64)?;
     let (argv, tail) = cli::shell_command(shell, command);
-    engine::run_job(&argv, seconds, tail.as_deref(), false)
+    engine::run_library_job(&argv, seconds, tail.as_deref(), false)
 }
 
 /// Automatic mode. `args` are the arguments after the program name (or after the
@@ -185,7 +235,20 @@ pub fn run_shell(shell: Shell, command_b64: &str, seconds: f64) -> Result<u32, G
 /// tree ends, with 125, when any of them exits. When the parent has already exited
 /// the call is an error, or returns 125 at once.
 pub fn run_auto(args: &[String]) -> Result<u32, GuardError> {
-    cli::auto(args.to_vec())
+    cli::auto_with(args.to_vec(), true)
+}
+
+/// Ask the enclosing extendable run to hold the deadline of the calling process
+/// for `seconds` from now. The run is the one named by `PROCESS_TREE_GUARD_CHANNEL`,
+/// which an extendable `process-tree-guard` sets for its command. `seconds` is sent
+/// as it is: the run refuses, and logs, a number that is not finite, not greater
+/// than zero, over [`MAX_SECONDS`] or over its own cap. Returns the grant, or a
+/// [`GuardError`] with the reason when the run refuses (the calling process is not
+/// in its job, the request is invalid or over its cap, a rate limit, the run is
+/// over), when it does not answer within a few seconds, or when there is no run to
+/// ask. The hold ends when the calling process exits, or when the seconds run out.
+pub fn extend(seconds: f64) -> Result<Grant, GuardError> {
+    extend::request(extend::Target::Caller, seconds)
 }
 
 /// A hook mode of the full command: `pretooluse`, `cursor`, `cursor-context`,
@@ -205,6 +268,7 @@ pub(crate) enum Role {
     Full,
     Deadline,
     Gate,
+    Contain,
 }
 
 /// The arguments after the first `skip` as text, or an error when one is not Unicode.
@@ -219,24 +283,38 @@ fn finish(result: Result<u32, GuardError>) -> i32 {
     match result {
         Ok(code) => code as i32,
         Err(error) => {
-            eprintln!("PROCESS_GUARD_ERROR: {}", error);
+            // Not `eprintln!`: a standard error whose reader has gone must not turn 125 into a crash.
+            // And one write for the line, as the log writes its lines, so that neither lands inside the other.
+            extend::write_standard_error(&format!("PROCESS_GUARD_ERROR: {}", error));
             125
         }
     }
 }
 
 fn entry(role: Role) -> i32 {
+    let code = entry_of(role);
+    // What the trace kept and no run wrote: an argument error, or a hook.
+    engine::flush_trace(None);
+    code
+}
+
+fn entry_of(role: Role) -> i32 {
     engine::trace("start");
     let mut args = std::env::args_os().skip(1);
     if role == Role::Gate {
         let first = args.next().and_then(|v| v.into_string().ok());
         // The gate would otherwise read the help flag as a vendor and wait for a payload.
         if matches!(first.as_deref(), Some("-h" | "--help")) {
-            println!("{}", cli::GATE_USAGE);
+            cli::say(cli::GATE_USAGE);
             return 0;
         }
         let vendor = first.unwrap_or_else(|| "pretooluse".into());
         return hook::main(&vendor, Role::Gate);
+    }
+    // The contain role runs one command in an extendable run: no automatic mode, no
+    // hook, whatever its file name.
+    if role == Role::Contain {
+        return finish(text_args(1).and_then(|args| cli::run_args(args, role)));
     }
     // Installed under a name ending in "-auto", the program is the automatic
     // wrapper itself, so a host can name it as a single program path. Only the
@@ -254,21 +332,22 @@ fn entry(role: Role) -> i32 {
             return hook::main(&vendor, Role::Full);
         }
         Some("auto") => return finish(text_args(2).and_then(cli::auto)),
+        Some("extend") => return finish(text_args(2).and_then(cli::extend_command)),
         _ => {}
     }
-    finish(text_args(1).and_then(cli::run_args))
+    finish(text_args(1).and_then(|args| cli::run_args(args, role)))
 }
 
-/// The entry point of `process-tree-guard`, the full command: `--timeout`, the
-/// `auto` subcommand, the `hook` subcommand and automatic mode by a file name
-/// ending in `-auto`. Returns the exit code for `std::process::exit`.
+/// The entry point of `process-tree-guard`, the full command: `--timeout` (with
+/// `--extendable`), the `extend`, `auto` and `hook` subcommands and automatic mode
+/// by a file name ending in `-auto`. Returns the exit code for `std::process::exit`.
 pub fn main_full() -> i32 {
     entry(Role::Full)
 }
 
 /// The entry point of `process-tree-guard-deadline`, the deadline role: the full
-/// command with `--timeout` or automatic mode, and no hook mode. Returns the
-/// exit code for `std::process::exit`.
+/// command with `--timeout` (and `--extendable`), `extend` or automatic mode, and
+/// no hook mode. Returns the exit code for `std::process::exit`.
 pub fn main_deadline() -> i32 {
     entry(Role::Deadline)
 }
@@ -285,4 +364,16 @@ pub fn main_deadline() -> i32 {
 /// `std::process::exit`.
 pub fn main_gate() -> i32 {
     entry(Role::Gate)
+}
+
+/// The entry point of `process-tree-guard-contain`, the contain role:
+/// `process-tree-guard-contain --timeout SECONDS COMMAND...` runs the command in a
+/// job of its own as a child of an extendable run. Its `--timeout` is a request to
+/// the run that encloses it, which is refused (exit code 125) when it is over the
+/// run's cap; with no such run it refuses to start, with 125, because it never
+/// runs a command without a deadline that something finite holds. It takes no
+/// extension options and has no automatic or hook mode, whatever its file name.
+/// Returns the exit code for `std::process::exit`.
+pub fn main_contain() -> i32 {
+    entry(Role::Contain)
 }

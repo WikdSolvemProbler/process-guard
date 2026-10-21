@@ -47,8 +47,10 @@
 //! tool and replaces `tool_input.command` with a call to the automatic wrapper, so
 //! the command runs under the guard.
 
+use crate::cli::say;
+use crate::extend::write_standard_error;
 use crate::Role;
-use std::io::{Read, Write};
+use std::io::Read;
 
 #[derive(Debug)]
 pub enum Json {
@@ -317,7 +319,7 @@ pub fn powershell_auto(exe: &str, role: Role) -> i32 {
         .map_or(false, |b64| crate::base64::decode_command(b64).is_ok());
     let already = valid_envelope(&command, exe, role) || wrappers.iter().any(wrapped_already);
     if already {
-        println!("{{}}");
+        say("{}");
         return 0;
     }
     let mut updated = tool_input;
@@ -327,10 +329,10 @@ pub fn powershell_auto(exe: &str, role: Role) -> i32 {
         }
     }
     let bypass = payload.get("permission_mode").and_then(Json::as_str) == Some("bypassPermissions");
-    println!("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":{},\"permissionDecisionReason\":{},\"updatedInput\":{}}}}}",
+    say(&format!("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":{},\"permissionDecisionReason\":{},\"updatedInput\":{}}}}}",
         quote(if bypass { "allow" } else { "ask" }),
         quote("Command runs under the process guard (automatic deadline and process tree cleanup)."),
-        to_json(&Json::Object(updated)));
+        to_json(&Json::Object(updated))));
     0
 }
 
@@ -558,13 +560,13 @@ pub fn antigravity(exe: &str, role: Role) -> i32 {
     let read = std::io::stdin().take(16 * 1024 * 1024).read_to_string(&mut input).is_ok();
     let wrapper_exists = wrapper_paths(exe, role).and_then(|paths| paths.into_iter().next()).map_or(false, |path| std::path::Path::new(&path).is_file());
     let line = antigravity_decision(exe, role, if read { Some(&input) } else { None }, wrapper_exists);
-    let _ = writeln!(std::io::stdout(), "{}", line);
+    say(&line);
     0
 }
 
 /// `hook antigravity-context`: the policy as a SessionStart system message.
 pub fn antigravity_context() -> i32 {
-    let _ = writeln!(std::io::stdout(), "{{\"injectSteps\":[{{\"systemMessage\":{{\"systemMessage\":{}}}}}]}}", quote(&policy_text()));
+    say(&format!("{{\"injectSteps\":[{{\"systemMessage\":{{\"systemMessage\":{}}}}}]}}", quote(&policy_text())));
     0
 }
 
@@ -587,7 +589,7 @@ pub fn main(vendor: &str, role: Role) -> i32 {
         return antigravity_context();
     }
     if vendor == "cursor-context" {
-        println!("{{\"additional_context\":{}}}", quote(&policy_text()));
+        say(&format!("{{\"additional_context\":{}}}", quote(&policy_text())));
         return 0;
     }
     let mut input = String::new();
@@ -601,15 +603,19 @@ pub fn main(vendor: &str, role: Role) -> i32 {
             command.and_then(Json::as_str).map_or(false, |c| !exe.is_empty() && valid_envelope(c, &exe, role))
         });
     if allowed {
-        println!("{}", if vendor == "cursor" { "{\"permission\":\"allow\"}" } else { "{}" });
+        say(if vendor == "cursor" { "{\"permission\":\"allow\"}" } else { "{}" });
         return 0;
     }
+    // The decision is the exit code, and a host that blocks on exit 2 must get it whether or not
+    // either stream can be written: with panic = abort a failed `println!` or `eprintln!` ends the
+    // process with a crash code, and a host that reads any other code as a non-blocking error lets
+    // the command run (Common Weakness Enumeration, CWE-636).
     if vendor == "cursor" {
-        println!("{{\"permission\":\"deny\",\"user_message\":{0},\"agent_message\":{0}}}", quote(&reason));
+        say(&format!("{{\"permission\":\"deny\",\"user_message\":{0},\"agent_message\":{0}}}", quote(&reason)));
     } else {
-        println!("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":{}}}}}", quote(&reason));
+        say(&format!("{{\"hookSpecificOutput\":{{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":{}}}}}", quote(&reason)));
     }
-    eprintln!("{}", reason);
+    write_standard_error(&reason);
     2
 }
 

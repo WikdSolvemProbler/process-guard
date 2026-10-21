@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Edge case and efficiency battery for the process guard (inventory B1 to B131):
+//! Edge case and efficiency battery for the process guard (inventory B1 to B147):
 //! exit codes across the 32 bit range, timeout precision, wide and deep process
 //! trees, escape attempts, nested guards, missing standard handles, bulk output,
 //! argument and shell quoting, concurrency, launch overhead, hook mode attacks,
@@ -1039,5 +1039,445 @@ fn b131_gate_prints_its_usage_for_help_and_does_not_read_a_payload() {
         checks.check("B131", &format!("gate in the {}: help after a vendor is not help, so the payload is read and denied", layout.name()),
             result.code == 2 && after.code == 2 && after.out() == result.out(), format!("{} {}", detail(&result), detail(&after)));
     }
+    checks.finish();
+}
+
+// ------------------------------------------- 17. the channel of an extendable run (B132 to B136, and B139)
+
+/// An extendable run started in the background, whose command publishes its channel
+/// name and holds, so the test can talk to the channel from outside the job.
+struct Running {
+    child: std::process::Child,
+    channel: String,
+    began: std::time::Instant,
+    _dir: TempDir,
+}
+
+fn start_run(options: &[&str], timeout: &str, hold: &str, log: &str) -> Running {
+    let dir = TempDir::new("b132-");
+    let published = text(&dir.join("channel.txt"));
+    let mut args = vec!["--extension-log", log];
+    args.extend_from_slice(options);
+    let began = std::time::Instant::now();
+    let child = spawn_quiet(guard(), &extendable_args(&args, timeout, &[testkit(), "publish-env", &published, CHANNEL_VARIABLE, hold]));
+    let channel = published_text(&dir.join("channel.txt"));
+    Running { child, channel, began, _dir: dir }
+}
+
+fn published_text(path: &Path) -> String {
+    published(path, 20.0).unwrap_or_default().trim().to_string()
+}
+
+/// The little endian bytes of a number as hexadecimal, as the wire carries them.
+fn le(value: u64) -> String {
+    value.to_le_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// A request message as hexadecimal: the magic, a target (1 the caller, 2 its parent) and the seconds.
+fn request_hex(target: u64, seconds: f64) -> String {
+    let magic: String = b"PTGERQ01".iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}{}{}", magic, le(target), le(seconds.to_bits()))
+}
+
+/// The status and the reason code of a reply that `raw-send` printed, or None.
+fn reply_of(result: &Out) -> Option<(u64, u64)> {
+    let hex = result.out().lines().find_map(|line| line.strip_prefix("reply "))?.trim().to_string();
+    let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()).collect();
+    if bytes.len() != 40 || &bytes[..8] != b"PTGERP01" {
+        return None;
+    }
+    let word = |i: usize| u64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap());
+    Some((word(1), word(2)))
+}
+
+#[test]
+fn b132_a_client_outside_the_job_is_refused_and_the_deadline_does_not_move() {
+    let _serial = serial();
+    let mut checks = Checks::new("outside client");
+    let dir = TempDir::new("b132log-");
+    let log = text(&dir.join("extension.log"));
+    let mut run = start_run(&[], "4", "100", &log);
+    checks.check("B132", "the run published a channel name", run.channel.starts_with("\\\\.\\pipe\\process-tree-guard-"), run.channel.clone());
+    // The test is not in the run's job: neither the library call nor the extend program can move its deadline.
+    let mut library = Command::new(testkit());
+    library.args(["extend-self", "30", "0"]).env(CHANNEL_VARIABLE, &run.channel);
+    let library = exec(library);
+    let mut program = Command::new(guard());
+    program.args(["extend", "30"]).env(CHANNEL_VARIABLE, &run.channel);
+    let program = exec(program);
+    checks.check("B132", "a request from a process outside the job is refused by the library call and by extend",
+        library.code == 125 && library.out().contains("not in the job") && program.code == 125 && program.err().contains("not in the job"),
+        format!("{} / {}", detail(&library), detail(&program)));
+    let status = wait_limited(&mut run.child, 30);
+    let elapsed = run.began.elapsed().as_secs_f64();
+    if status.is_none() {
+        kill(&mut run.child);
+    }
+    checks.check("B132", "the run still ends at its own deadline with 124", status.and_then(|s| s.code()) == Some(124) && elapsed >= 3.9, format!("{:?} after {:.2} s", status, elapsed));
+    checks.timing("B132", "the run ends by its own deadline plus the grace, not at the 30 seconds asked for", elapsed <= 4.0 * UNIT + GRACE, format!("{:.2} s", elapsed));
+    checks.bound("B132", "the run ends long before the 30 seconds asked for", elapsed < 12.0 * UNIT, format!("{:.2} s", elapsed));
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    let refused = file.lines().filter(|l| l.contains("decision=refused") && l.contains("not in the job of this run") && l.contains("requested=30")).count();
+    checks.check("B132", "both refusals are in the log, with the images that asked", refused == 2 && file.contains("image=\"testkit.exe\"") && file.contains("image=\"process-tree-guard.exe\""), file);
+    checks.finish();
+}
+
+#[test]
+fn b133_requests_are_rate_limited_per_process() {
+    let _serial = serial();
+    let mut checks = Checks::new("rate limit");
+    // One process asks 30 times in a row: its share is 12 requests in 10 seconds. Another process has a share of its own.
+    let dir = TempDir::new("b133-");
+    let log = text(&dir.join("extension.log"));
+    let alone = extendable(&["--extension-log", &log], "10", &[testkit(), "extend-loop", "30", "1"]);
+    let granted = alone.out().lines().filter(|l| l.starts_with("granted ")).count();
+    let limited = alone.out().lines().filter(|l| l.starts_with("error ") && l.contains("too many requests")).count();
+    checks.check("B133", "of 30 requests in a row from one process 12 are granted and 18 are refused for the rate", granted == 12 && limited == 18, format!("{} granted, {} limited: {}", granted, limited, alone.out().trim()));
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    // Every grant is a line of its own. The first refusal for the rate is a line of its own, and the 17 after it in the same window
+    // of refusals are one line with the count, so that a process that asks in a loop cannot fill the log.
+    checks.check("B133", "the 12 grants are lines of their own, the first refusal for the rate is a line, and the 17 after it are one line with their count",
+        file.lines().count() == 14 && file.lines().filter(|l| l.contains("decision=granted")).count() == 12
+            && file.lines().filter(|l| l.contains("decision=refused") && l.contains("too many requests")).count() == 2
+            && file.lines().any(|l| l.contains("17 more refused within 10 seconds of the first")), file);
+    let second_log = text(&dir.join("second.log"));
+    let shared = extendable(&["--extension-log", &second_log], "3", &[testkit(), "par", "1", "+", testkit(), "extend-loop", "14", "1", "+", testkit(), "extend-self", "1", "0"]);
+    let lines = std::fs::read_to_string(&second_log).unwrap_or_default();
+    let mut by_process: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+    for line in lines.lines() {
+        let entry = by_process.entry(log_field(line, "pid").unwrap_or_default()).or_default();
+        if line.contains("decision=granted") { entry.0 += 1 } else { entry.1 += 1 }
+    }
+    let mut counts: Vec<(usize, usize)> = by_process.values().copied().collect();
+    counts.sort();
+    checks.check("B133", "a second process in the same run is not held back by the first one's share", counts == vec![(1, 0), (12, 2)], format!("{:?} after {}", counts, detail(&shared)));
+    checks.finish();
+}
+
+#[test]
+fn b134_malformed_and_forged_requests_are_refused_and_move_nothing() {
+    let _serial = serial();
+    let mut checks = Checks::new("hostile messages");
+    let long: String = "ab".repeat(80);
+    let cases: Vec<(&str, String, Option<(u64, u64)>)> = vec![
+        ("a message of two bytes", "0102".into(), Some((1, 4))),
+        ("24 bytes with the wrong magic", "00".repeat(24), Some((1, 4))),
+        ("a target that is neither the caller, its parent nor a release", request_hex(4, 5.0), Some((1, 4))),
+        ("a message of 80 bytes, longer than any request", long, Some((1, 4))),
+        // The first 24 bytes are a request that would be granted, and the message is longer than a request by one byte, and
+        // then by as many as the guard reads at once: only the fixed size refuses them.
+        ("a good request followed by one more byte", format!("{}00", request_hex(1, 2.0)), Some((1, 4))),
+        ("a good request followed by 40 bytes, 64 in all", format!("{}{}", request_hex(1, 2.0), "00".repeat(40)), Some((1, 4))),
+        ("a good request cut short by one byte", request_hex(1, 2.0)[..46].to_string(), Some((1, 4))),
+        ("seconds that are not a number", request_hex(1, f64::NAN), Some((1, 7))),
+        ("seconds below zero", request_hex(1, -5.0), Some((1, 7))),
+        ("zero seconds", request_hex(1, 0.0), Some((1, 7))),
+        ("seconds beyond the 24 hours the guard allows", request_hex(1, 1.0e9), Some((1, 1))),
+        ("a good request, to show the same route grants", request_hex(1, 2.0), Some((0, 0))),
+    ];
+    for (name, hex, expected) in cases {
+        let result = extendable(&["--max-extension", "5"], "5", &[testkit(), "raw-send", "env", &hex, "0", "yes"]);
+        let reply = reply_of(&result);
+        checks.check("B134", &format!("{}: the reply is {:?}", name, expected), reply == expected, format!("{:?} {}", reply, detail(&result)));
+    }
+    checks.finish();
+}
+
+#[test]
+fn b135_no_more_instances_of_the_channel_can_be_made_and_its_access_list_is_for_the_current_user_only() {
+    let _serial = serial();
+    let mut checks = Checks::new("channel security");
+    let squat = extendable(&[], "10", &[testkit(), "pipe-squat", "env"]);
+    // ERROR_ACCESS_DENIED (5) for the first-instance flag; the plain request is refused too, since the four instances the pipe allows exist.
+    checks.check("B135", "no second instance of the channel can be made, with or without the first-instance flag",
+        squat.code == 0 && squat.out().contains("first-instance 5") && squat.out().lines().any(|l| l.starts_with("plain ") && l != "plain 0"), detail(&squat));
+    let mut who = Command::new("whoami.exe");
+    who.args(["/user", "/fo", "csv", "/nh"]);
+    let whoami = exec(who);
+    let sid = whoami.out().trim().rsplit(',').next().unwrap_or("").trim_matches('"').to_string();
+    let sddl = extendable(&[], "10", &[testkit(), "pipe-sddl", "env"]);
+    checks.check("B135", "the access list is one entry, for the current user's identifier, and is protected",
+        sid.starts_with("S-1-") && sddl.out().trim() == format!("D:P(A;;0x12019b;;;{})", sid), format!("{} / {}", sid, detail(&sddl)));
+    // The rights are read, write and synchronize: the right to make another instance is not among them.
+    checks.check("B135", "the rights in the list do not include creating another instance of the pipe", 0x12019bu32 & 0x4 == 0, "0x12019b has no FILE_CREATE_PIPE_INSTANCE");
+    checks.finish();
+}
+
+#[test]
+fn b144_the_channel_is_a_message_mode_pipe_made_to_refuse_remote_clients() {
+    let _serial = serial();
+    let mut checks = Checks::new("channel mode");
+    // The pipe reads back as a message pipe with the four instances (GetNamedPipeInfo on a client handle).
+    let info = extendable(&[], "10", &[testkit(), "pipe-info", "env"]);
+    checks.check("B144", "the channel is a message mode pipe, seen from the client end, with four instances",
+        info.out().contains("type message end client instances 4"), detail(&info));
+    // Nothing can read PIPE_REJECT_REMOTE_CLIENTS back from a pipe, and a remote client is not tried here: this checks that
+    // the mode the channel is made with names the flag and message mode (the unit test of the same name asserts the value
+    // passed to CreateNamedPipeW).
+    let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("extend.rs")).unwrap_or_default();
+    let mode = source.lines().find(|line| line.starts_with("const CHANNEL_PIPE_MODE")).unwrap_or("");
+    checks.check("B144", "the mode the channel is made with is message type, message read mode and PIPE_REJECT_REMOTE_CLIENTS",
+        mode.contains("PIPE_TYPE_MESSAGE") && mode.contains("PIPE_READMODE_MESSAGE") && mode.contains("PIPE_REJECT_REMOTE_CLIENTS"), mode);
+    checks.finish();
+}
+
+#[test]
+fn b136_a_client_that_stalls_does_not_delay_the_next_client() {
+    let _serial = serial();
+    let mut checks = Checks::new("stalled client");
+    let dir = TempDir::new("b136-");
+    let log = text(&dir.join("extension.log"));
+    // One client connects and sends nothing for 30 seconds. Half a unit later another asks for a hold of
+    // 5 units, with the boss at 4. The channel lets go of the first client after a quarter of a second, and
+    // serves the second on an instance of its own meanwhile, so the hold ends the run at about 0.5 + 5 units,
+    // later than the boss's 4. Served after the stall of the earlier 2 seconds, it would end at about 7.5.
+    let result = extendable(&["--extension-log", &log], "4", &[testkit(), "par", "100", "+", testkit(), "raw-send", "env", "stall", "30", "no", "+",
+        testkit(), "after", "0.5", testkit(), "extend-self", "5", "100"]);
+    let elapsed = result.elapsed.as_secs_f64();
+    checks.check("B136", "the second client was served: the run ends at its hold, later than the boss's deadline",
+        result.code == 124 && elapsed >= 5.4, detail(&result));
+    checks.timing("B136", "the run ends by 5.5 units plus the grace", elapsed <= 5.5 * UNIT + GRACE, detail(&result));
+    checks.bound("B136", "the run ends long before the stalled client's 30 seconds", elapsed < 12.0 * UNIT, detail(&result));
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    checks.check("B136", "the second client's request is logged as granted", file.lines().any(|l| l.contains("requested=5 granted=5 decision=granted")), file.clone());
+    let silent = file.lines().find(|l| l.contains("no request arrived within")).map(str::to_string);
+    checks.check("B136", "the stalled client is in the log: it was let in, sent no request and was let go",
+        silent.as_deref().map_or(false, |l| l.contains("decision=refused") && l.contains("requested=unknown")), file);
+    checks.finish();
+}
+
+// ------------------------------------- 18. the log under a flood (B137, B138)
+
+#[test]
+fn b137_a_flood_from_outside_the_job_cannot_push_a_grant_out_of_the_log() {
+    let _serial = serial();
+    let mut checks = Checks::new("log flood from outside");
+    let dir = TempDir::new("b137-");
+    let log = text(&dir.join("extension.log"));
+    let channel_file = dir.join("channel.txt");
+    // One process in the job asks for 8 units at the start and holds on; the test, which is outside the job, then asks 600 times.
+    let channel_text = text(&channel_file);
+    let args = extendable_args(&["--max-extension", "20", "--extension-log", &log], "3",
+        &[testkit(), "par", "100", "+", testkit(), "publish-env", &channel_text, CHANNEL_VARIABLE, "100", "+", testkit(), "extend-self", "8", "100"]);
+    let mut run = spawn_quiet(guard(), &args);
+    let channel = published_text(&channel_file);
+    let granted_at = std::time::Instant::now();
+    while !std::fs::read_to_string(&log).unwrap_or_default().contains("decision=granted") && granted_at.elapsed().as_secs() < 20 {
+        nap(0.05);
+    }
+    let mut flood = Command::new(testkit());
+    flood.args(["extend-flood", "600", "1"]).env(CHANNEL_VARIABLE, &channel);
+    let flood = exec(flood);
+    let status = wait_limited(&mut run, 40);
+    if status.is_none() {
+        kill(&mut run);
+    }
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = file.lines().collect();
+    let sent: usize = flood.out().split_whitespace().filter_map(|word| word.parse::<usize>().ok()).sum();
+    checks.check("B137", "the 600 requests from outside the job were all refused", sent == 600 && flood.out().starts_with("granted 0 outside"), detail(&flood));
+    checks.check("B137", "the grant is still the first line of the log", lines.first().map_or(false, |l| l.contains("requested=8 granted=8 decision=granted")), file.clone());
+    checks.check("B137", "the log has the first refusals as lines of their own and the rest as one line with a count, not a line for each request",
+        lines.len() < 40 && lines.iter().any(|l| l.contains("not in the job of this run")) && lines.iter().any(|l| l.contains("more refused within 10 seconds of the first")),
+        format!("{} lines: {}", lines.len(), file));
+    checks.check("B137", "the run ends at its hold, 124, as the flood did not move it", status.and_then(|s| s.code()) == Some(124), format!("{:?}", status));
+    checks.finish();
+}
+
+#[test]
+fn b138_a_process_in_the_job_that_asks_in_a_loop_cannot_flood_standard_error_or_the_file() {
+    let _serial = serial();
+    let mut checks = Checks::new("log flood from inside");
+    let dir = TempDir::new("b138-");
+    let log = text(&dir.join("extension.log"));
+    let result = extendable(&["--extension-log", &log], "20", &[testkit(), "extend-flood", "1500", "1"]);
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    let counts: Vec<usize> = result.out().split_whitespace().filter_map(|word| word.parse::<usize>().ok()).collect();
+    // granted, outside, limited, other
+    checks.check("B138", "every one of the 1500 requests was answered, and all but the share of the window were refused for the rate",
+        counts.len() == 4 && counts.iter().sum::<usize>() == 1500 && counts[1] == 0 && counts[3] == 0 && counts[0] >= 12 && counts[2] >= 1, detail(&result));
+    checks.check("B138", "standard error and the file hold a few lines, not one for each request",
+        extension_lines(&result.err()).len() < 40 && file.lines().count() < 40 && result.err().len() < 20_000, format!("{} lines, {} bytes: {}", file.lines().count(), result.err().len(), file));
+    checks.check("B138", "the lines on standard error are the lines in the file", extension_lines(&result.err()).iter().map(String::as_str).eq(file.lines()), file.clone());
+    checks.finish();
+}
+
+// ---------------- 19. stalls, short-lived requesters and what the documents say (B139 to B142)
+
+#[test]
+fn b139_repeated_stalls_from_outside_and_from_inside_the_job_do_not_keep_a_client_from_being_served() {
+    let _serial = serial();
+    let mut checks = Checks::new("repeated stalls");
+    let dir = TempDir::new("b139-");
+    let log = text(&dir.join("extension.log"));
+    let channel_file = dir.join("channel.txt");
+    let channel_text = text(&channel_file);
+    // Three processes in the job connect and say nothing, again and again, for 8 seconds, and so do eight processes
+    // outside it. A legitimate process in the job asks at 1.5 seconds for 6 units, with the boss at 3. If the channel
+    // is held up by the stalls the client gives up after 5 seconds and the run ends at 3; served, it ends at 7.5.
+    let full = extendable_args(&["--max-extension", "20", "--extension-log", &log], "3",
+        &[testkit(), "par", "100", "+", testkit(), "publish-env", &channel_text, CHANNEL_VARIABLE, "100", "+",
+            testkit(), "stall-loop", "env", "8", "+", testkit(), "stall-loop", "env", "8", "+", testkit(), "stall-loop", "env", "8", "+",
+            testkit(), "after", "1.5", testkit(), "extend-self", "6", "100"]);
+    let began = std::time::Instant::now();
+    let mut run = spawn_quiet(guard(), &full);
+    let channel = published_text(&channel_file);
+    let mut outside: Vec<std::process::Child> = (0..8).map(|_| spawn_quiet(testkit(), &["stall-loop", &channel, "7"])).collect();
+    let status = wait_limited(&mut run, 60);
+    let elapsed = began.elapsed().as_secs_f64();
+    if status.is_none() {
+        kill(&mut run);
+    }
+    for stall in outside.iter_mut() {
+        if wait_limited(stall, 20).is_none() {
+            kill(stall);
+        }
+    }
+    let file = std::fs::read_to_string(&log).unwrap_or_default();
+    checks.check("B139", "the client in the job was served among the stalls: its hold ends the run, long after the boss's 3 units",
+        status.and_then(|s| s.code()) == Some(124) && elapsed >= 7.0 * UNIT, format!("{:?} after {:.2} s", status, elapsed));
+    checks.timing("B139", "the run ends by 7.5 units plus the grace", elapsed <= 7.5 * UNIT + GRACE, format!("{:.2} s", elapsed));
+    checks.bound("B139", "the run ends long before the stalls would have let it", elapsed < 30.0 * UNIT, format!("{:.2} s", elapsed));
+    checks.check("B139", "its request is in the log as granted", file.lines().any(|l| l.contains("requested=6 granted=6 decision=granted")), file.clone());
+    checks.check("B139", "the stalls are in the log as refusals, within the budget: a few lines, not one for each connection",
+        file.lines().any(|l| l.contains("no request arrived within")) && file.lines().count() < 200, format!("{} lines", file.lines().count()));
+    checks.finish();
+}
+
+#[test]
+fn b140_more_short_lived_requesters_than_the_table_holds_are_all_granted() {
+    let _serial = serial();
+    let mut checks = Checks::new("short-lived requesters");
+    // 1600 processes, each asking once and exiting, in batches of 200: more than the 1024 the rate table holds at
+    // once, within a window of 10 seconds on a machine that starts about a hundred processes a second. A process
+    // that has exited must give up its place, so every one of them is granted.
+    let command = guard_cmd(&extendable_args(&["--max-extension", "300"], "300", &[testkit(), "churn", "1600", "200", "0.2"]));
+    let result = exec_with(command, Opts { limit_secs: 200, keep_stdout: true, ..Opts::default() });
+    checks.check("B140", "all 1600 requests were granted, none refused", result.code == 0 && result.out().trim() == "granted 1600 refused 0", format!("exit {} {:?} in {:.1} s", result.code, result.out().trim(), result.elapsed.as_secs_f64()));
+    checks.check("B140", "no process was told that too many were asking", !result.err().contains("too many"), result.err().lines().filter(|l| l.contains("too many")).take(3).collect::<Vec<_>>().join(" | "));
+    checks.finish();
+}
+
+#[test]
+fn b141_the_documents_say_that_a_process_in_the_job_can_turn_the_log_file_over() {
+    let mut checks = Checks::new("log retention");
+    // Grants are always lines of their own, so a process in the job that starts many short-lived processes, each
+    // asking once, can fill the file and its one rotation within minutes and push every earlier line out. The
+    // documents must say so, and must not claim that the file keeps its lines for long.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B141", &format!("{} says that the log file can be turned over within minutes, so it is evidence only if copied off promptly", name),
+            body.contains("turn the log file over") && body.contains("copied off the machine"), name);
+        checks.check("B141", &format!("{} does not say that the log is pushed out only slowly", name),
+            !body.contains("pushed out of its file only slowly") && !body.contains("better part of an hour"), name);
+    }
+    checks.finish();
+}
+
+#[test]
+fn b142_the_documents_say_what_a_failed_turn_over_does_and_what_a_library_call_inside_a_run_holds() {
+    let mut checks = Checks::new("log file and library calls");
+    // A follower that holds the audit file open without sharing delete stops its rename, and the guard then copies
+    // the earlier lines instead of discarding them; a library call inside a run holds it only while the call lasts.
+    // The documents must say both, and the follower's part in the first.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B142", &format!("{} says that the log file may not be turned over (a follower without FILE_SHARE_DELETE), that the earlier lines go to PATH.1, and that it then grows to twice the limit with a notice", name),
+            body.contains("PATH.1") && body.contains("notice") && body.contains("twice") && body.contains("FILE_SHARE_DELETE"), name);
+        checks.check("B142", &format!("{} says that the hold of a library call inside a run ends when the call returns, and the limit of 12 in 10 seconds", name),
+            body.contains("ended when the call returns") && body.contains("12 per process in"), name);
+    }
+    checks.finish();
+}
+
+#[test]
+fn b143_the_documents_say_what_overlapping_calls_hold_what_collectors_must_share_and_where_the_test_helper_is_built() {
+    let mut checks = Checks::new("overlapping calls, collectors and the test helper");
+    // Calls of the library that overlap in one process each have a hold of their own; a collector of the audit file must
+    // share writing as well as deleting, and the guard holds the file and says when a write fails; the test helper is
+    // built for a test run only. The documents must say so, and must not say that a call replaces the hold of `extend`.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B143", &format!("{} says that each call has a hold of its own, so that calls that overlap do not replace or release one another's", name),
+            body.contains("a hold of its own") && body.contains("overlap"), name);
+        checks.check("B143", &format!("{} does not say that a call replaces the hold that `extend` made", name),
+            !body.contains("replaces any hold the process asked for"), name);
+        checks.check("B143", &format!("{} tells a collector to share FILE_SHARE_WRITE as well as FILE_SHARE_DELETE, and says the guard holds the file open for appending and reports a failed write", name),
+            body.contains("FILE_SHARE_WRITE") && body.contains("FILE_SHARE_DELETE") && body.contains("open for appending") && body.contains("tries again every half second"), name);
+    }
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap_or_default();
+    checks.check("B143", "the README says that a source install does not build or install the test helper", readme.contains("not the test helper `testkit`"), "README.md");
+    checks.finish();
+}
+
+#[test]
+fn b145_the_documents_state_the_log_the_hold_limit_and_the_reply_that_is_not_taken() {
+    let mut checks = Checks::new("log, hold limit and reply");
+    // The log is a line for every request and every grant, and refusals within stated limits (a decision); one process can
+    // hold at most 8 deadlines; a reply that the client does not take in half a second withdraws the grant; and the changelog
+    // describes the release against 2.0.0-alpha.2 without recording the passes that led to it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B145", &format!("{} says that one process cannot hold more than 8 deadlines and gives the reason a ninth is refused", name),
+            body.contains("this process holds too many deadlines") && body.contains("8 for one process"), name);
+        checks.check("B145", &format!("{} says that a grant whose reply the client does not take is withdrawn, and the log says so", name),
+            body.contains("withdraw") && body.contains("decision=withdrawn"), name);
+    }
+    for name in ["README.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B145", &format!("{} says that every request and every grant is a line, and that refusals are within stated limits", name),
+            body.to_lowercase().contains("every request and every grant is a line") && !body.to_lowercase().contains("every request, grant and refusal is a line")
+                && (body.contains("a stated decision") || body.contains("This is a decision")), name);
+    }
+    let changelog = std::fs::read_to_string(root.join("CHANGELOG.md")).unwrap_or_default();
+    let section = changelog.split("\n## ").find(|section| section.starts_with("2.0.0-alpha.3")).unwrap_or("");
+    let history: Vec<&str> = ["Before this", "Before, ", "before, ", "earlier text", "An earlier", "was wrong"].into_iter().filter(|phrase| section.contains(phrase)).collect();
+    checks.check("B145", "the entry for 2.0.0-alpha.3 describes what the release adds and changes, and records no earlier state that no release had", !section.is_empty() && history.is_empty(), format!("{:?}", history));
+    checks.finish();
+}
+
+#[test]
+fn b146_the_documents_say_the_audit_file_is_evidence_only_against_a_process_that_cannot_open_it() {
+    let mut checks = Checks::new("audit file as evidence");
+    // The guard and the processes in the job run as the same account, so a folder that the job cannot write to is a folder the
+    // guard cannot write to either, and a process in the job can append a line in the form of a grant. The documents must say
+    // that the file is evidence only against a process that cannot open it, and must not offer that folder as a mitigation.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B146", &format!("{} says that the file is evidence only against a process that cannot open it", name),
+            body.contains("evidence only against a process that cannot open it") && body.contains("same account"), name);
+        checks.check("B146", &format!("{} does not offer a folder that the job cannot write to as a mitigation, or call the file the record to rely on", name),
+            !body.contains("in a folder that the processes in the job cannot write to") && !body.contains("is the record to rely on")
+                && !body.contains("a folder that the processes in the job cannot write to prevents")
+                && !body.contains("a folder that the processes in the job cannot write to does not prevent"), name);
+    }
+    checks.finish();
+}
+
+#[test]
+fn b147_the_documents_say_standard_error_is_the_only_record_without_an_audit_file() {
+    let mut checks = Checks::new("standard error as the record");
+    // The policy says a deadline moves only by a logged request. Without --extension-log the log is the guard's standard error, so
+    // the documents must say that it is then the only record, that a run does not start when it cannot be one, and that a grant
+    // stands only once its line is written; and they must not say that the changes to every run are fewer than they are.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B147", &format!("{} says that without an audit file standard error is the only record, and what the run does about it", name),
+            body.contains("standard error is the only record") && body.contains("null device") && body.contains("only once its line has been written"), name);
+    }
+    for name in ["README.md", "CHANGELOG.md", "src/lib.rs"] {
+        let body = std::fs::read_to_string(root.join(name)).unwrap_or_default();
+        checks.check("B147", &format!("{} does not give a number of differences from 2.0.0-alpha.2 that is smaller than its list", name),
+            !body.contains("Three things differ") && !body.contains("three things differ"), name);
+    }
+    let readme = std::fs::read_to_string(root.join("README.md")).unwrap_or_default();
+    checks.check("B147", "the README says that the hook modes keep exit code 2 for a denial whatever the state of their streams",
+        readme.contains("a denial exits with 2 whether or not the guard can write its output and its reason"), "README.md");
     checks.finish();
 }

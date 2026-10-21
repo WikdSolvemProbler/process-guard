@@ -105,18 +105,19 @@ pub fn testkit() -> &'static str {
 
 // ------------------------------------------------------- role programs, layouts
 
-/// The three programs the crate builds: the full command, the deadline role and
-/// the hook role.
-pub const ROLES: [&str; 3] = ["process-tree-guard", "process-tree-guard-deadline", "process-tree-guard-gate"];
+/// The four programs the crate builds: the full command, the deadline role, the
+/// hook role and the contain role.
+pub const ROLES: [&str; 4] = ["process-tree-guard", "process-tree-guard-deadline", "process-tree-guard-gate", "process-tree-guard-contain"];
 
 /// The built program of this name (one of ROLES), exactly as cargo built it in
 /// this run. Unlike `guard()`, it is not replaced by PROCESS_TREE_GUARD_EXE.
 pub fn role(name: &str) -> &'static str {
-    static PATHS: OnceLock<[String; 3]> = OnceLock::new();
+    static PATHS: OnceLock<[String; 4]> = OnceLock::new();
     let paths = PATHS.get_or_init(|| [
         long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard"))),
         long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-deadline"))),
         long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-gate"))),
+        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-contain"))),
     ]);
     let index = ROLES.iter().position(|known| *known == name).unwrap_or_else(|| panic!("{} is not a program of this crate", name));
     &paths[index]
@@ -150,7 +151,8 @@ impl Layout {
 }
 
 /// A private tree holding every program in one of the layouts: the full command
-/// and its automatic copy, the deadline role and its automatic copy, and the gate.
+/// and its automatic copy, the deadline role and its automatic copy, the gate and
+/// the contain role.
 pub struct Tree {
     _root: TempDir,
     pub layout: Layout,
@@ -181,6 +183,7 @@ impl Tree {
         copy_role(&tree.libexec, ROLES[1], ROLES[1]);
         copy_role(&tree.libexec, ROLES[1], "process-tree-guard-deadline-auto");
         copy_role(&tree.libexec, ROLES[2], ROLES[2]);
+        copy_role(&tree.libexec, ROLES[3], ROLES[3]);
         tree
     }
 
@@ -206,6 +209,8 @@ pub struct Out {
     pub stdout_len: u64,
     pub stderr: Vec<u8>,
     pub elapsed: Duration,
+    /// When the command was started, in milliseconds since 1970 (the clock the guard's log lines are written in).
+    pub began_unix_ms: i64,
 }
 
 impl Out {
@@ -294,6 +299,7 @@ pub fn exec_with(mut command: Command, opts: Opts) -> Out {
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    let began_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
     let began = Instant::now();
     let mut child = command.spawn().unwrap_or_else(|e| panic!("cannot start {:?}: {}", command.get_program(), e));
     // The child may exit before reading everything; a failed write is not an error.
@@ -314,7 +320,7 @@ pub fn exec_with(mut command: Command, opts: Opts) -> Out {
     };
     let (stdout, stdout_len) = out.finish(Duration::from_secs(10));
     let (stderr, _) = err.finish(Duration::from_secs(10));
-    Out { code: status.code().unwrap_or(-1) as u32, stdout, stdout_len, stderr, elapsed: began.elapsed() }
+    Out { code: status.code().unwrap_or(-1) as u32, stdout, stdout_len, stderr, elapsed: began.elapsed(), began_unix_ms }
 }
 
 /// Run a command whose standard streams the caller has already set.
@@ -366,6 +372,61 @@ pub fn guarded(timeout: &str, child: &[&str]) -> Out {
 /// The guard with a shell payload.
 pub fn shell(timeout: &str, shell_name: &str, payload: &str) -> Out {
     run_guard(&["--timeout", timeout, "--shell", shell_name, "--command-b64", &base64(payload.as_bytes())])
+}
+
+// ------------------------------------------------------------ extendable runs
+
+/// The unit of time in the scaled tests of extendable runs: one second. A test
+/// that plans an end at `n` units expects it between `n` units and `n` units plus
+/// the grace; the grace covers starting the processes and tearing the tree down.
+pub const UNIT: f64 = 1.0;
+/// The grace G of the scaled tests, in seconds.
+pub const GRACE: f64 = 1.5;
+/// The unit of the three cases of a deadline held up by children (G51 to G53), three seconds: in
+/// the first two the boss has 2 units, in which the two guards it starts must start and register,
+/// and a unit of one second leaves a busy machine too little time for that.
+pub const CASE_UNIT: f64 = 3.0;
+
+/// The environment variable that names the channel of an extendable run.
+pub const CHANNEL_VARIABLE: &str = "PROCESS_TREE_GUARD_CHANNEL";
+
+/// The arguments of an extendable run: `--extendable`, the options, `--timeout`, then the child.
+pub fn extendable_args<'a>(options: &[&'a str], timeout: &'a str, child: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--extendable"];
+    args.extend_from_slice(options);
+    args.extend(["--timeout", timeout, "--"]);
+    args.extend_from_slice(child);
+    args
+}
+
+/// An extendable run of the guard under test.
+pub fn extendable(options: &[&str], timeout: &str, child: &[&str]) -> Out {
+    run_guard(&extendable_args(options, timeout, child))
+}
+
+/// The log lines the guard wrote for requests, from a standard error text.
+pub fn extension_lines(stderr: &str) -> Vec<String> {
+    stderr.lines().filter(|line| line.starts_with("PROCESS_TREE_GUARD_EXTENSION: ")).map(str::to_string).collect()
+}
+
+/// The value of `name=` in a log line: the quoted text, or the word up to the next space.
+pub fn log_field(line: &str, name: &str) -> Option<String> {
+    let at = line.find(&format!(" {}=", name))? + name.len() + 2;
+    let rest = &line[at..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Some(out),
+                '\\' => out.push(chars.next()?),
+                c => out.push(c),
+            }
+        }
+        None
+    } else {
+        Some(rest.split(' ').next()?.to_string())
+    }
 }
 
 /// Start the guard (or anything else) with all standard streams null.
@@ -971,6 +1032,17 @@ impl Checks {
         } else {
             println!("INFO {} {} {} (not asserted: {})", id, name, if ok { "within the bound" } else { "outside the bound" }, detail);
         }
+    }
+    /// A structural bound on time: asserted whatever the timing setting. It is set well
+    /// away from the right answer and near the wrong one (the time a broken run would take
+    /// is a multiple of the right one), so a broken implementation cannot pass it, and a
+    /// correct run meets it on a machine that is busy but not oversubscribed. On a machine
+    /// that is oversubscribed a helper can start so late that a correct run ends after the
+    /// bound, or is refused its request, and the check then fails: the bounds are not
+    /// proof against any load. The tight bounds, the planned end plus the grace, are `timing`
+    /// checks.
+    pub fn bound(&mut self, id: &str, name: &str, ok: bool, detail: impl Display) {
+        self.check(id, &format!("{} (structural bound, always asserted)", name), ok, detail);
     }
     pub fn info(&self, line: impl Display) {
         println!("INFO {}", line);

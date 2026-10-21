@@ -24,12 +24,12 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp target/release/process-tree-guard.exe target/release/process-tree-guard-deadline.exe target/release/process-tree-guard-gate.exe dist/
+          cp target/release/process-tree-guard.exe target/release/process-tree-guard-deadline.exe target/release/process-tree-guard-gate.exe target/release/process-tree-guard-contain.exe dist/
           cp LICENSE NOTICE README.md POLICY.md dist/
           # The 1.x name is kept through all of 2.x as an alias asset: the same program, copied here
           # from the program built in this run, never from a file in the build folder.
           cp target/release/process-tree-guard.exe dist/process-guard.exe
-          cd dist && sha256sum process-tree-guard.exe process-tree-guard-deadline.exe process-tree-guard-gate.exe process-guard.exe > SHA256SUMS && cat SHA256SUMS
+          cd dist && sha256sum process-tree-guard.exe process-tree-guard-deadline.exe process-tree-guard-gate.exe process-tree-guard-contain.exe process-guard.exe > SHA256SUMS && cat SHA256SUMS
       - name: Check the release assets
         shell: bash
         run: |
@@ -40,6 +40,7 @@ jobs:
           README.md
           SHA256SUMS
           process-guard.exe
+          process-tree-guard-contain.exe
           process-tree-guard-deadline.exe
           process-tree-guard-gate.exe
           process-tree-guard.exe"
@@ -53,7 +54,7 @@ jobs:
           fi
           # The alias asset is the same program as the new name, and every executable is listed in SHA256SUMS.
           cmp dist/process-guard.exe dist/process-tree-guard.exe
-          cd dist && sha256sum --check SHA256SUMS && test "$(wc -l < SHA256SUMS)" -eq 4
+          cd dist && sha256sum --check SHA256SUMS && test "$(wc -l < SHA256SUMS)" -eq 5
       - name: Check the version resources of the release programs
         shell: pwsh
         run: |
@@ -62,6 +63,7 @@ jobs:
             'process-tree-guard.exe' = 'Process Tree Guard'
             'process-tree-guard-deadline.exe' = 'Process Tree Guard: Deadline'
             'process-tree-guard-gate.exe' = 'Process Tree Guard: Gate'
+            'process-tree-guard-contain.exe' = 'Process Tree Guard: Contain'
             'process-guard.exe' = 'Process Tree Guard'
           }
           $failed = $false
