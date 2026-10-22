@@ -118,6 +118,43 @@
 //! options without `--extendable` are refused with a message of their own; and the usage text names
 //! `extend` and the extension options. See the README.
 //!
+//! A `--max-extension` over 21,600 is a per-run exception: before the job is made and before
+//! the command starts, the top-level guard asks for the password of the account the guard runs
+//! as (the signed-in user in the usual case), by the secure desktop prompt or, with
+//! `--authenticate console`, on a console that is really there,
+//! checks it with `LogonUserW` against the guard's own user, and allows at most 3 attempts.
+//! A run that nobody can be asked about, or that is cancelled or not answered within 300
+//! seconds, exits with 125 and never starts its command. A guard inside an extendable run (a
+//! nested guard) is refused before anyone is asked, and the contain role and automatic mode do
+//! not ask: they refuse the options. Nor does the hook program: it denies a line that carries
+//! the options, or wraps it whole as the command text of the automatic wrapper, which does not
+//! ask either. A guard that another guard started (as the command of automatic mode, or under a
+//! guard that is not extendable) is refused before anything is shown, because a command that an
+//! agent runs is such a run and an agent must not be able to summon a prompt. Two tests make the
+//! refusal. The first is by file name: the programs of this crate, the 1.x name, and any file name
+//! that ends in `-auto`, which selects automatic mode. The search follows the parent chain while
+//! each parent is alive, started before its child and is not one of `explorer.exe`,
+//! `services.exe`, `wininit.exe`, `winlogon.exe`, `svchost.exe` or `smss.exe` at its system path
+//! (`explorer.exe` in the Windows folder, the other five in `System32`; a program of one of those
+//! names in any other folder, one under the Windows folder included, is a copy that a process of
+//! the user may be able to make, and is walked past like any other process), for at most 32 levels; a parent
+//! that has already exited ends it, so a command started through a launcher that exits before the
+//! guard runs is not seen to be under a guard by this test, and a launcher can name a parent of its
+//! choice. The second is by job: every job a guard makes kills its processes when it closes, so a
+//! process whose innermost job does so is refused, however its chain of parents looks, unless the
+//! process has put itself in a job of its own, which any process of the user can do with three
+//! calls (nested jobs are allowed, and the test programs of this repository do it); the test
+//! refuses commands that were not written to avoid it. It also refuses a guard started from
+//! inside a host that puts its terminal in a job of that kind (continuous integration runners,
+//! some editor terminals), which must start the guard from an ordinary terminal. An agent that
+//! runs as the same user outside a guard job, that puts its own process in a job of its own (a
+//! nested job replaces the innermost job that the job test reads) and starts the guard from a
+//! process whose parent has exited, or that can set its own parent, can still summon a prompt; the
+//! password is still required.
+//! Each attempt and the outcome is a line of the log. None of the calls `run`, `run_shell`,
+//! `run_auto`, `run_hook` and `extend` asks; the entry points `main_full` and `main_deadline`
+//! do, from the command line of the process, as the programs do.
+//!
 //! # The owner rule
 //!
 //! The guard ends the tree when the process that launched it exits, and in a
@@ -135,6 +172,7 @@
 //! guard from a process whose parent outlives the call, or start the
 //! `process-tree-guard` program as a child, which then watches the embedder itself.
 
+mod auth;
 mod base64;
 mod cli;
 mod engine;

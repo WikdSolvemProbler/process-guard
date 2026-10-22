@@ -135,6 +135,25 @@ pub struct AssociateCompletionPort {
     pub port: Handle,
 }
 
+/// CREDUI_INFOW: what the sign-in prompt shows besides the fields.
+#[repr(C)]
+pub struct CredUiInfoW {
+    pub size: u32,
+    pub parent: Handle,
+    pub message: *const u16,
+    pub caption: *const u16,
+    pub banner: Handle,
+}
+
+/// USEROBJECTFLAGS, the answer for `UOI_FLAGS`.
+#[repr(C)]
+#[derive(Default)]
+pub struct UserObjectFlags {
+    pub inherit: Bool,
+    pub reserved: Bool,
+    pub flags: u32,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
@@ -180,9 +199,11 @@ extern "system" {
     pub fn GetLastError() -> u32;
     pub fn GetConsoleWindow() -> Handle;
     pub fn GetConsoleMode(console: Handle, mode: *mut u32) -> Bool;
+    pub fn SetConsoleMode(console: Handle, mode: u32) -> Bool;
     pub fn GetFileType(file: Handle) -> u32;
     pub fn WriteConsoleW(console: Handle, buffer: *const c_void, length: u32, written: *mut u32, reserved: *mut c_void) -> Bool;
     pub fn QueryFullProcessImageNameW(process: Handle, flags: u32, name: *mut u16, size: *mut u32) -> Bool;
+    pub fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
     pub fn GetProcessTimes(process: Handle, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> Bool;
     pub fn IsProcessInJob(process: Handle, job: Handle, result: *mut Bool) -> Bool;
     pub fn GetTickCount64() -> u64;
@@ -223,6 +244,11 @@ extern "system" {
     pub fn GetQueuedCompletionStatus(port: Handle, transferred: *mut u32, key: *mut usize, overlapped: *mut *mut Overlapped, milliseconds: u32) -> Bool;
     pub fn PostQueuedCompletionStatus(port: Handle, transferred: u32, key: usize, overlapped: *mut Overlapped) -> Bool;
     pub fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    pub fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> Bool;
+    pub fn GetNumberOfConsoleInputEvents(console: Handle, events: *mut u32) -> Bool;
+    pub fn CreateMutexW(attributes: *mut c_void, initial_owner: Bool, name: *const u16) -> Handle;
+    pub fn LoadLibraryExW(name: *const u16, file: Handle, flags: u32) -> Handle;
+    pub fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
 }
 
 #[link(name = "advapi32")]
@@ -281,6 +307,184 @@ pub const ERROR_MORE_DATA: u32 = 234;
 pub const ERROR_PIPE_BUSY: u32 = 231;
 pub const ERROR_PIPE_CONNECTED: u32 = 535;
 pub const ERROR_IO_PENDING: u32 = 997;
+pub const ERROR_ALREADY_EXISTS: u32 = 183;
+pub const ERROR_CANCELLED: u32 = 1223;
+pub const ERROR_LOGON_FAILURE: u32 = 1326;
+/// The sign-in prompt shows only the accounts of the current user, on the secure desktop.
+pub const CREDUIWIN_ENUMERATE_CURRENT_USER: u32 = 0x200;
+pub const CREDUIWIN_SECURE_PROMPT: u32 = 0x1000;
+/// Flags of the console prompt: the prompt is shown even when credentials for the target are
+/// stored, no certificate or smart card, nothing is saved, and the credentials are generic (the
+/// target names no server to check them against).
+pub const CREDUI_FLAGS_DO_NOT_PERSIST: u32 = 0x2;
+pub const CREDUI_FLAGS_EXCLUDE_CERTIFICATES: u32 = 0x8;
+pub const CREDUI_FLAGS_ALWAYS_SHOW_UI: u32 = 0x80;
+pub const CREDUI_FLAGS_GENERIC_CREDENTIALS: u32 = 0x40000;
+/// The protection type `CredIsProtectedW` gives a password that is in clear text.
+pub const CRED_UNPROTECTED: i32 = 0;
+/// The most wide characters the message of the desktop sign-in prompt may have.
+pub const CREDUI_MAX_MESSAGE_LENGTH: usize = 1024;
+/// Sizes, in wide characters, of the buffers the sign-in prompt fills: the maximum lengths of the
+/// system (CREDUI_MAX_USERNAME_LENGTH, CRED_MAX_DOMAIN_TARGET_NAME_LENGTH,
+/// CREDUI_MAX_PASSWORD_LENGTH), which do not count the NUL, plus one for the NUL.
+pub const CREDUI_USER_CHARS: usize = 514;
+pub const CREDUI_DOMAIN_CHARS: usize = 338;
+pub const CREDUI_PASSWORD_CHARS: usize = 257;
+/// The form of a user name that `GetUserNameExW` writes as `DOMAIN\user`, read without a look up
+/// that can leave the machine.
+pub const NAME_SAM_COMPATIBLE: i32 = 2;
+pub const UOI_FLAGS: i32 = 1;
+pub const WSF_VISIBLE: u32 = 1;
+pub const LOGON32_LOGON_INTERACTIVE: u32 = 2;
+pub const LOGON32_PROVIDER_DEFAULT: u32 = 0;
+pub const GENERIC_WRITE: u32 = 0x4000_0000;
+pub const FILE_SHARE_READ_AND_WRITE: u32 = 3;
+/// Load a library from the system folder only, never from the folder of the program or the current folder.
+pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
+
+// ------------------------------------------------- the libraries of the sign-in prompt
+//
+// The sign-in prompt needs `credui.dll`, `user32.dll`, `ole32.dll` and `secur32.dll`, which only a run over the
+// default cap uses. They are not linked: a program that links them loads them at start, for every
+// command it guards, and cannot start where one cannot be loaded. They are loaded from the system
+// folder when a prompt is first wanted, and a function that cannot be found makes the prompt
+// unavailable (the run is refused) and nothing else. The same holds for `LogonUserW` and
+// `LookupAccountNameW`, which the programs that can never ask must not import at all.
+
+pub type GetProcessWindowStationFn = unsafe extern "system" fn() -> Handle;
+pub type GetUserObjectInformationWFn = unsafe extern "system" fn(Handle, i32, *mut c_void, u32, *mut u32) -> Bool;
+pub type CoTaskMemFreeFn = unsafe extern "system" fn(*mut c_void);
+/// `GetUserNameExW` returns a BOOLEAN, one byte.
+pub type GetUserNameExWFn = unsafe extern "system" fn(i32, *mut u16, *mut u32) -> u8;
+pub type CredUiPromptForWindowsCredentialsWFn =
+    unsafe extern "system" fn(*const CredUiInfoW, u32, *mut u32, *const c_void, u32, *mut *mut c_void, *mut u32, *mut Bool, u32) -> u32;
+pub type CredUnPackAuthenticationBufferWFn =
+    unsafe extern "system" fn(u32, *const c_void, u32, *mut u16, *mut u32, *mut u16, *mut u32, *mut u16, *mut u32) -> Bool;
+pub type CredUiCmdLinePromptForCredentialsWFn =
+    unsafe extern "system" fn(*const u16, *mut c_void, u32, *mut u16, u32, *mut u16, u32, *mut Bool, u32) -> u32;
+/// The handler of a console control event (Ctrl+C, Ctrl+Break, closing the console, logging off, shutting down).
+pub type ConsoleCtrlHandlerFn = unsafe extern "system" fn(u32) -> Bool;
+/// `SetConsoleCtrlHandler(handler, add)`.
+pub type SetConsoleCtrlHandlerFn = unsafe extern "system" fn(Option<ConsoleCtrlHandlerFn>, Bool) -> Bool;
+/// `ExpungeConsoleCommandHistoryW(name of the program)`: clears the command history that the console keeps for a program.
+pub type ExpungeConsoleCommandHistoryWFn = unsafe extern "system" fn(*const u16) -> Bool;
+/// `CredIsProtectedW(credentials, protection type)`: whether a password is in a protected form.
+pub type CredIsProtectedWFn = unsafe extern "system" fn(*mut u16, *mut i32) -> Bool;
+/// `LogonUserW(user, domain, password, logon type, provider, token)`.
+pub type LogonUserWFn = unsafe extern "system" fn(*const u16, *const u16, *const u16, u32, u32, *mut Handle) -> Bool;
+/// `LookupAccountNameW(system, name, sid, sid size, domain, domain chars, kind)`.
+pub type LookupAccountNameWFn =
+    unsafe extern "system" fn(*const u16, *const u16, *mut c_void, *mut u32, *mut u16, *mut u32, *mut u32) -> Bool;
+
+/// What the test for a person being present asks of `user32.dll`.
+pub struct WindowStationApi {
+    pub station: GetProcessWindowStationFn,
+    pub information: GetUserObjectInformationWFn,
+}
+
+/// What the name of the account the guard runs as asks of `secur32.dll`.
+pub struct NameApi {
+    pub name: GetUserNameExWFn,
+}
+
+/// What the secure desktop prompt asks of `credui.dll`, `ole32.dll` and `advapi32.dll`.
+pub struct DesktopApi {
+    pub prompt: CredUiPromptForWindowsCredentialsWFn,
+    pub unpack: CredUnPackAuthenticationBufferWFn,
+    pub free: CoTaskMemFreeFn,
+    pub protected: CredIsProtectedWFn,
+}
+
+/// What the check of the password asks of `advapi32.dll`. They are bound at run time, like the
+/// rest of the prompt, so that the programs that can never ask (the contain role and the
+/// automatic copies) have no import of a function that checks a credential.
+pub struct LogonApi {
+    pub logon: LogonUserWFn,
+    pub lookup: LookupAccountNameWFn,
+}
+
+/// What the console prompt asks of `credui.dll` and `kernel32.dll`. The history call is not found
+/// on every system; where it is missing the history is not cleared.
+pub struct ConsoleApi {
+    pub prompt: CredUiCmdLinePromptForCredentialsWFn,
+    pub handler: SetConsoleCtrlHandlerFn,
+    pub expunge: Option<ExpungeConsoleCommandHistoryWFn>,
+}
+
+/// The library `name`, from the system folder. It is never freed: the functions taken from it
+/// are used for as long as the process lives, which is as long as a prompt can be wanted.
+fn library(name: &str) -> Option<Handle> {
+    let name = wide(name);
+    let module = unsafe { LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    (!module.is_null()).then_some(module)
+}
+
+/// The function `name` (ended by a NUL) of `module`, as the function pointer type `T`.
+///
+/// # Safety
+/// `T` must be the `extern "system"` function pointer type of the function that has that name.
+unsafe fn function<T: Copy>(module: Handle, name: &[u8]) -> Option<T> {
+    if name.last() != Some(&0) || std::mem::size_of::<T>() != std::mem::size_of::<*const c_void>() {
+        return None;
+    }
+    let address = GetProcAddress(module, name.as_ptr());
+    if address.is_null() { None } else { Some(std::mem::transmute_copy::<*const c_void, T>(&address)) }
+}
+
+pub fn window_station_api() -> Option<&'static WindowStationApi> {
+    static API: std::sync::OnceLock<Option<WindowStationApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let user32 = library("user32.dll")?;
+        Some(WindowStationApi {
+            station: function(user32, b"GetProcessWindowStation\0")?,
+            information: function(user32, b"GetUserObjectInformationW\0")?,
+        })
+    }).as_ref()
+}
+
+pub fn name_api() -> Option<&'static NameApi> {
+    static API: std::sync::OnceLock<Option<NameApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let secur32 = library("secur32.dll")?;
+        Some(NameApi { name: function(secur32, b"GetUserNameExW\0")? })
+    }).as_ref()
+}
+
+pub fn desktop_api() -> Option<&'static DesktopApi> {
+    static API: std::sync::OnceLock<Option<DesktopApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let (credui, ole32, advapi32) = (library("credui.dll")?, library("ole32.dll")?, library("advapi32.dll")?);
+        Some(DesktopApi {
+            prompt: function(credui, b"CredUIPromptForWindowsCredentialsW\0")?,
+            unpack: function(credui, b"CredUnPackAuthenticationBufferW\0")?,
+            free: function(ole32, b"CoTaskMemFree\0")?,
+            protected: function(advapi32, b"CredIsProtectedW\0")?,
+        })
+    }).as_ref()
+}
+
+pub fn logon_api() -> Option<&'static LogonApi> {
+    static API: std::sync::OnceLock<Option<LogonApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let advapi32 = library("advapi32.dll")?;
+        Some(LogonApi {
+            logon: function(advapi32, b"LogonUserW\0")?,
+            lookup: function(advapi32, b"LookupAccountNameW\0")?,
+        })
+    }).as_ref()
+}
+
+pub fn console_api() -> Option<&'static ConsoleApi> {
+    static API: std::sync::OnceLock<Option<ConsoleApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let (credui, kernel32) = (library("credui.dll")?, library("kernel32.dll")?);
+        Some(ConsoleApi {
+            prompt: function(credui, b"CredUICmdLinePromptForCredentialsW\0")?,
+            handler: function(kernel32, b"SetConsoleCtrlHandler\0")?,
+            expunge: function(kernel32, b"ExpungeConsoleCommandHistoryW\0"),
+        })
+    }).as_ref()
+}
 
 pub fn os_error() -> GuardError {
     error_for(unsafe { GetLastError() })

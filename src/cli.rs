@@ -3,15 +3,17 @@
 
 //! The command line forms: `--timeout SECONDS ...` and automatic mode.
 
+use crate::auth::{Exception, Method};
 use crate::base64::{base64_encode, decode_command};
-use crate::engine::{parent_image, run_job, run_job_with, run_library_job, which, RunMode};
+use crate::engine::{list2cmdline, parent_image, run_job, run_job_with, run_library_job, which, RunMode};
 use crate::extend::{escape, image_of, iso8601, request_held, Settings, Target, DEFAULT_MAX_EXTENSION};
 use crate::{GuardError, Role, Shell, MAX_SECONDS};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
-pub const USAGE: &str = "usage: process-tree-guard [--extendable [--max-extension SECONDS] [--extension-log PATH]] --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])\n       process-tree-guard extend SECONDS";
+pub const USAGE: &str = "usage: process-tree-guard [--extendable [--max-extension SECONDS] [--extension-log PATH] [--authenticate {desktop,console}]] \
+    --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])\n       process-tree-guard extend SECONDS";
 
 /// What `process-tree-guard-contain -h` prints.
 pub const CONTAIN_USAGE: &str = "usage: process-tree-guard-contain --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])  (runs only inside an extendable run of process-tree-guard; the timeout is a request to that run)";
@@ -63,6 +65,7 @@ struct Options {
     extendable: bool,
     max_extension: Option<String>,
     extension_log: Option<String>,
+    authenticate: Option<String>,
 }
 
 /// Parse the argument list. Errors become exit 125, never 2. `-h` and `--help`
@@ -71,7 +74,7 @@ struct Options {
 fn parse(args: Vec<String>, extension_options: bool) -> Result<Options, GuardError> {
     let mut options = Options {
         help: false, timeout: None, shell: None, command_b64: None, command: Vec::new(),
-        extendable: false, max_extension: None, extension_log: None,
+        extendable: false, max_extension: None, extension_log: None, authenticate: None,
     };
     let mut i = 0;
     while i < args.len() {
@@ -94,7 +97,7 @@ fn parse(args: Vec<String>, extension_options: bool) -> Result<Options, GuardErr
             None => (arg.clone(), None),
         };
         let known: &[&str] = if extension_options {
-            &["--timeout", "--shell", "--command-b64", "--max-extension", "--extension-log"]
+            &["--timeout", "--shell", "--command-b64", "--max-extension", "--extension-log", "--authenticate"]
         } else {
             &["--timeout", "--shell", "--command-b64"]
         };
@@ -119,6 +122,12 @@ fn parse(args: Vec<String>, extension_options: bool) -> Result<Options, GuardErr
             "--command-b64" => options.command_b64 = Some(value),
             "--max-extension" => options.max_extension = Some(value),
             "--extension-log" => options.extension_log = Some(value),
+            "--authenticate" => {
+                if Method::from_name(&value).is_none() {
+                    return Err(GuardError(format!("argument --authenticate: invalid choice: '{}' (choose from 'desktop', 'console')", value)));
+                }
+                options.authenticate = Some(value)
+            }
             _ => return Err(GuardError(format!("unrecognized arguments: {}", key))),
         }
         i += 1;
@@ -130,8 +139,8 @@ fn parse(args: Vec<String>, extension_options: bool) -> Result<Options, GuardErr
 /// the environment, so nothing a child sets can raise the cap.
 fn extension_settings(options: &Options, timeout: f64) -> Result<Option<Settings>, GuardError> {
     if !options.extendable {
-        if options.max_extension.is_some() || options.extension_log.is_some() {
-            return Err(GuardError("--max-extension and --extension-log need --extendable".into()));
+        if options.max_extension.is_some() || options.extension_log.is_some() || options.authenticate.is_some() {
+            return Err(GuardError("--max-extension, --extension-log and --authenticate need --extendable".into()));
         }
         return Ok(None);
     }
@@ -158,7 +167,16 @@ fn extension_settings(options: &Options, timeout: f64) -> Result<Option<Settings
         Some(path) => Some(PathBuf::from(path)),
         None => None,
     };
-    Ok(Some(Settings { max_seconds, log_path }))
+    // A cap over the default is an exception that needs the password of the account the guard runs as. This
+    // function only says so: the prompt is made later, when the command is known to be runnable,
+    // and never from a launch argument alone. `--authenticate` is read and ignored at or below
+    // the default cap, which never prompts. The command line is filled in by the caller.
+    let exception = (max_seconds > DEFAULT_MAX_EXTENSION).then(|| Exception {
+        method: options.authenticate.as_deref().and_then(Method::from_name).unwrap_or(Method::Desktop),
+        command: String::new(),
+        timeout,
+    });
+    Ok(Some(Settings { max_seconds, log_path, exception }))
 }
 
 /// `[--extendable ...] --timeout SECONDS (--shell SHELL --command-b64 BASE64 | [--] COMMAND [ARGS...])`,
@@ -171,10 +189,27 @@ pub fn run_args(args: Vec<String>, role: Role) -> Result<u32, GuardError> {
         say(if contain { CONTAIN_USAGE } else { USAGE });
         return Ok(0);
     }
+    let launch = plan(options)?;
+    run_job_with(&launch.child, launch.seconds, launch.raw_tail.as_deref(), false, &RunMode { extendable: launch.extendable, require_channel: contain, library: false })
+}
+
+/// What a command line asks to run.
+struct Launch {
+    child: Vec<String>,
+    seconds: f64,
+    raw_tail: Option<String>,
+    extendable: Option<Settings>,
+}
+
+/// Check the options and work out the command: the errors in the order they are reported (the
+/// timeout and the cap, then the command), with no prompt and no system call.
+fn plan(options: Options) -> Result<Launch, GuardError> {
     let timeout = options.timeout.clone().ok_or_else(|| GuardError("the following arguments are required: --timeout".into()))?;
     let seconds = duration(&timeout)?;
-    let extendable = extension_settings(&options, seconds)?;
+    let mut extendable = extension_settings(&options, seconds)?;
     let mut raw_tail: Option<String> = None;
+    // The text the prompt of an exception shows: the command of a shell, else the command line.
+    let shown: String;
     let child: Vec<String> = if let Some(shell) = options.shell {
         let encoded = match (&options.command_b64, options.command.is_empty()) {
             (Some(b64), true) => b64,
@@ -182,6 +217,7 @@ pub fn run_args(args: Vec<String>, role: Role) -> Result<u32, GuardError> {
         };
         let command = decode_command(encoded)?;
         let shell = Shell::from_name(&shell).expect("the shell was checked when the arguments were parsed");
+        shown = command.clone();
         let (child, tail) = shell_command(shell, command);
         raw_tail = tail;
         child
@@ -197,9 +233,13 @@ pub fn run_args(args: Vec<String>, role: Role) -> Result<u32, GuardError> {
         if child.is_empty() {
             return Err(GuardError("a command is required after --".into()));
         }
+        shown = list2cmdline(&child);
         child
     };
-    run_job_with(&child, seconds, raw_tail.as_deref(), false, &RunMode { extendable, require_channel: contain, library: false })
+    if let Some(exception) = extendable.as_mut().and_then(|settings| settings.exception.as_mut()) {
+        exception.command = shown;
+    }
+    Ok(Launch { child, seconds, raw_tail, extendable })
 }
 
 /// `extend SECONDS`: ask the enclosing extendable run to hold the deadline of the
@@ -261,7 +301,7 @@ pub fn auto_with(args: Vec<String>, library: bool) -> Result<u32, GuardError> {
             "--shell" if i + 1 < args.len() => { shell = Some(args[i + 1].clone()); i += 2; }
             "--command-b64" if i + 1 < args.len() => { encoded = Some(decode_command(&args[i + 1])?); i += 2; }
             "--" => { i += 1; break; }
-            "--extendable" | "--max-extension" | "--extension-log" => {
+            "--extendable" | "--max-extension" | "--extension-log" | "--authenticate" => {
                 return Err(GuardError("auto: automatic mode is never extendable".into()));
             }
             _ => break,
@@ -398,6 +438,81 @@ mod tests {
         // The only limit on a request is the cap; a run that is renewed within it is renewed for as long as it is.
         assert!(parse(words("--extendable --max-total 600 --timeout 5 x"), true).is_err());
         assert!(parse(words("--max-total=600 --timeout 5 x"), true).is_err());
+    }
+
+    #[test]
+    fn a_cap_over_the_default_is_an_exception_and_nothing_else_is() {
+        let settings = |line: &str| extension_settings(&parse(words(line), true).ok().unwrap(), 5.0);
+        for line in ["--extendable", "--extendable --max-extension 21600", "--extendable --max-extension 10",
+            "--extendable --max-extension 21600 --authenticate console", "--extendable --max-extension 10 --authenticate desktop"] {
+            let exception = settings(line).ok().flatten().expect("an extendable run").exception;
+            assert!(exception.is_none(), "{} is at or below the default cap and never prompts", line);
+        }
+        let over_settings = settings("--extendable --max-extension 21601").ok().flatten().expect("over the cap");
+        let over = over_settings.exception.as_ref().expect("over the cap");
+        assert_eq!(over.method, Method::Desktop, "the desktop prompt is the default");
+        assert!(over_settings.max_seconds == 21601.0 && over.command.is_empty(), "the exception has no cap of its own: the prompt asks for the one that is enforced");
+        assert_eq!(over.timeout, 5.0, "the exception carries the deadline the run starts with, for the prompt to show");
+        let day_settings = settings("--extendable --max-extension 86400 --authenticate console").ok().flatten().expect("the largest cap");
+        let day = day_settings.exception.as_ref().expect("the largest cap");
+        assert_eq!((day.method, day_settings.max_seconds), (Method::Console, 86400.0));
+        let named = settings("--extendable --max-extension 86400 --authenticate desktop").ok().flatten().and_then(|s| s.exception).expect("desktop");
+        assert_eq!(named.method, Method::Desktop);
+        // Neither the cap nor the method means anything without --extendable.
+        assert!(settings("--max-extension 86400").is_err());
+        assert!(matches!(settings("--authenticate console"), Err(GuardError(m)) if m.contains("need --extendable")));
+    }
+
+    #[test]
+    fn authenticate_takes_desktop_or_console_and_nothing_else() {
+        for bad in ["", "Console", "DESKTOP", "hello", "console ", "windows-hello", "none"] {
+            assert!(parse(vec!["--authenticate".into(), bad.into(), "--timeout".into(), "5".into()], true).is_err(), "{:?}", bad);
+            assert!(parse(vec![format!("--authenticate={}", bad)], true).is_err(), "{:?}", bad);
+        }
+        for good in ["desktop", "console"] {
+            assert_eq!(parse(vec![format!("--authenticate={}", good)], true).ok().unwrap().authenticate.as_deref(), Some(good));
+        }
+        assert!(parse(vec!["--authenticate".into()], true).is_err(), "a value is required");
+        // The contain role takes no extension options, so no prompt either.
+        assert!(matches!(parse(words("--authenticate console --timeout 5 x"), false), Err(GuardError(m)) if m.starts_with("unrecognized")));
+        // After the command it is the command's own argument.
+        assert!(parse(words("--timeout 5 -- x --authenticate bogus"), true).ok().unwrap().authenticate.is_none());
+    }
+
+    #[test]
+    fn automatic_mode_never_takes_authenticate() {
+        for line in ["--authenticate console echo x", "--extendable --authenticate console echo x", "--extendable --max-extension 86400 --authenticate console echo x"] {
+            let error = auto_with(words(line), false).expect_err("automatic mode is never extendable");
+            assert!(error.message().contains("never extendable"), "{}: {}", line, error);
+        }
+    }
+
+    #[test]
+    fn the_prompt_is_given_the_command_that_will_run() {
+        let launch = |line: &str| plan(parse(words(line), true).ok().unwrap()).ok().unwrap();
+        let shown = |launch: Launch| launch.extendable.and_then(|s| s.exception).map(|e| e.command);
+        assert_eq!(shown(launch("--extendable --max-extension 86400 --timeout 5 -- tool.exe a b")), Some("tool.exe a b".to_string()));
+        assert_eq!(shown(launch("--extendable --max-extension 86400 --timeout 5 tool.exe")), Some("tool.exe".to_string()));
+        // The command line as it will be started: the boundaries of the arguments are kept, so `a b` and `a`, `b` do not look the same.
+        let with = |args: &[&str]| {
+            let mut line = words("--extendable --max-extension 86400 --timeout 5 --");
+            line.extend(args.iter().map(|arg| arg.to_string()));
+            shown(plan(parse(line, true).ok().unwrap()).ok().unwrap())
+        };
+        assert_eq!(with(&["tool.exe", "a b"]), Some("tool.exe \"a b\"".to_string()));
+        assert_eq!(with(&["tool.exe", "a", "b"]), Some("tool.exe a b".to_string()));
+        assert_eq!(with(&["tool.exe", "say \"hi\" there"]), Some("tool.exe \"say \\\"hi\\\" there\"".to_string()));
+        assert_eq!(with(&["tool.exe", ""]), Some("tool.exe \"\"".to_string()), "an empty argument is shown");
+        let b64 = base64_encode(b"echo hello");
+        assert_eq!(shown(launch(&format!("--extendable --max-extension 86400 --shell cmd --command-b64 {} --timeout 5", b64))), Some("echo hello".to_string()),
+            "a shell run shows the decoded text, not the encoded argument");
+        assert_eq!(shown(launch("--extendable --timeout 5 -- tool.exe")), None, "a run at the default cap has no exception to show it in");
+        // The largest deadline under the largest cap passes the argument checks: it is the only way to a 24 hour first deadline.
+        assert!(plan(parse(words("--extendable --max-extension 86400 --authenticate console --timeout 86400 -- tool.exe"), true).ok().unwrap()).is_ok());
+        // The cap and the timeout are checked before the command is looked at, and none of it prompts.
+        let error = plan(parse(words("--extendable --max-extension 86400 --timeout 90000"), true).ok().unwrap()).err().expect("a bad timeout");
+        assert!(error.message().contains("timeout"), "{}", error);
+        assert!(plan(parse(words("--extendable --max-extension 86400 --timeout 5"), true).ok().unwrap()).is_err(), "no command");
     }
 
     #[test]

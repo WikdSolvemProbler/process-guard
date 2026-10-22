@@ -18,6 +18,11 @@ jobs:
       PROCESS_TREE_GUARD_TIMING: info
       # The version resources are linked only for the MSVC target, so a run that did not link them fails.
       PROCESS_TREE_GUARD_REQUIRE_RESOURCES: '1'
+      # The checks of the sign-in prompts that need a window station or a pseudo console run here and fail if the runner
+      # cannot make one. They are named one by one: a general variable such as CI is set on machines where a person sits.
+      PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST: '1'
+      PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION: '1'
+      PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE: '1'
     steps:
       - uses: actions/checkout@v5
       - name: Build

@@ -1,6 +1,6 @@
 [package]
 name = "process-tree-guard"
-version = "2.0.0-alpha.3"
+version = "2.0.0-alpha.4"
 edition = "2021"
 rust-version = "1.78"
 description = "Windows process tree deadline: runs one command under a job object and kills the whole tree at a finite timeout."

@@ -4,7 +4,11 @@
 //! The engine: one command in a job object, a deadline, and the cleanup of
 //! every process in the job.
 
-use crate::extend::{next_token, register_start, release, write_standard_error, Extension, Settings, Token, BACKSTOP_MS, CHANNEL_VARIABLE};
+use crate::auth;
+use crate::extend::{
+    enclosed, next_token, not_started_text, open_log, register_start, release, write_standard_error, Extension, Log, Settings, Token, BACKSTOP_MS,
+    CHANNEL_VARIABLE, DEFAULT_MAX_EXTENSION, LOG_FLUSH_MS,
+};
 use crate::sys::*;
 use crate::GuardError;
 use std::ffi::c_void;
@@ -115,7 +119,7 @@ pub fn which(name: &str) -> Option<String> {
 }
 
 /// Quote arguments into one command line exactly as the C runtime parses it back.
-fn list2cmdline(args: &[String]) -> String {
+pub(crate) fn list2cmdline(args: &[String]) -> String {
     let mut result = String::new();
     for arg in args {
         let mut backslashes = String::new();
@@ -152,7 +156,7 @@ fn list2cmdline(args: &[String]) -> String {
 
 /// The parent's process ID straight from this process's own record; falls back
 /// to a full process snapshot only if that query fails.
-fn parent_process_id() -> Result<u32, GuardError> {
+pub(crate) fn parent_process_id() -> Result<u32, GuardError> {
     unsafe {
         let mut info: ProcessBasicInformation = std::mem::zeroed();
         let status = NtQueryInformationProcess(GetCurrentProcess(), 0, &mut info as *mut _ as *mut c_void,
@@ -225,6 +229,16 @@ impl Drop for FlushTrace {
     fn drop(&mut self) {
         flush_trace(None);
     }
+}
+
+/// What a unit test of the engine looks at in a run just before its command starts: the
+/// extension (the cap it was made with) and how many owners are watched. Only under `cfg(test)`.
+#[cfg(test)]
+type BeforeStart = Box<dyn Fn(Option<&Extension>, usize)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_START: std::cell::RefCell<Option<BeforeStart>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How a run differs from a plain deadline.
@@ -365,6 +379,19 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
     let mut full = vec![executable.clone()];
     full.extend_from_slice(&argv[1..]);
     trace("resolved executable");
+    // A guard with an exception that is started inside an extendable run is refused before it asks
+    // that run for anything, so that a run that is refused places no hold on the run around it.
+    if let Some(settings) = mode.extendable.as_ref().filter(|settings| settings.exception.is_some()) {
+        if enclosed() {
+            let opened = open_log(settings)?;
+            let error = match auth::decide(settings, true, &executable, "", &[], &auth::Owners::empty(), &opened) {
+                Err(error) => error,
+                Ok(()) => GuardError("an exception above the cap cannot be granted inside another run".into()),
+            };
+            opened.finish(LOG_FLUSH_MS);
+            return Err(error);
+        }
+    }
     // Started inside an extendable run, the guard asks it for this deadline first; a
     // refusal (over the cap, a rate limit, no verified place in the job) ends it here.
     let token = if mode.library { next_token() } else { 0 };
@@ -373,15 +400,73 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
     // process that goes on, so the hold is ended when the call returns, whatever the outcome.
     let _end = EndHold((held && mode.library).then_some(token));
 
-    let mut handles: Vec<Handle> = Vec::new();
+    // Every cap over the default is an exception that was built with the means to ask for it. A
+    // caller that builds settings with a large cap and no exception gets no run, not a run with
+    // a cap that nobody approved.
+    if let Some(settings) = mode.extendable.as_ref() {
+        if settings.max_seconds > DEFAULT_MAX_EXTENSION && settings.exception.is_none() {
+            return Err(GuardError("a cap over the default needs the password of the account the guard runs as; the run did not start".into()));
+        }
+    }
+    // A cap over the default needs the password of the account the guard runs as. It is asked for now, once the
+    // command is known to be runnable and before the job exists or the command starts, and the
+    // log it is recorded in is passed on to the extension. A run inside another run is refused.
+    // The process that started the guard is opened first and watched while a prompt is open, so
+    // that a prompt is never answered for a run that nobody started.
+    // The handle of that process that the prompt watched is kept, and is the one the run is
+    // watched against: a process that took its identifier in between is never taken for it.
+    let mut log: Option<Log> = None;
+    let mut kept: Vec<Handle> = Vec::new();
+    if let Some(settings) = mode.extendable.as_ref().filter(|settings| settings.exception.is_some()) {
+        let opened = open_log(settings)?;
+        // A run inside another run is refused before anything else is looked at, so it needs no owner.
+        let owners = if held {
+            auth::Owners::empty()
+        } else {
+            match parent_process_id().and_then(|id| auth::Owners::open(&[id])) {
+                Ok(owners) => owners,
+                Err(error) => {
+                    let error = auth::refuse_unwatched(settings, &opened, error.message());
+                    opened.finish(LOG_FLUSH_MS);
+                    return Err(error);
+                }
+            }
+        };
+        let parent = owners.image();
+        // Every live process above the guard, for the refusal of a run that another guard started.
+        let ancestors = if held { Vec::new() } else { ancestor_images() };
+        match auth::decide(settings, held, &executable, &parent, &ancestors, &owners, &opened) {
+            Ok(()) => {
+                log = Some(opened);
+                kept = owners.into_handles();
+            }
+            Err(error) => {
+                opened.finish(LOG_FLUSH_MS);
+                return Err(error);
+            }
+        }
+    }
+
+    // The kept handles are closed with the others, at the end of the run.
+    let mut handles: Vec<Handle> = kept.clone();
     let mut info = ProcessInformation { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), process_id: 0, thread_id: 0 };
     let mut assigned = false;
+    // Set once the command is running, so that a run whose exception was approved and which then fails to start says so in the log.
+    let mut started_command = false;
     let mut extension: Option<Extension> = None;
     // The notice for the end of the run, written once the tree is gone.
     let mut notice: Option<String> = None;
     let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
     if job.is_null() {
-        return Err(os_error());
+        let error = os_error();
+        if let Some(log) = log.take() {
+            log.note(&not_started_text(&error));
+            log.finish(LOG_FLUSH_MS);
+        }
+        for handle in handles.drain(..) {
+            unsafe { CloseHandle(handle) };
+        }
+        return Err(error);
     }
     handles.push(job);
 
@@ -392,7 +477,7 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
             checked(SetInformationJobObject(job, EXTENDED_LIMIT_CLASS, &mut limits as *mut _ as *mut c_void,
                 std::mem::size_of::<ExtendedLimitInformation>() as u32))?;
             if let Some(settings) = &mode.extendable {
-                extension = Some(Extension::start(job, settings, seconds)?);
+                extension = Some(Extension::start(job, settings, seconds, log.take())?);
             }
 
             let mut startup: StartupInfoW = std::mem::zeroed();
@@ -415,13 +500,16 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
             }
             // Owners: the parent, or in automatic mode every live ancestor, so a
             // host that kills only the outer launcher of a shell still ends the tree.
+            // A run with an exception already holds its parent (nearest first), opened for the prompt.
             let owner_ids = if watch_ancestors {
-                ancestor_ids()
-            } else {
+                ancestor_ids(false)
+            } else if kept.is_empty() {
                 vec![parent_process_id()?]
+            } else {
+                Vec::new()
             };
-            let mut owners: Vec<Handle> = Vec::new();
-            for id in owner_ids.iter().take(60) {
+            let mut owners: Vec<Handle> = kept.clone();
+            for id in owner_ids.iter().skip(kept.len()).take(60) {
                 let owner = OpenProcess(SYNCHRONIZE, 0, *id);
                 if !owner.is_null() {
                     handles.push(owner);
@@ -431,6 +519,13 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
                 }
             }
             trace("job ready, owners opened");
+            // For the unit tests of the engine only: a look at the run just before its command starts.
+            #[cfg(test)]
+            BEFORE_START.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook(extension.as_ref(), owners.len());
+                }
+            });
 
             // The child cannot run or spawn until it belongs to the job.
             let application = wide(&executable);
@@ -462,6 +557,7 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
             if ResumeThread(info.thread) == u32::MAX {
                 return Err(os_error());
             }
+            started_command = true;
             trace("child started");
             let mut waits = vec![info.process];
             waits.extend_from_slice(&owners);
@@ -492,6 +588,19 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
     })();
     trace("child finished");
 
+    // A log that was opened for an exception and never passed on (the job could not be set up): it says that the approved run
+    // did not start, as the log of the extension does when the failure comes after it was made.
+    if let Some(log) = log.take() {
+        if let Err(error) = &outcome {
+            log.note(&not_started_text(error));
+        }
+        log.finish(LOG_FLUSH_MS);
+    }
+    if let (Err(error), false, Some(extension)) = (&outcome, started_command, extension.as_ref()) {
+        if mode.extendable.as_ref().map_or(false, |settings| settings.exception.is_some()) {
+            extension.note(&not_started_text(error));
+        }
+    }
     // No more grants once the command has finished or the deadline has passed.
     if let Some(extension) = extension.as_ref() {
         extension.close();
@@ -523,23 +632,61 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
     outcome
 }
 
+/// The time the process behind `handle` was created, as the system counts it; the handle needs
+/// the right to query limited information.
+pub(crate) fn started_at(handle: Handle) -> Option<u64> {
+    let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
+    let ok = unsafe { GetProcessTimes(handle, &mut c, &mut e, &mut k, &mut u) };
+    if ok == 0 { None } else { Some(c) }
+}
+
 fn creation_time(id: u32) -> Option<u64> {
     unsafe {
-        let handle = OpenProcess(0x1000, 0, id);
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id);
         if handle.is_null() {
             return None;
         }
-        let (mut c, mut e, mut k, mut u) = (0u64, 0u64, 0u64, 0u64);
-        let ok = GetProcessTimes(handle, &mut c, &mut e, &mut k, &mut u);
+        let started = started_at(handle);
         CloseHandle(handle);
-        if ok == 0 { None } else { Some(c) }
+        started
     }
+}
+
+/// The programs of the desktop shell and of the system that end the walk up the parents (for the
+/// refusal of a run that another guard started, only when they are the files at their system paths).
+const WALK_ENDS_AT: [&str; 6] = ["explorer.exe", "services.exe", "wininit.exe", "winlogon.exe", "svchost.exe", "smss.exe"];
+
+/// The Windows folder as the system gives it, without a final separator; empty when it cannot be read.
+fn windows_folder() -> String {
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..length]).trim_end_matches('\\').to_string()
+}
+
+/// Whether the walk up the parents ends at a parent with this file name and image path: only one
+/// of the six programs of the system, at its system path (explorer.exe in the Windows folder, the
+/// other five in System32). A program of that name in any other folder, one under the Windows
+/// folder included, is a copy that a process of the user may be able to make, and is walked past
+/// like any other process; so is one whose path cannot be read, which fails toward a refusal.
+fn ends_the_walk(name: &str, image: &str, windows: &str) -> bool {
+    if windows.is_empty() || image.is_empty() || !WALK_ENDS_AT.contains(&name) {
+        return false;
+    }
+    let folder = if name == "explorer.exe" { windows.to_string() } else { format!("{}\\System32", windows) };
+    image.eq_ignore_ascii_case(&format!("{}\\{}", folder, name))
 }
 
 /// Live ancestors of this process, nearest first: each one must have started
 /// before its child (so a reused process ID is never mistaken for an ancestor),
-/// and the walk stops at the desktop shell or system processes.
-fn ancestor_ids() -> Vec<u32> {
+/// and the walk stops at the desktop shell or system processes. With `strict`, as the refusal of
+/// a run that another guard started needs, a program of those names ends the walk only when it
+/// is the file at its system path; without it, as the owner list of automatic mode has always
+/// had it, the name alone ends the walk.
+fn ancestor_ids(strict: bool) -> Vec<u32> {
+    let windows = if strict { windows_folder() } else { String::new() };
     let mut map = std::collections::HashMap::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(SNAPPROCESS, 0);
@@ -563,7 +710,7 @@ fn ancestor_ids() -> Vec<u32> {
         let parent = match map.get(&child) { Some((p, _)) => *p, None => break };
         let name = match map.get(&parent) { Some((_, n)) => n.clone(), None => break };
         if parent == 0 || parent == 4 || out.contains(&parent)
-            || ["explorer.exe", "services.exe", "wininit.exe", "winlogon.exe", "svchost.exe", "smss.exe"].contains(&name.as_str()) {
+            || (WALK_ENDS_AT.contains(&name.as_str()) && (!strict || ends_the_walk(&name, &image_path_of_id(parent), &windows))) {
             break;
         }
         let started = match creation_time(parent) { Some(t) => t, None => break };
@@ -582,28 +729,109 @@ fn ancestor_ids() -> Vec<u32> {
     out
 }
 
-/// Image file name of the process that launched the guard, lower case.
-pub fn parent_image() -> String {
+/// The path of the file of the process behind `handle` as the system gives it, letter case
+/// included; empty when it cannot be read. The handle needs the right to query limited information.
+pub(crate) fn image_path_of_handle(handle: Handle) -> String {
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) } == 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..size as usize])
+}
+
+fn image_path_of_id(id: u32) -> String {
     unsafe {
-        let id = match parent_process_id() { Ok(id) => id, Err(_) => return String::new() };
-        let handle = OpenProcess(0x1000, 0, id); // PROCESS_QUERY_LIMITED_INFORMATION
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id);
         if handle.is_null() {
             return String::new();
         }
-        let mut buffer = [0u16; 1024];
-        let mut size = buffer.len() as u32;
-        let ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+        let path = image_path_of_handle(handle);
         CloseHandle(handle);
-        if ok == 0 {
-            return String::new();
-        }
-        String::from_utf16_lossy(&buffer[..size as usize]).to_ascii_lowercase()
+        path
     }
+}
+
+/// The path of the file of the process that launched the guard, as the system gives it;
+/// empty when it cannot be read.
+pub(crate) fn parent_image_path() -> String {
+    parent_process_id().map_or_else(|_| String::new(), image_path_of_id)
+}
+
+/// Image file name of the process that launched the guard, lower case.
+pub fn parent_image() -> String {
+    parent_image_path().to_ascii_lowercase()
+}
+
+/// The images of every live ancestor of this process, nearest first (see `ancestor_ids`); an
+/// image that cannot be read is empty.
+fn ancestor_images() -> Vec<String> {
+    ancestor_ids(true).into_iter().map(image_path_of_id).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_image_of_a_process_keeps_its_letter_case_for_the_prompt_and_is_lower_case_for_the_rest() {
+        use std::os::windows::io::AsRawHandle;
+        // A process that is started here has a system folder path, which the system writes with capitals.
+        let mut child = std::process::Command::new("cmd").args(["/d", "/c", "ping -n 6 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).spawn().expect("start a process");
+        let path = image_path_of_handle(child.as_raw_handle() as Handle);
+        let by_identifier = image_path_of_id(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(path.to_ascii_lowercase().ends_with("\\cmd.exe"), "{}", path);
+        assert_ne!(path, path.to_ascii_lowercase(), "the path is as the system gives it: {}", path);
+        assert_eq!(path, by_identifier);
+        // The parent of this process: the path keeps its case; the old name is the same path in lower case.
+        let parent = parent_image_path();
+        assert!(!parent.is_empty() && parent_image() == parent.to_ascii_lowercase(), "{} {}", parent, parent_image());
+        // An unreadable process has no image.
+        assert_eq!(image_path_of_id(0xffff_fff0), "");
+    }
+
+    #[test]
+    fn the_walk_ends_at_the_programs_at_their_system_paths_and_goes_past_a_copy_under_the_same_name() {
+        let windows = windows_folder();
+        assert!(windows.len() > 3 && !windows.ends_with('\\'), "{}", windows);
+        // The files of the system end it at their system paths, whatever the letter case.
+        assert!(ends_the_walk("explorer.exe", &format!("{}\\explorer.exe", windows), &windows));
+        assert!(ends_the_walk("svchost.exe", &format!("{}\\System32\\svchost.exe", windows.to_ascii_uppercase()), &windows));
+        for name in ["services.exe", "wininit.exe", "winlogon.exe", "svchost.exe", "smss.exe"] {
+            assert!(ends_the_walk(name, &format!("{}\\System32\\{}", windows, name), &windows), "{}", name);
+        }
+        // Another folder, a folder whose name only begins like the Windows folder, a folder under the Windows folder that is not the
+        // system path (some of them can be written to by a standard user), the system path of another program, a name that is not one
+        // of the six, and a path that cannot be read do not end it.
+        assert!(!ends_the_walk("explorer.exe", "C:\\Tools\\explorer.exe", &windows));
+        assert!(!ends_the_walk("explorer.exe", &format!("{}2\\explorer.exe", windows), &windows));
+        assert!(!ends_the_walk("explorer.exe", &format!("{}\\Temp\\explorer.exe", windows), &windows));
+        assert!(!ends_the_walk("svchost.exe", &format!("{}\\Tasks\\svchost.exe", windows), &windows));
+        assert!(!ends_the_walk("smss.exe", &format!("{}\\System32\\spool\\drivers\\color\\smss.exe", windows), &windows));
+        assert!(!ends_the_walk("services.exe", &format!("{}\\explorer.exe", windows), &windows));
+        assert!(!ends_the_walk("explorer.exe", &format!("{}\\System32\\explorer.exe", windows), &windows));
+        assert!(!ends_the_walk("svchost.exe", &format!("{}\\svchost.exe", windows), &windows));
+        assert!(!ends_the_walk("cmd.exe", &format!("{}\\System32\\cmd.exe", windows), &windows));
+        assert!(!ends_the_walk("explorer.exe", "", &windows));
+        assert!(!ends_the_walk("explorer.exe", &format!("{}\\explorer.exe", windows), ""));
+        // A copy of an ordinary program under the name of the shell, as any process of the user can make, is walked past.
+        let folder = std::env::temp_dir().join(format!("ptg-walk-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("make a folder");
+        let copy = folder.join("explorer.exe");
+        let system = format!("{}\\System32\\cmd.exe", windows);
+        std::fs::copy(&system, &copy).expect("copy a program");
+        let mut child = std::process::Command::new(&copy).args(["/d", "/c", "ping -n 6 127.0.0.1 >nul"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).spawn().expect("start the copy");
+        let image = image_path_of_id(child.id());
+        let ends = ends_the_walk("explorer.exe", &image, &windows);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&folder);
+        assert!(image.to_ascii_lowercase().ends_with("\\explorer.exe") && !ends, "{} {}", image, ends);
+    }
 
     #[test]
     fn the_deadline_is_calculated_again_at_least_every_backstop_interval() {
@@ -650,7 +878,7 @@ mod tests {
             // The command holds the run for 30 seconds and ends on its own after two, a second after the run's own deadline of one.
             let mut child = std::process::Command::new("ping.exe").args(["-n", "3", "127.0.0.1"]).stdin(quiet()).stdout(quiet()).stderr(quiet()).spawn().expect("start ping.exe");
             assert_ne!(AssignProcessToJobObject(job, child.as_raw_handle() as Handle), 0, "put the command in the job");
-            let extension = Extension::start(job, &Settings { max_seconds: 60.0, log_path: None }, 1.0).expect("start the extension");
+            let extension = Extension::start(job, &Settings { max_seconds: 60.0, log_path: None, exception: None }, 1.0, None).expect("start the extension");
             extension.hold_for_test(child.id(), 30.0);
             child.wait().expect("the command ends");
             // The hold ended with the command, so the deadline is back at the one that passed long ago, and the exit is still reported.
@@ -695,13 +923,96 @@ mod tests {
     }
 
     #[test]
+    fn a_cap_over_the_default_that_nobody_approved_is_not_a_run() {
+        // Settings built by a caller that did not build the exception: the cap is over the default and nothing asks for it.
+        // The refusal comes before the job is made, so the command (which would end at once) is never started.
+        let argv: Vec<String> = ["cmd.exe", "/c", "exit"].iter().map(|part| part.to_string()).collect();
+        for max_seconds in [DEFAULT_MAX_EXTENSION + 1.0, 86_400.0] {
+            let mode = RunMode { extendable: Some(Settings { max_seconds, log_path: None, exception: None }), ..RunMode::default() };
+            let error = run_job_with(&argv, 5.0, None, false, &mode).expect_err("a cap that nobody approved");
+            assert!(error.message().contains("needs the password of the account the guard runs as") && error.message().contains("did not start"), "{}", error);
+        }
+    }
+
+    /// The settings of a run over the default cap with the audit file `log`.
+    fn exception_settings(log: &std::path::Path) -> Settings {
+        Settings {
+            max_seconds: 86_400.0,
+            log_path: Some(log.to_path_buf()),
+            exception: Some(auth::Exception { method: auth::Method::Console, command: "cmd.exe".into(), timeout: 20.0 }),
+        }
+    }
+
+    #[test]
+    fn an_approved_exception_runs_its_command_with_the_cap_and_the_owner_that_were_opened_and_a_refused_one_never_starts_it() {
+        let folder = std::env::temp_dir().join(format!("process-tree-guard-engine-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("make a folder for the files of the test");
+        let argv: Vec<String> = ["cmd.exe", "/d", "/s", "/c"].iter().map(|part| part.to_string()).collect();
+        let command = |marker: &std::path::Path| format!("echo ran> \"{}\" & exit 3", marker.display());
+        let lines = |log: &std::path::Path| std::fs::read_to_string(log).unwrap_or_default().lines().map(String::from).collect::<Vec<String>>();
+        // Approved: the command runs and its exit code passes through; the run has the cap that was approved, one owner (the
+        // process that started the guard, opened for the prompt and kept for the run), and one approval line.
+        let (marker, log) = (folder.join("approved.txt"), folder.join("approved.log"));
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorder = seen.clone();
+        BEFORE_START.with(|hook| *hook.borrow_mut() = Some(Box::new(move |extension, owners| {
+            let extension = extension.expect("an extendable run has its extension");
+            // A hold of the whole cap is granted only by a run that was made with that cap.
+            extension.hold_for_test(std::process::id(), 86_400.0);
+            recorder.borrow_mut().push(owners);
+        })));
+        auth::seam::ANSWER.with(|answer| answer.set(Some(true)));
+        let mode = RunMode { extendable: Some(exception_settings(&log)), ..RunMode::default() };
+        let code = run_job_with(&argv, 20.0, Some(&command(&marker)), false, &mode).expect("an approved exception runs its command");
+        assert_eq!(code, 3, "the exit code of the command passes through");
+        assert!(marker.exists(), "the command ran");
+        assert_eq!(*seen.borrow(), [1], "the run was made with the cap, and watches the one owner that the prompt opened");
+        let approved = lines(&log);
+        assert_eq!(approved.iter().filter(|line| line.contains("decision=exception-approved")).count(), 1, "{:?}", approved);
+        assert!(approved.iter().all(|line| !line.contains("decision=exception-refused")) && approved[0].contains("requested=86400")
+            && approved[0].contains("attempt=1 "), "{:?}", approved);
+        // Refused: the prompt is cancelled, the run does not start, and the extension is never made.
+        let (marker, log) = (folder.join("refused.txt"), folder.join("refused.log"));
+        seen.borrow_mut().clear();
+        auth::seam::ANSWER.with(|answer| answer.set(Some(false)));
+        let mode = RunMode { extendable: Some(exception_settings(&log)), ..RunMode::default() };
+        let error = run_job_with(&argv, 20.0, Some(&command(&marker)), false, &mode).expect_err("a cancelled prompt refuses the run");
+        assert!(error.message().contains("exception refused") && error.message().contains("the run did not start"), "{}", error);
+        assert!(!marker.exists() && seen.borrow().is_empty(), "the command never started");
+        let refused = lines(&log);
+        assert!(refused.len() == 1 && refused[0].contains("decision=exception-refused") && refused[0].contains("the prompt was cancelled"), "{:?}", refused);
+        // Approved, and then the command cannot be started (a real program, a copy of cmd.exe, that this test holds open without
+        // sharing, so the system cannot open it to start it): the record does not leave a cap approved for a command that never
+        // ran, and says that it did not start. A file whose bytes are not a program is never used: Windows would try it as a
+        // 16-bit program and show a dialog. Should the hold not take, the copy runs `exit 0` and the test fails without a dialog.
+        let (held_program, log) = (folder.join("held-program.exe"), folder.join("not-started.log"));
+        std::fs::copy(format!("{}\\System32\\cmd.exe", windows_folder()), &held_program).expect("copy a real program");
+        let _held = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&held_program).expect("hold the program without sharing")
+        };
+        auth::seam::ANSWER.with(|answer| answer.set(Some(true)));
+        let mode = RunMode { extendable: Some(exception_settings(&log)), ..RunMode::default() };
+        let argv = [held_program.display().to_string(), "/d".into(), "/c".into(), "exit 0".into()];
+        let error = run_job_with(&argv, 20.0, None, false, &mode).expect_err("a program held without sharing does not start");
+        let not_started = lines(&log);
+        assert_eq!(not_started.iter().filter(|line| line.contains("decision=exception-approved")).count(), 1, "{:?}", not_started);
+        assert!(not_started.iter().any(|line| line.contains("notice=\"the approved run did not start: ") && line.contains(&error.message().replace('\\', "\\\\"))),
+            "the log says that the approved run did not start, and why: {:?} {}", not_started, error);
+        auth::seam::ANSWER.with(|answer| answer.set(None));
+        BEFORE_START.with(|hook| *hook.borrow_mut() = None);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
     fn quoting_matches_the_c_runtime_rules() {
-        let cases: [(&[&str], &str); 5] = [
+        let cases: [(&[&str], &str); 6] = [
             (&["a", "b c"], "a \"b c\""),
             (&["a\\\"b"], "a\\\\\\\"b"),
             (&["", "x"], "\"\" x"),
             (&["c:\\dir with space\\"], "\"c:\\dir with space\\\\\""),
             (&["plain\\path"], "plain\\path"),
+            (&["a b", "say \"hi\"", "c:\\x y\\"], "\"a b\" \"say \\\"hi\\\"\" \"c:\\x y\\\\\""),
         ];
         for (args, expected) in cases {
             let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();

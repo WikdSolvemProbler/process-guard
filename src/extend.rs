@@ -36,6 +36,7 @@
 //! call made inside a run is a nested guard in a process that goes on, so when it
 //! returns it makes a `release`, which ends the hold its start made.
 
+use crate::auth::Exception;
 use crate::engine::{format_seconds, job_process_ids};
 use crate::sys::*;
 use crate::GuardError;
@@ -86,7 +87,7 @@ const INSTANCES: u32 = 4;
 const READ_MS: u32 = 250;
 const TAKE_MS: u32 = 500;
 /// How long a grant waits for its line to be written to standard error when that is the only record.
-const RECORD_MS: u64 = 500;
+pub(crate) const RECORD_MS: u64 = 500;
 /// The same for a client that is refused whatever it sends (the rate limit, a run that has
 /// ended): the request is read only to put its numbers in the log.
 const REFUSED_READ_MS: u32 = 25;
@@ -108,7 +109,7 @@ const HELD_LINES: usize = LOG_QUEUE;
 /// Lines each copy of the log can have waiting; the next ones are dropped, and counted.
 const LOG_QUEUE: usize = 256;
 /// How long the end of a run waits for a copy of the log to take its last lines.
-const LOG_FLUSH_MS: u64 = 500;
+pub(crate) const LOG_FLUSH_MS: u64 = 500;
 /// How long a client waits for the channel.
 const CONNECT_MS: u64 = 5000;
 /// How long a client waits for the reply once its request is sent.
@@ -181,7 +182,7 @@ pub(crate) fn iso8601(unix_ms: u64) -> String {
 /// The characters of the Unicode category Cf (format): the ones that change how the text
 /// around them is shown without being shown themselves, such as the bidirectional
 /// controls, the zero width characters and the byte order mark.
-fn is_format(c: char) -> bool {
+pub(crate) fn is_format(c: char) -> bool {
     matches!(c as u32,
         0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0x180E
         | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
@@ -405,6 +406,63 @@ fn unrecorded_line(unix_ms: u64, back: &Withdraw, wait_ms: u64) -> String {
 /// A notice about the log itself.
 fn notice_line(unix_ms: u64, text: &str) -> String {
     format!("PROCESS_TREE_GUARD_EXTENSION: time={} notice=\"{}\"", iso8601(unix_ms), escape(text))
+}
+
+/// The hours of a number of seconds as a figure, rounded up to two decimals, with the zeros at
+/// the end left off (`24`, `6.5`, `6.95`), so that a cap such as 25000 seconds is not shown as
+/// `6.944444444444445`. Rounded up from the whole seconds, so that the figure is never smaller
+/// than the cap: a cap just over six hours is never shown as the default cap that needs no password.
+pub(crate) fn hours_figure(seconds: f64) -> String {
+    let hundredths = (seconds / 36.0).ceil() as u64;
+    let fraction = format!("{:02}", hundredths % 100);
+    match fraction.trim_end_matches('0') {
+        "" => format!("{}", hundredths / 100),
+        digits => format!("{}.{}", hundredths / 100, digits),
+    }
+}
+
+/// What the line for a decision on an exception above the cap is about. `account` is the account
+/// the guard runs as and `command` the command line the decision is about (as the prompt shows it),
+/// so that the record says what was approved and for whom; `method` is how the user was asked
+/// (`desktop` or `console`), `timeout` the deadline the run starts with, in seconds, and
+/// `started_by` the nearest process that started the guard, as the prompt shows it (empty when it
+/// is not known). `requested` is the cap asked for, in seconds. `attempt` is the number of the
+/// attempt (the attempts made before it when the run was refused before one was shown: 0 for a
+/// prompt that was never shown).
+pub(crate) struct ExceptionRecord<'a> {
+    pub unix_ms: u64,
+    pub pid: u32,
+    pub image: &'a str,
+    pub account: &'a str,
+    pub command: &'a str,
+    pub method: &'a str,
+    pub timeout: f64,
+    pub started_by: &'a str,
+    pub requested: f64,
+    pub approved: bool,
+    pub attempt: u32,
+    pub reason: &'a str,
+}
+
+/// The line for the decision on an exception above the cap, taken at the start of the run:
+/// `exception-approved` once the user has given the password, `exception-refused` for an
+/// attempt that failed or a run that cannot be asked. `hours` is the cap in hours (rounded up).
+/// Nothing the user typed is in it: not the password, and not a name.
+pub(crate) fn exception_line(record: &ExceptionRecord) -> String {
+    format!("PROCESS_TREE_GUARD_EXTENSION: time={} pid={} image=\"{}\" account=\"{}\" command=\"{}\" method=\"{}\" timeout={} started_by=\"{}\" requested={} hours={} granted=0 decision={} attempt={} reason=\"{}\"",
+        iso8601(record.unix_ms), record.pid, escape(record.image), escape(record.account), escape(record.command), escape(record.method), log_seconds(record.timeout),
+        escape(record.started_by), log_seconds(record.requested), hours_figure(record.requested),
+        if record.approved { "exception-approved" } else { "exception-refused" }, record.attempt, escape(record.reason))
+}
+
+/// The text of the notice for a run whose exception was approved and which then could not start.
+pub(crate) fn not_started_text(error: &GuardError) -> String {
+    format!("the approved run did not start: {}", error.message())
+}
+
+/// The time now, as the lines of the log write it.
+pub(crate) fn now_ms() -> u64 {
+    unix_ms_now()
 }
 
 /// The notice that lines were left out of a copy of the log because it could not keep up.
@@ -865,6 +923,23 @@ impl Log {
         Ok(Log { sinks, blocked, only })
     }
 
+    /// A log that keeps its lines in `lines`, for the tests of other modules. With `fail`, it
+    /// behaves as a log whose only record is a standard error: a line is a record only when `fail`
+    /// is clear as it is written; without it, the log has a file's rule and nothing is waited for.
+    #[cfg(test)]
+    pub(crate) fn capture(lines: Arc<Mutex<Vec<String>>>, fail: Option<Arc<AtomicBool>>) -> Log {
+        let last_written = Arc::new(AtomicBool::new(true));
+        let seen = last_written.clone();
+        let failing = fail.clone();
+        let write = move |line: &str| {
+            relock(&lines).push(line.to_string());
+            seen.store(!failing.as_ref().map_or(false, |fail| fail.load(Ordering::SeqCst)), Ordering::SeqCst);
+        };
+        let sink = Arc::new(Sink::start("test-log", Box::new(write), 16).expect("start the sink"));
+        let only = fail.map(|_| StandardErrorOnly { sink: sink.clone(), last_written });
+        Log { sinks: vec![sink], blocked: Arc::new(AtomicBool::new(false)), only }
+    }
+
     /// True while the audit record cannot be relied on to take lines: nothing is granted then.
     /// That is the audit file when there is one, and otherwise standard error, once a line
     /// written to it has failed (a write that works lifts it).
@@ -888,10 +963,38 @@ impl Log {
         }
     }
 
+    /// Queue the line of the approval of an exception above the cap and say whether it stands.
+    /// Unlike the line of a grant, which with an audit file is not waited for, the line of an
+    /// approval is waited for, for at most `wait_ms`, in the record: the audit file when there is
+    /// one (which must not be blocked once the line is placed: a file that cannot take it holds
+    /// it, and `blocked` says so), and otherwise standard error. An approval whose line was not
+    /// written is not an approval (Common Weakness Enumeration, CWE-778).
+    pub(crate) fn record_decision(&self, line: &str, wait_ms: u64) -> bool {
+        let Some(only) = &self.only else {
+            // Standard error is a copy of the audit file: the line is queued for both, the file's copy is waited for, and the
+            // file must not be unable to take it, which `blocked` says once its write has failed.
+            let numbers: Vec<Option<usize>> = self.sinks.iter().map(|sink| sink.enqueue(line)).collect();
+            return match (self.sinks.last(), numbers.last()) {
+                (Some(file), Some(Some(number))) => file.wait_written(*number, wait_ms) && !self.blocked.load(Ordering::SeqCst),
+                (None, _) => !self.blocked.load(Ordering::SeqCst),
+                _ => false,
+            };
+        };
+        match only.sink.enqueue(line) {
+            Some(number) => only.sink.wait_written(number, wait_ms) && only.last_written.load(Ordering::SeqCst),
+            None => false,
+        }
+    }
+
     pub(crate) fn push(&self, line: &str) {
         for sink in &self.sinks {
             sink.push(line);
         }
+    }
+
+    /// A line of the log that is a notice, with the time now.
+    pub(crate) fn note(&self, text: &str) {
+        self.push(&notice_line(unix_ms_now(), text));
     }
 
     /// Stop taking lines and give each copy a moment to write the ones it has. The file
@@ -1398,10 +1501,12 @@ impl Shared {
     }
 }
 
-/// What the run asks of its channel: the cap and the audit file.
+/// What the run asks of its channel: the cap and the audit file. `exception` is set when the
+/// cap is over the default, and the run then needs the password of the account the guard runs as to start.
 pub struct Settings {
     pub max_seconds: f64,
     pub log_path: Option<PathBuf>,
+    pub exception: Option<Exception>,
 }
 
 /// A running channel: the instances of the pipe, the threads that serve them and watch the job, and the deadline.
@@ -1427,18 +1532,31 @@ fn random_hex() -> Result<String, GuardError> {
 }
 
 /// The text form of the security identifier of the user this process runs as.
-fn current_user_sid() -> Result<String, GuardError> {
+pub(crate) fn current_user_sid() -> Result<String, GuardError> {
     unsafe {
         let mut token: Handle = std::ptr::null_mut();
         checked(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token))?;
+        let sid = token_user_sid(token);
+        CloseHandle(token);
+        sid
+    }
+}
+
+/// The text form of the security identifier of the user of `token`, which stays open.
+pub(crate) fn token_user_sid(token: Handle) -> Result<String, GuardError> {
+    unsafe {
         let mut needed = 0u32;
         GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut needed);
         let mut buffer = vec![0u64; (needed as usize + 7) / 8 + 1];
-        let got = GetTokenInformation(token, TOKEN_USER_CLASS, buffer.as_mut_ptr() as *mut c_void, (buffer.len() * 8) as u32, &mut needed);
-        CloseHandle(token);
-        checked(got)?;
+        checked(GetTokenInformation(token, TOKEN_USER_CLASS, buffer.as_mut_ptr() as *mut c_void, (buffer.len() * 8) as u32, &mut needed))?;
         // TOKEN_USER starts with a pointer to the security identifier.
-        let sid = *(buffer.as_ptr() as *const *mut c_void);
+        sid_text(*(buffer.as_ptr() as *const *mut c_void))
+    }
+}
+
+/// The text form of the security identifier `sid`.
+pub(crate) fn sid_text(sid: *mut c_void) -> Result<String, GuardError> {
+    unsafe {
         let mut text: *mut u16 = std::ptr::null_mut();
         checked(ConvertSidToStringSidW(sid, &mut text))?;
         let mut length = 0;
@@ -1518,17 +1636,43 @@ fn create_pipes(name: &str) -> Result<Vec<Handle>, GuardError> {
     }
 }
 
+/// Open the log of an extendable run: the audit file, when there is one, must be a file on a
+/// disk, and without one standard error must be able to hold a record. The run does not start
+/// when it cannot be opened. It is opened before the command is known to be wanted, so that
+/// the decision on an exception above the cap has a place to be recorded.
+pub(crate) fn open_log(settings: &Settings) -> Result<Log, GuardError> {
+    check_log_path(settings.log_path.as_deref())?;
+    if settings.log_path.is_none() && !standard_error_records() {
+        return Err(GuardError("an extendable run needs a record of its grants: standard error is closed or is the null device, \
+            and --extension-log was not given; the run did not start".into()));
+    }
+    Log::start(settings.log_path.clone(), LOG_LIMIT)
+}
+
 impl Extension {
     /// Open the channel of a run whose own deadline is `timeout_seconds` from now.
-    /// `job` is the run's job object, which stays open for as long as the extension.
-    pub fn start(job: Handle, settings: &Settings, timeout_seconds: f64) -> Result<Extension, GuardError> {
-        check_log_path(settings.log_path.as_deref())?;
-        if settings.log_path.is_none() && !standard_error_records() {
-            return Err(GuardError("an extendable run needs a record of its grants: standard error is closed or is the null device, \
-                and --extension-log was not given; the run did not start".into()));
-        }
-        let log = Log::start(settings.log_path.clone(), LOG_LIMIT)?;
-        let channel = format!("{}{}", PIPE_PREFIX, random_hex()?);
+    /// `job` is the run's job object, which stays open for as long as the extension. `log` is
+    /// the log the run has already opened (it records the decision on an exception above the
+    /// cap before the job exists); without one it is opened here. The log is finished on every
+    /// path out of this function: by the extension when it ends, or here when it cannot start.
+    pub fn start(job: Handle, settings: &Settings, timeout_seconds: f64, log: Option<Log>) -> Result<Extension, GuardError> {
+        let log = match log {
+            Some(log) => log,
+            None => open_log(settings)?,
+        };
+        // A run that holds an approved exception says in the log when it then fails to start, so that the record does not
+        // show a cap approved for a command that never ran.
+        let announce = settings.exception.is_some();
+        let channel = match random_hex() {
+            Ok(hex) => format!("{}{}", PIPE_PREFIX, hex),
+            Err(error) => {
+                if announce {
+                    log.note(&not_started_text(&error));
+                }
+                log.finish(LOG_FLUSH_MS);
+                return Err(error);
+            }
+        };
         let started = tick();
         let (wake, stop) = unsafe { (CreateEventW(std::ptr::null_mut(), 0, 0, std::ptr::null()), CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null())) };
         if wake.is_null() || stop.is_null() {
@@ -1540,6 +1684,10 @@ impl Extension {
                     }
                 }
             }
+            if announce {
+                log.note(&not_started_text(&error));
+            }
+            log.finish(LOG_FLUSH_MS);
             return Err(error);
         }
         let shared = Arc::new(Shared {
@@ -1554,27 +1702,46 @@ impl Extension {
         let mut extension = Extension {
             shared: shared.clone(), pipes: Vec::new(), stop, port: std::ptr::null_mut(), wake, servers: Vec::new(), monitor: None, started, channel,
         };
-        extension.pipes = create_pipes(&extension.channel)?;
-        unsafe {
-            extension.port = CreateIoCompletionPort(INVALID_HANDLE, std::ptr::null_mut(), 0, 1);
-            if extension.port.is_null() {
-                return Err(os_error());
+        let for_note = shared.clone();
+        let made = (|| -> Result<(), GuardError> {
+            extension.pipes = create_pipes(&extension.channel)?;
+            unsafe {
+                extension.port = CreateIoCompletionPort(INVALID_HANDLE, std::ptr::null_mut(), 0, 1);
+                if extension.port.is_null() {
+                    return Err(os_error());
+                }
+                let mut association = AssociateCompletionPort { key: 0, port: extension.port };
+                checked(SetInformationJobObject(job, ASSOCIATE_COMPLETION_PORT_CLASS, &mut association as *mut _ as *mut c_void,
+                    std::mem::size_of::<AssociateCompletionPort>() as u32))?;
             }
-            let mut association = AssociateCompletionPort { key: 0, port: extension.port };
-            checked(SetInformationJobObject(job, ASSOCIATE_COMPLETION_PORT_CLASS, &mut association as *mut _ as *mut c_void,
-                std::mem::size_of::<AssociateCompletionPort>() as u32))?;
+            let (port, stop_event) = (extension.port as usize, stop as usize);
+            let spawn = |name: &str, body: Box<dyn FnOnce() + Send>| {
+                std::thread::Builder::new().name(name.into()).spawn(body).map_err(|error| GuardError(format!("cannot start the extension thread: {}", error)))
+            };
+            for pipe in extension.pipes.clone() {
+                let (serving, pipe) = (shared.clone(), pipe as usize);
+                let server = spawn("extension-server", Box::new(move || serve(&serving, pipe as Handle, stop_event as Handle)))?;
+                extension.servers.push(server);
+            }
+            extension.monitor = Some(spawn("extension-monitor", Box::new(move || watch_job(&shared, port as Handle)))?);
+            Ok(())
+        })();
+        match made {
+            Ok(()) => Ok(extension),
+            Err(error) => {
+                // The extension is dropped on return, which ends its threads and finishes the log: the line comes first.
+                if announce {
+                    for_note.log.note(&not_started_text(&error));
+                }
+                Err(error)
+            }
         }
-        let (port, stop_event) = (extension.port as usize, stop as usize);
-        let spawn = |name: &str, body: Box<dyn FnOnce() + Send>| {
-            std::thread::Builder::new().name(name.into()).spawn(body).map_err(|error| GuardError(format!("cannot start the extension thread: {}", error)))
-        };
-        for pipe in extension.pipes.clone() {
-            let (serving, pipe) = (shared.clone(), pipe as usize);
-            let server = spawn("extension-server", Box::new(move || serve(&serving, pipe as Handle, stop_event as Handle)))?;
-            extension.servers.push(server);
-        }
-        extension.monitor = Some(spawn("extension-monitor", Box::new(move || watch_job(&shared, port as Handle)))?);
-        Ok(extension)
+    }
+
+    /// Put a line in the log saying what happened to the run, for the engine: a run with an approved exception whose command could
+    /// not be started says so, before the log is finished.
+    pub fn note(&self, text: &str) {
+        self.shared.log.note(text);
     }
 
     /// The event the supervisor waits on besides the processes: set when a process
@@ -2218,6 +2385,16 @@ pub(crate) fn register_start(seconds: f64, required: bool, token: Token) -> Resu
     }
 }
 
+/// Whether an extendable run encloses this process: the environment names a channel and the
+/// channel is there. Nothing is sent to it, so it places no hold on the run, and a name that is
+/// not a channel, or one that is gone, is no run (as for `register_start`). A channel that is
+/// busy is there.
+pub(crate) fn enclosed() -> bool {
+    let Ok(Some(name)) = channel_from_environment() else { return false };
+    let wide_name = wide(&name);
+    unsafe { WaitNamedPipeW(wide_name.as_ptr(), 1) != 0 || GetLastError() != ERROR_FILE_NOT_FOUND }
+}
+
 /// End the hold `token` of the calling process on the enclosing run: what a library call
 /// does when it returns, since the process that made it goes on and the hold was for the
 /// call. Its other holds, the ones of calls that overlap it among them, stand. It moves
@@ -2302,6 +2479,56 @@ mod tests {
         assert!(odd.contains("requested=unknown granted=0 decision=refused"));
         let bad = log_line(0, &Entry { pid: 1, image: "x", requested: Some(f64::NAN), granted: None, reason: "r" });
         assert!(bad.contains("requested=invalid"));
+    }
+
+    #[test]
+    fn the_line_for_an_exception_has_decisions_of_its_own_and_the_attempt_and_escapes_what_it_is_given() {
+        let record = |account, command, started_by, requested, approved, attempt, reason| ExceptionRecord {
+            unix_ms: 1_700_000_000_000, pid: 42, image: "guard.exe", account, command, method: "console", timeout: 20.0, started_by, requested, approved, attempt, reason,
+        };
+        let approved = exception_line(&record("PC\\me", "C:\\tools\\run.exe --all", "C:\\Apps\\host.exe", 86_400.0, true, 2, "a cap of 24 hours was approved"));
+        assert_eq!(approved, "PROCESS_TREE_GUARD_EXTENSION: time=2023-11-14T22:13:20.000Z pid=42 image=\"guard.exe\" account=\"PC\\\\me\" \
+            command=\"C:\\\\tools\\\\run.exe --all\" method=\"console\" timeout=20 started_by=\"C:\\\\Apps\\\\host.exe\" requested=86400 hours=24 granted=0 \
+            decision=exception-approved attempt=2 reason=\"a cap of 24 hours was approved\"");
+        let refused = exception_line(&record("", "", "", 21_600.5, false, 0, "no \"one\"\r\nis here"));
+        assert!(refused.contains("requested=21600.5 hours=6.01 granted=0 decision=exception-refused attempt=0 reason=\"no \\\"one\\\"\\u{d}\\u{a}is here\""), "{}", refused);
+        assert!(refused.contains("started_by=\"\" requested="), "a starter that is not known is an empty field: {}", refused);
+        assert!(exception_line(&record("a", "c", "s", 25_000.0, false, 1, "r")).contains("requested=25000 hours=6.95 granted=0"), "hours are rounded up to two decimals");
+        let desktop = exception_line(&ExceptionRecord { method: "desktop", timeout: 0.5, ..record("a", "c", "s", 86_400.0, false, 1, "r") });
+        assert!(desktop.contains("method=\"desktop\" timeout=0.5 started_by=\"s\" requested=86400"), "{}", desktop);
+        for (seconds, text) in [(86_400.0, "24"), (3_600.0, "1"), (23_400.0, "6.5"), (25_000.0, "6.95"), (21_601.0, "6.01"), (21_600.0, "6"), (21_600.5, "6.01"),
+            (21_600.000_000_1, "6.01"), (1_800.0, "0.5"), (86_396.4, "24"), (44_100.0, "12.25")] {
+            assert_eq!(hours_figure(seconds), text, "{}", seconds);
+        }
+        // Never smaller than the cap, so a figure can only overstate what a person approves.
+        for seconds in (21_601..86_400).step_by(37) {
+            let shown: f64 = hours_figure(seconds as f64).parse().unwrap_or(0.0);
+            assert!(shown * 3600.0 + 1e-6 >= seconds as f64 && shown > 6.0, "{} {}", seconds, shown);
+        }
+        assert!(!refused.chars().any(|c| c.is_control()), "a line is one line of printable text: {:?}", refused);
+        let odd_image = exception_line(&ExceptionRecord { image: "k\u{2028}it \"x\"=1.exe", ..record("a\u{202e}\"b", "c\r\n\"d\"", "s\u{85}\"t\"", 86_400.0, false, 1, "r") });
+        assert!(odd_image.contains("image=\"k\\u{2028}it \\\"x\\\"=1.exe\""), "{}", odd_image);
+        assert!(odd_image.contains("account=\"a\\u{202e}\\\"b\" command=\"c\\u{d}\\u{a}\\\"d\\\"\" method="), "the account and the command are escaped like the rest: {}", odd_image);
+        assert!(odd_image.contains("started_by=\"s\\u{85}\\\"t\\\"\" requested="), "and so is the starter: {}", odd_image);
+        assert!(!odd_image.chars().any(|c| c.is_control() || is_format(c)), "{:?}", odd_image);
+    }
+
+    #[test]
+    fn the_user_of_a_token_is_read_for_the_check_of_an_exception_and_the_log_is_opened_before_the_job() {
+        use std::os::windows::io::AsRawHandle;
+        let mut token: Handle = std::ptr::null_mut();
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }, 0);
+        let from_token = token_user_sid(token);
+        unsafe { CloseHandle(token) };
+        let ours = current_user_sid().expect("the user of this process");
+        assert_eq!(from_token.as_ref().ok(), Some(&ours));
+        assert!(ours.starts_with("S-1-"), "{}", ours);
+        // A handle that is not a token has no user: the check of an exception cannot be passed with one.
+        let file = std::fs::File::open(std::env::current_exe().expect("this program")).expect("open this program");
+        assert!(token_user_sid(file.as_raw_handle() as Handle).is_err());
+        // The log of a run is opened before the job, and refuses a file that is not on a disk.
+        let device = Settings { max_seconds: 86_400.0, log_path: Some(PathBuf::from("NUL")), exception: None };
+        assert!(matches!(open_log(&device), Err(GuardError(m)) if m.contains("must be a regular file")));
     }
 
     #[test]
@@ -2603,6 +2830,26 @@ mod tests {
         assert!(with_file.record("granted", 0) && !with_file.blocked(), "with an audit file the file's own rule decides, and nothing is waited for");
         with_file.blocked.store(true, Ordering::SeqCst);
         assert!(with_file.blocked());
+    }
+
+    #[test]
+    fn with_an_audit_file_the_line_of_an_approval_is_a_record_only_when_the_file_took_it() {
+        let folder = std::env::temp_dir().join(format!("ptg-record-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).expect("make a folder for the file");
+        // A file that takes lines: the line is waited for and it is in the file.
+        let path = folder.join("audit.log");
+        let good = Log::start(Some(path.clone()), 1 << 20).expect("start a log with a file");
+        assert!(good.record_decision("approved one", 5_000) && !good.blocked(), "a line the file wrote is a record");
+        good.finish(1_000);
+        assert!(std::fs::read_to_string(&path).unwrap_or_default().contains("approved one"));
+        // A file in a folder that is not there cannot take a line: the approval of an exception is not recorded.
+        let bad = Log::start(Some(folder.join("missing").join("audit.log")), 1 << 20).expect("start a log whose file cannot be written");
+        assert!(!bad.record_decision("approved two", 5_000), "a line that the file could not take is not a record");
+        assert!(bad.blocked(), "and nothing is granted while it cannot");
+        // The line of a grant is not waited for with an audit file, as before.
+        assert!(bad.record("granted", 0), "the line of a grant is queued and stands at once");
+        bad.finish(1_000);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[test]

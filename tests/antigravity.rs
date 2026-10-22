@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A41):
+//! Behaviour tests for the Google Antigravity hook vendors (inventory A1 to A42):
 //! `hook antigravity` rewrites a `run_command` call so the automatic wrapper runs
 //! it, and `hook antigravity-context` prints the policy as a SessionStart message.
 //! The last group runs the hook role (`process-tree-guard-gate`) in both install
@@ -1150,6 +1150,63 @@ fn a41_a_denial_exits_2_whether_or_not_its_output_can_be_written() {
         let by_full = run(&full, "run-closed-stdout", &["hook", vendor]);
         let by_gate = run(&gate, "run-closed-stdout", &[vendor]);
         checks.check("A41", &format!("{} with a standard output nobody can write to: exit 0", vendor), by_full == Some(0) && by_gate == Some(0), format!("{:?} / {:?}", by_full, by_gate));
+    }
+    checks.finish();
+}
+
+// ---------------- a command line that asks for a cap over the default is not an envelope either (A42)
+
+#[test]
+fn a42_a_command_line_with_a_cap_over_the_default_or_a_method_is_not_an_envelope() {
+    let mut checks = Checks::new("exception launch");
+    // The envelope is an exact form with no extension options, so a line that asks for an exception above the cap, which would
+    // need the signed-in user's password, is never passed through as an envelope: the hooks that only allow or deny refuse it, and
+    // the rewriting ones wrap it again whole, as the command text of the automatic wrapper. The options are in that text and not in
+    // the wrapper's arguments, so the wrapper does not refuse them; the guard that it starts is a top-level guard that another guard
+    // started, and it is refused before anything is shown. The hook and the wrapper do not ask themselves. The checks that decide only
+    // run nothing; the last one runs the rewritten line with the console method and a standard input that is not a console, so that
+    // nothing could be shown whatever a defect did.
+    let body = base64(b"echo hi");
+    for layout in LAYOUTS {
+        let tree = plain_tree(layout, "agx-");
+        let gate = tree.exe(ROLES[2]);
+        let full_exe = tree.exe(ROLES[0]);
+        let full = posix(&full_exe);
+        for (name, options) in [
+            ("--extendable --max-extension 86400 --authenticate console", "--extendable --max-extension 86400 --authenticate console"),
+            ("--authenticate console", "--authenticate console"),
+            ("--authenticate desktop with --extendable", "--extendable --authenticate desktop"),
+        ] {
+            let launch = format!("{} {} --timeout 60 --shell cmd --command-b64 {}", full, options, body);
+            let from_full = run_hook(&full_exe, "antigravity", call(&json_quote(&launch)).as_bytes());
+            let from_gate = run_gate(&gate, "antigravity", call(&json_quote(&launch)).as_bytes());
+            for (hook_name, out) in [("the full command's hook", from_full), ("the gate", from_gate)] {
+                let d = Json::parse(out.out().trim()).unwrap_or(Json::Null);
+                checks.check("A42", &format!("{} in the {}: an envelope with {} is wrapped again, not passed through", hook_name, layout.name(), name),
+                    one_object(&out) && decision(&d) == Some("allow") && d.get("overwrite").is_some(), out.out());
+            }
+            let payload = format!("{{\"tool_input\":{{\"command\":{}}}}}", json_quote(&launch));
+            let by_gate = run_gate(&gate, "pretooluse", payload.as_bytes());
+            let by_full = run_hook(&full_exe, "pretooluse", payload.as_bytes());
+            checks.check("A42", &format!("pretooluse in the {} denies an envelope with {}, for the gate and the full command", layout.name(), name),
+                by_gate.code == 2 && by_full.code == 2 && by_gate.out().contains("\"permissionDecision\":\"deny\"") && by_full.out().contains("\"permissionDecision\":\"deny\""),
+                format!("exit {} {} / exit {} {}", by_gate.code, by_gate.out(), by_full.code, by_full.out()));
+        }
+        // The rewritten line, run under the wrapper it names: the guard inside it was started by a guard, so it is refused for that and
+        // not asked, with its command (the shell payload) never run.
+        let marker = TempDir::new("a42-");
+        let marker_file = marker.join("ran.txt");
+        let payload = base64(format!("echo SHOULD_NOT_RUN & echo x > \"{}\"", marker_file.display()).as_bytes());
+        let launch = format!("{} --extendable --max-extension 86400 --authenticate console --timeout 60 --shell cmd --command-b64 {}", full, payload);
+        let (out, d) = gate_decision(&gate, &launch);
+        let rewritten = command_line(&d).unwrap_or("").to_string();
+        let ran = bash(&rewritten, &[]);
+        let refused: Vec<String> = extension_lines(&ran.err()).into_iter().filter(|line| line.contains("decision=exception-")).collect();
+        checks.check("A42", &format!("the rewritten line in the {}, run with a standard input that is not a console: the guard inside it is refused because the wrapper started it, and nothing runs", layout.name()),
+            decision(&d) == Some("allow") && !rewritten.is_empty() && ran.code != 0 && !marker_file.exists() && !ran.out().contains("SHOULD_NOT_RUN")
+                && refused.len() == 1 && refused[0].contains("attempt=0") && refused[0].contains(&format!("reason=\"{}", WRAPPED_REASON))
+                    && !refused[0].contains("standard input is not") && !ran.err().contains("never extendable"),
+            format!("{} / exit {} {} {}", out.out(), ran.code, ran.out().trim(), ran.err().trim()));
     }
     checks.finish();
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Edge case and efficiency battery for the process guard (inventory B1 to B147):
+//! Edge case and efficiency battery for the process guard (inventory B1 to B148):
 //! exit codes across the 32 bit range, timeout precision, wide and deep process
 //! trees, escape attempts, nested guards, missing standard handles, bulk output,
 //! argument and shell quoting, concurrency, launch overhead, hook mode attacks,
@@ -1485,5 +1485,202 @@ fn b147_the_documents_say_standard_error_is_the_only_record_without_an_audit_fil
     let readme = std::fs::read_to_string(root.join("README.md")).unwrap_or_default();
     checks.check("B147", "the README says that the hook modes keep exit code 2 for a denial whatever the state of their streams",
         readme.contains("a denial exits with 2 whether or not the guard can write its output and its reason"), "README.md");
+    checks.finish();
+}
+
+#[test]
+fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resists() {
+    let mut checks = Checks::new("the exception above the cap");
+    // A cap over six hours needs the signed-in user's password at the start of the run. The documents must say how it is asked
+    // for, when a run is refused, how many attempts there are and how long a prompt waits, that a PIN cannot approve, and (in
+    // SECURITY.md) that it resists accidents and agents without the password and not a process of the same user that can
+    // tamper with the guard; the policy gets its one sentence, and the manual check of the prompts is written as steps.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap_or_default();
+    for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
+        let body = read(name);
+        checks.check("B148", &format!("{} says that a cap over the default needs the signed-in user's password, with --authenticate, and what the log records", name),
+            body.contains("signed-in user's password") && body.contains("--authenticate") && body.contains("exception-approved"), name);
+        checks.check("B148", &format!("{} says that there are 3 attempts, that a prompt waits 300 seconds, that session 0 is refused and that a PIN cannot approve (spelled out)", name),
+            body.contains("3 attempts") && body.contains("300 seconds") && body.contains("session 0") && body.contains("Personal Identification Number (PIN)"), name);
+    }
+    for name in ["README.md", "CHANGELOG.md"] {
+        let body = read(name);
+        checks.check("B148", &format!("{} says that a run that is refused is an exception-refused line and that the console prompt needs a real console", name),
+            body.contains("exception-refused") && (body.contains("real interactive console") || body.contains("real console")), name);
+    }
+    let security = read("SECURITY.md");
+    checks.check("B148", "SECURITY.md says that the exception resists accidents and agents without the password, not a process of the same user that can tamper with the guard, and cites the standard",
+        security.contains("resists accidents and agents that do not have the password") && security.contains("tamper with the guard process")
+            && security.contains("800-63B") && security.contains("verifier impersonation resistance") && security.contains("The prompt itself is in scope"), "SECURITY.md");
+    let policy = read("POLICY.md");
+    checks.check("B148", "POLICY.md has the sentence: a `--max-extension` above six hours needs the signed-in user's password at the start of the run, \
+        and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard",
+        policy.contains("A `--max-extension` above six hours needs the signed-in user's password at the start of the run, \
+            and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard."), "POLICY.md");
+    let contributing = read("CONTRIBUTING.md");
+    let steps = contributing.split("## Manual check of the prompts").nth(1).unwrap_or("");
+    checks.check("B148", "CONTRIBUTING.md has the manual check of the prompts as eleven numbered steps: step 9 for a scheduled task and a remote shell, \
+        step 10 for a domain machine away from its controller, step 11 for the test on a window station that is not visible, watched",
+        (1..=11).all(|n| steps.lines().any(|line| line.starts_with(&format!("{}. ", n)))) && !steps.lines().any(|line| line.starts_with("12. "))
+            && steps.lines().any(|line| line.starts_with("9. ") && line.contains("scheduled task") && line.contains("Windows Remote Management (WinRM)"))
+            && steps.lines().any(|line| line.starts_with("10. ") && line.contains("domain controller"))
+            && steps.lines().any(|line| line.starts_with("11. ") && line.contains("G95") && line.contains("screen")), steps.chars().take(200).collect::<String>());
+    // What the documents must say about the wait, the empty password, the hours in the log and the pseudo console, and what they must not claim.
+    let (readme_text, changelog_text) = (read("README.md"), read("CHANGELOG.md"));
+    for (name, body) in [("README.md", &readme_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the run's own deadline starts after the approval and that the wait for the prompt is bounded at 300 seconds for each of at most 3 attempts", name),
+            body.contains("starts when the command starts, after the approval") && body.contains("300 seconds for each of at most 3 attempts"), name);
+        checks.check("B148", &format!("{} says that an empty password never approves and that the log has the hours", name),
+            body.contains("empty password") && body.contains("hours="), name);
+        checks.check("B148", &format!("{} does not say that a guard under automatic mode, a hook or a guard that is not extendable never prompts, or that the dialog goes with the process", name),
+            !body.contains("a nested guard, the contain role, automatic mode and the hook envelope never prompt")
+                && !body.contains("the dialog goes with the process") && !body.contains("agents cannot cause a prompt"), name);
+    }
+    let security_text = read("SECURITY.md");
+    checks.check("B148", "SECURITY.md says that a guard that another guard started (under automatic mode, a hook's rewritten line or a guard that is not extendable) is refused before any prompt, \
+        that the owner is watched, that an empty password never approves and that a pseudo console passes the test of the console",
+        security_text.contains("was started by a guard and is refused before any prompt, lock or logon") && security_text.contains("watched while any wait goes on") && security_text.contains("an empty password is never accepted")
+            && security_text.contains("pseudo console") && security_text.contains("1385") && !security_text.contains("not yet watching its owner")
+            && security_text.contains("need no password"), "SECURITY.md");
+    checks.check("B148", "the README says that the console test is also passed by a pseudo console, and the manual check says to write down what the dialog does",
+        readme_text.contains("a pseudo console, which a process of the same user can create, also passes this test") && steps.contains("write down whether the dialog is gone"), "README.md / CONTRIBUTING.md");
+    // What the three documents say about the wait, the figure of the hours, the accounts that cannot approve, the lock and the guessing of a password.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that a run may wait up to 1095 seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, and the record of the approval), not 15", name),
+            body.contains("up to 1095 seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, \
+                5 seconds each for the name of the account and, with the console method, for the write of the message, \
+                and half a second for the record of the approval on standard error)")
+                && !body.contains("15 minutes") && !body.contains("up to 18 minutes"), name);
+        checks.check("B148", &format!("{} says that a smart card cannot approve, and that the look up of a name in another form may contact a domain controller", name),
+            body.contains("a smart card") && body.contains("domain controller") && body.contains("may contact a domain controller") && !body.contains("needs no network"), name);
+        checks.check("B148", &format!("{} says that the hours are rounded up and does not say that they are rounded to the nearest or limited to at most two decimals", name),
+            (body.contains("rounded up to two decimals") || body.contains("rounded up")) && !body.contains("at most two decimals"), name);
+    }
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text)] {
+        checks.check("B148", &format!("{} says that the lock name can be held by a program of the session and that a program that drives a console can guess the password", name),
+            (body.contains("holds the name of the lock") || body.contains("holds that name")) && body.contains("can guess the password, three tries per start"), name);
+        checks.check("B148", &format!("{} advises an account lockout threshold against guessing at the console, and says that a wait of 2 seconds slows and does not stop a loop", name),
+            body.contains("account lockout") && body.contains("2 seconds") && body.contains("does not stop"), name);
+    }
+    checks.check("B148", "the README and SECURITY.md say that the guard must stay with the person: if the agent runs as the account or can obtain its password, the exception gives no protection against it",
+        readme_text.contains("the guard must run as the person") && security_text.contains("the guard itself must stay with the signed-in person")
+            && readme_text.contains("gives no protection against that agent") && security_text.contains("gives no protection against that agent"), "README.md / SECURITY.md");
+    checks.check("B148", "SECURITY.md and the documentation of the library say that the hook program does not ask: it denies a line that carries the options or wraps it whole, and do not say that the hook envelope refuses them",
+        security_text.contains("denies a line that carries the options, or wraps it whole as the command text of the automatic wrapper") && !security_text.contains("they refuse the options and do not ask")
+            && include_str!("../src/lib.rs").contains("or wraps it whole as the command text of the automatic wrapper") && !include_str!("../src/lib.rs").contains("the hook envelope do not ask"), "SECURITY.md / src/lib.rs");
+    let readme = read("README.md");
+    checks.check("B148", "the README points to the manual check, and says that the tests never show a prompt to the person who runs them and what they do not assert",
+        readme.contains("CONTRIBUTING.md") && readme.contains("The tests never show a prompt to the person who runs them") && readme.contains("Not asserted by the tests"), "README.md");
+    // What the console prompt can and cannot do, as the code and the documents say it.
+    let auth_source = include_str!("../src/auth.rs");
+    checks.check("B148", "the prompt text for the console says to leave the prompt unanswered or close the console, and does not tell the user to cancel: the console prompt has no cancel key",
+        auth_source.contains("leave the prompt unanswered for {} seconds, or close this console, to refuse the run") && auth_source.contains("\"cancel to refuse the run\""), "src/auth.rs");
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the console prompt is not known to have a cancel key and that what Esc, Ctrl+C and Ctrl+Z with Enter do has not been tried, \
+            says how to refuse, and says that the user name cannot be changed there; it does not state the behaviour of those keys as fact", name),
+            body.contains("is not known to have a cancel key") && body.contains("has not been tried") && body.contains("Ctrl+C may end the guard") && body.contains("closing the console")
+                && !body.contains("has no cancel key") && !body.contains("Esc and Ctrl+C leave it waiting") && !body.contains("Ctrl+Z with Enter is an empty answer")
+                && body.contains("the name cannot be changed there") && !body.contains("A name typed over it") && !body.contains("a name typed over it") && !body.contains("Any name typed over it"), name);
+        checks.check("B148", &format!("{} says that the record names the account and the command line, that the errors given only for a correct password are 1327, 1328, 1329, 1330, 1331, 1380, 1385, 1793 \
+            and 1907, that a panic hook zeroes the buffers, and that the console prompt is always shown", name),
+            body.contains("account=") && body.contains("command=") && body.contains("1327, 1328, 1329, 1330, 1331") && body.contains("1380, 1385, 1793") && body.contains("panic hook")
+                && body.contains("CREDUI_FLAGS_ALWAYS_SHOW_UI") && !body.contains("best effort") && !body.contains("Neither the password nor the user name"), name);
+        checks.check("B148", &format!("{} spells out the first mention of the Common Weakness Enumeration as term (acronym)", name),
+            body.find("CWE").map_or(false, |at| body[..at].ends_with("Common Weakness Enumeration (") || body[..at].ends_with("Common Weakness Enumeration, ")), name);
+        checks.check("B148", &format!("{} names the form of the user name for an Azure Active Directory (Azure AD) account among what is not asserted", name),
+            body.contains("Azure Active Directory (Azure AD)"), name);
+    }
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the command line is in the line, that a secret passed as an argument is therefore written to the audit file and to standard error, \
+            that the failed-logon (4625) and lockout (4740) events are the cost of a wrong password, and that a run that was approved and did not start says so", name),
+            body.contains("The command line is in the line (the first 140 characters once written out, as the prompt shows them), so a secret passed as an argument is written to the audit file and to standard error")
+                && body.contains("pass secrets by environment variable or file, not by argument")
+                && body.contains("failed-logon event (4625)") && body.contains("lockout event (4740)")
+                && body.contains("the approved run did not start"), name);
+        checks.check("B148", &format!("{} calls the parent process what the system reports, information and not proof, and shows the deadline the run starts with and the note on characters outside basic Latin", name),
+            body.contains("the parent process as the system reports it") && (body.contains("information, not proof") || body.contains("information and not proof")) && !body.contains("Started by")
+                && body.contains("deadline the run starts with") && body.contains("outside basic Latin") && body.contains("Cyrillic"), name);
+    }
+    checks.check("B148", "the README and SECURITY.md say that the approval is of the text shown and not of the content of the program, and that a run inside a job with a \
+        shorter deadline that the guard did not recognise ends with that deadline; no document says that a guard inside the automatic wrapper ends with the \
+        wrapper's own deadline, which no approval can reach",
+        readme_text.contains("The approval is of the text shown, not of the content of the program") && security_text.contains("The approval is of the text shown, not of the content of the program")
+            && readme_text.contains("ends with that deadline, whatever cap was approved") && security_text.contains("ends with that deadline, whatever cap was approved")
+            && changelog_text.contains("ends with that deadline, whatever cap was approved")
+            && ![&readme_text, &security_text, &changelog_text].iter().any(|body| body.contains("ends with that wrapper's own deadline")), "README.md / SECURITY.md / CHANGELOG.md");
+    // The refusal of a run that another guard started is made by two tests, and the documents say what each reaches and what it does not.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the refusal is by file name (the programs of the guard and any name ending in -auto, as far as the search of the parents reaches, \
+            which a parent that has exited ends) and by job (every job of a guard kills on close), that an agent outside a guard job, one that puts itself in a job of its own, or \
+            one that sets its own parent can still summon a prompt, and does not say that no agent can", name),
+            body.contains("any file name ending in `-auto`") && body.contains("a parent that has already exited ends it") && body.contains("for at most 32 levels")
+                && body.contains("kills its processes when it closes") && body.contains("can still summon a prompt; the password is still required")
+                && body.contains("job of its own") && body.contains("at its system path (`explorer.exe` in the Windows folder, the other five in `System32`")
+                && !body.contains("no way to summon a prompt") && !body.contains("looks at every live process above the guard") && !body.contains("Every live process above the guard is looked at")
+                && !body.contains("a copy of the guard under another file name is not recognised, which only"), name);
+    }
+    // The refusal of a starter that cannot be watched, and the console history, are in the documents.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that a starter that cannot be watched refuses the run before any prompt, and that the console command history is not established to be free of the password", name),
+            body.contains("the process that started the run cannot be watched") && body.contains("command history"), name);
+    }
+    checks.check("B148", "the README says that the refusal of a cap that was not approved includes the runs where nobody could be asked, and counts four refusals before any attempt",
+        readme_text.contains("or nobody could be asked (see \"The exception above the cap\")") && readme_text.contains("except for the last four items"), "README.md");
+    checks.check("B148", "SECURITY.md does not say that the automatic wrapper refuses a line that carries the options (the guard that the wrapper runs is refused as a run that \
+        a guard started), and the changelog does not say that the envelope check refuses them",
+        !security_text.contains("automatic wrapper, which refuses them") && security_text.contains("the guard that the wrapper then runs was started by a guard and is refused before anything is shown")
+            && !changelog_text.contains("the envelope check refuse the options themselves") && changelog_text.contains("the envelope check does not accept a line that carries them as an envelope"), "SECURITY.md / CHANGELOG.md");
+    checks.check("B148", "the README, SECURITY.md and CHANGELOG.md say that a refusal after a prompt keeps the right to a prompt for 10 seconds, and the reason of the lock says so",
+        [&readme_text, &security_text, &changelog_text].iter().all(|body| body.contains("10 seconds") && body.contains("less than 10 seconds ago"))
+            && auth_source.contains("was refused less than 10 seconds ago"), "README.md / SECURITY.md / CHANGELOG.md");
+    checks.check("B148", "the log reason for an approval says the password of the account the guard runs as was given, not that the signed-in user gave it",
+        auth_source.contains("the password of the account the guard runs as was given at the {} prompt") && !auth_source.contains("the signed-in user gave the password at the"), "src/auth.rs");
+    let contributing_steps = steps.to_string();
+    checks.check("B148", "CONTRIBUTING.md: the console step asks for the password alone, tries Esc, Ctrl+C and Ctrl+Z with Enter and a stored generic credential, \
+        and step 1 says what passes (the command line fully visible) and records each type of account; step 7 names Azure AD; step 8 gives the command that runs at the cap",
+        contributing_steps.contains("asks for the password alone") && contributing_steps.contains("Esc, then Ctrl+C, then Ctrl+Z and Enter") && !contributing_steps.contains("Type the name of another account")
+            && contributing_steps.contains("Command line field is fully visible") && contributing_steps.contains("a local account, a Microsoft account, a domain account")
+            && contributing_steps.contains("Azure AD") && contributing_steps.contains("cmdkey /generic:\"Process Tree Guard\"") && contributing_steps.contains("cmdkey /delete:\"Process Tree Guard\"")
+            && contributing_steps.contains("`process-tree-guard --extendable --max-extension 21600 --timeout 20 -- cmd /c echo ran`"), "CONTRIBUTING.md");
+    checks.check("B148", "the README and the changelog list what Esc, Ctrl+C and Ctrl+Z with Enter do at the console prompt among what the tests do not assert, \
+        and the changelog says that the nested guard over the cap is a change and that automatic mode now refuses a leading --authenticate",
+        readme_text.contains("what Esc, Ctrl+C and Ctrl+Z with Enter do at the console prompt (the manual check, step 6, records it)")
+            && changelog_text.contains("what Esc, Ctrl+C and Ctrl+Z with Enter do at the console prompt (the manual check, step 6, records it)")
+            && changelog_text.contains("Apart from the changes listed under Changed") && !changelog_text.contains("Apart from the one change")
+            && changelog_text.contains("Automatic mode refuses a leading `--authenticate`") && changelog_text.contains("ran in 2.0.0-alpha.3 and is refused from this version"), "README.md / CHANGELOG.md");
+    // A guard that another guard started is not asked, and the documents say so wherever they say who is asked.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that a run that another guard started is refused before any prompt, lock or logon, with the reason, and does not say that such a run asks", name),
+            body.contains("an exception above the cap is not asked for by a run that another guard started")
+                && !body.contains("is a top-level run and asks like any other") && !body.contains("is a top-level run and does ask") && !body.contains("and the guard that this starts asks")
+                && !body.contains("which is a top-level run and is asked like any other"), name);
+        checks.check("B148", &format!("{} says that three attempts can equal the lockout threshold of a hardened machine, that the setting is 3 or fewer in the Defense Information Systems Agency (DISA) Windows \
+            Security Technical Implementation Guide (STIG), and what to set instead", name),
+            body.contains("Three attempts per run can equal the lockout threshold") && body.contains("Defense Information Systems Agency (DISA) Windows Security Technical Implementation Guide (STIG)")
+                && body.contains("at least 5"), name);
+        checks.check("B148", &format!("{} says that a PIN, a fingerprint, a face or a smart card is not expected to unpack to a password and does not say that it does not, and that an unpacked PIN is sent to the logon", name),
+            body.contains("is not expected to unpack to a password") && !body.contains("does not unpack to a password") && body.contains("If a PIN does unpack under the account's own name"), name);
+        checks.check("B148", &format!("{} says that a refusal line is queued and given 500 milliseconds, and that the refusal is also the error and the exit code", name),
+            body.contains("A refusal line is queued and the guard gives the file 500 milliseconds to take it before it returns") && body.contains("the refusal itself is also the error on standard error and the exit code 125"), name);
+        checks.check("B148", &format!("{} says that the line names the method, the deadline the run starts with and the process that started the guard", name),
+            body.contains("method=") && body.contains("timeout=") && body.contains("started_by="), name);
+    }
+    checks.check("B148", "SECURITY.md states one bound for the whole message, under 1,024 characters, the limit of the dialog; the desktop prompt refuses a longer message and the unit test proves the bound",
+        security_text.contains("under 1,024 characters, the limit of the dialog") && !security_text.contains("3.7 thousand")
+            && include_str!("../src/auth.rs").contains("if text.encode_utf16().count() >= CREDUI_MAX_MESSAGE_LENGTH {")
+            && include_str!("../src/auth.rs").contains("assert!(text.encode_utf16().count() < CREDUI_MAX_MESSAGE_LENGTH"), "SECURITY.md / src/auth.rs");
+    // `CI` alone does not switch on the checks that need a window station or a pseudo console, and the README says so for each variable.
+    for variable in ["PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST", "PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION", "PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE"] {
+        let entries: Vec<&str> = readme_text.lines().filter(|line| line.starts_with(&format!("- `{}`", variable))).collect();
+        checks.check("B148", &format!("the README entry for {} says that it takes non-empty text and that `CI` alone does not set it, and does not say that `CI` sets it", variable),
+            entries.len() == 1 && entries[0].contains("any non-empty text") && entries[0].contains("`CI` alone does not")
+                && !entries[0].contains("when `CI` is set"), format!("{:?}", entries));
+        let guard_source = include_str!("guard.rs");
+        checks.check("B148", &format!("the code reads {} as a variable that is set and not empty, and `CI` is not read for it", variable),
+            guard_source.contains(&format!("variable_set(\"{}\")", variable)) && !guard_source.contains("var_os(\"CI\")"), variable.to_string());
+    }
+    checks.check("B148", "the README lists --authenticate with --max-extension and --extension-log among the options that need --extendable",
+        readme_text.contains("`--max-extension`, `--extension-log` and `--authenticate` without `--extendable` are refused with a message of their own"), "README.md");
     checks.finish();
 }

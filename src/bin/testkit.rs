@@ -6,7 +6,8 @@
 //! One small executable stands in for every child the tests need: sleepers,
 //! exit codes, standard stream relays, argument reporters, markers that record
 //! their process identifier, wide and deep process trees, bulk output, calls of
-//! the library, requests to an extendable run, and an owner that leaves when told.
+//! the library, requests to an extendable run, an owner that leaves when told, and a guard
+//! run on a window station or in a pseudo console that nobody can see.
 //! The first argument selects the subcommand. A usage error exits with 97.
 //!
 //! Markers are written to a temporary name and renamed into place, so a reader
@@ -35,8 +36,26 @@ struct ThreadEntry {
     flags: u32,
 }
 
+/// A process in a snapshot (PROCESSENTRY32W).
+#[repr(C)]
+struct ProcessEntry {
+    size: u32,
+    usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    parent_process_id: u32,
+    priority_base: i32,
+    flags: u32,
+    exe_file: [u16; 260],
+}
+
 #[link(name = "kernel32")]
 extern "system" {
+    fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry) -> i32;
+    fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry) -> i32;
+    fn GetCurrentProcessId() -> u32;
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetNamedPipeInfo(pipe: *mut c_void, flags: *mut u32, out_buffer: *mut u32, in_buffer: *mut u32, max_instances: *mut u32) -> i32;
@@ -45,6 +64,9 @@ extern "system" {
     fn ReadFile(handle: *mut c_void, buffer: *mut u8, count: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
     fn WriteFile(handle: *mut c_void, buffer: *const u8, count: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
     fn OpenProcess(access: u32, inherit: i32, id: u32) -> *mut c_void;
+    fn GetProcessTimes(process: *mut c_void, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    fn QueryFullProcessImageNameW(process: *mut c_void, flags: u32, name: *mut u16, size: *mut u32) -> i32;
+    fn GetSystemWindowsDirectoryW(buffer: *mut u16, size: u32) -> u32;
     fn CreatePipe(read: *mut *mut c_void, write: *mut *mut c_void, attributes: *mut c_void, size: u32) -> i32;
     fn GetLastError() -> u32;
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
@@ -55,12 +77,41 @@ extern "system" {
     fn GetThreadTimes(thread: *mut c_void, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
     fn SuspendThread(thread: *mut c_void) -> u32;
     fn ResumeThread(thread: *mut c_void) -> u32;
+    fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
+    fn TerminateProcess(process: *mut c_void, code: u32) -> i32;
+    fn CreateProcessW(application: *const u16, command_line: *mut u16, process_attributes: *mut c_void, thread_attributes: *mut c_void, inherit_handles: i32,
+        creation_flags: u32, environment: *mut c_void, current_directory: *const u16, startup: *mut StartupInfo, information: *mut ProcessInfo) -> i32;
+    fn CreatePseudoConsole(size: u32, input: *mut c_void, output: *mut c_void, flags: u32, console: *mut *mut c_void) -> i32;
+    fn ClosePseudoConsole(console: *mut c_void);
+    fn InitializeProcThreadAttributeList(list: *mut c_void, count: u32, flags: u32, size: *mut usize) -> i32;
+    fn UpdateProcThreadAttribute(list: *mut c_void, flags: u32, attribute: usize, value: *mut c_void, size: usize, previous: *mut c_void, returned: *mut usize) -> i32;
+    fn DeleteProcThreadAttributeList(list: *mut c_void);
+    fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+    fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn QueryInformationJobObject(job: *mut c_void, class: i32, info: *mut c_void, length: u32, returned: *mut u32) -> i32;
+    fn TerminateJobObject(job: *mut c_void, code: u32) -> i32;
+}
+
+#[link(name = "user32")]
+extern "system" {
+    fn CreateWindowStationW(name: *const u16, flags: u32, access: u32, attributes: *mut c_void) -> *mut c_void;
+    fn SetProcessWindowStation(station: *mut c_void) -> i32;
+    fn GetProcessWindowStation() -> *mut c_void;
+    fn CreateDesktopW(name: *const u16, device: *const u16, mode: *mut c_void, flags: u32, access: u32, attributes: *mut c_void) -> *mut c_void;
+    fn GetUserObjectInformationW(object: *mut c_void, index: i32, info: *mut c_void, length: u32, needed: *mut u32) -> i32;
 }
 
 #[link(name = "ntdll")]
 extern "system" {
     fn NtSuspendProcess(process: *mut c_void) -> i32;
     fn NtResumeProcess(process: *mut c_void) -> i32;
+}
+
+#[link(name = "secur32")]
+extern "system" {
+    fn GetUserNameExW(format: i32, name: *mut u16, size: *mut u32) -> u8;
 }
 
 #[link(name = "advapi32")]
@@ -287,6 +338,412 @@ fn marker_present(path: &Path) -> bool {
         count_marker_files(path) > 0
     } else {
         path.exists()
+    }
+}
+
+/// The code of `hidden-station-guard` when the window station could not be made or is visible.
+const NO_HIDDEN_STATION_EXIT: i32 = 96;
+
+/// STARTUPINFOW.
+#[repr(C)]
+struct StartupInfo {
+    cb: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_count_chars: u32,
+    y_count_chars: u32,
+    fill_attribute: u32,
+    flags: u32,
+    show_window: u16,
+    reserved2_size: u16,
+    reserved2: *mut u8,
+    std_input: *mut c_void,
+    std_output: *mut c_void,
+    std_error: *mut c_void,
+}
+
+#[repr(C)]
+struct ProcessInfo {
+    process: *mut c_void,
+    thread: *mut c_void,
+    process_id: u32,
+    thread_id: u32,
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A command line from arguments, each in quotes when it has a space or is empty (no argument has a quote or a trailing backslash).
+fn command_line(args: &[&str]) -> String {
+    args.iter().map(|arg| if arg.is_empty() || arg.contains(' ') { format!("\"{}\"", arg) } else { arg.to_string() }).collect::<Vec<_>>().join(" ")
+}
+
+fn run_on_hidden_station(guard: &str, cap: &str, timeout: &str, child: &[String]) -> i32 {
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    const UOI_FLAGS: i32 = 1;
+    const UOI_NAME: i32 = 2;
+    const WSF_VISIBLE: u32 = 1;
+    const DETACHED_PROCESS: u32 = 0x8;
+    const STARTF_USESTDHANDLES: u32 = 0x100;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
+    // The refusal is immediate. A guard that is still there after this is not refusing, and may have put a prompt on
+    // the screen: the wait is short so that, if it ever does, the prompt is gone within seconds.
+    const WAIT_LIMIT_MS: u32 = 10_000;
+    unsafe {
+        // A station with no name of its own: the system names it, and a named one is refused to a process that is not a service.
+        let station = CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, std::ptr::null_mut());
+        if station.is_null() || SetProcessWindowStation(station) == 0 {
+            eprintln!("testkit: cannot make a window station [WinError {}]", GetLastError());
+            return NO_HIDDEN_STATION_EXIT;
+        }
+        // USEROBJECTFLAGS: two Booleans, then the flags. The station that is current now must not be visible.
+        let (mut flags, mut needed) = ([0u32; 3], 0u32);
+        let current = GetProcessWindowStation();
+        if current.is_null() || GetUserObjectInformationW(current, UOI_FLAGS, flags.as_mut_ptr() as *mut c_void, 12, &mut needed) == 0 || flags[2] & WSF_VISIBLE != 0 {
+            eprintln!("testkit: the window station of this process is visible or cannot be read; nothing was started");
+            return NO_HIDDEN_STATION_EXIT;
+        }
+        let desktop = CreateDesktopW(wide("hidden").as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, GENERIC_ALL, std::ptr::null_mut());
+        if desktop.is_null() {
+            eprintln!("testkit: cannot make a desktop [WinError {}]", GetLastError());
+            return NO_HIDDEN_STATION_EXIT;
+        }
+        let mut station_name = [0u16; 256];
+        if GetUserObjectInformationW(current, UOI_NAME, station_name.as_mut_ptr() as *mut c_void, 510, &mut needed) == 0 {
+            eprintln!("testkit: cannot read the name of the window station [WinError {}]", GetLastError());
+            return NO_HIDDEN_STATION_EXIT;
+        }
+        let station_name = String::from_utf16_lossy(&station_name[..station_name.iter().position(|unit| *unit == 0).unwrap_or(0)]);
+        let mut desktop_name = wide(&format!("{}\\hidden", station_name));
+        let mut args: Vec<&str> = vec![guard, "--extendable", "--max-extension", cap, "--timeout", timeout, "--"];
+        args.extend(child.iter().map(String::as_str));
+        let mut line = wide(&command_line(&args));
+        let mut startup: StartupInfo = std::mem::zeroed();
+        startup.cb = std::mem::size_of::<StartupInfo>() as u32;
+        startup.desktop = desktop_name.as_mut_ptr();
+        startup.flags = STARTF_USESTDHANDLES;
+        for (which, slot) in [(-10i32, 0usize), (-11, 1), (-12, 2)] {
+            let handle = GetStdHandle(which as u32);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
+            match slot {
+                0 => startup.std_input = handle,
+                1 => startup.std_output = handle,
+                _ => startup.std_error = handle,
+            }
+        }
+        let mut info = ProcessInfo { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), process_id: 0, thread_id: 0 };
+        let started = CreateProcessW(std::ptr::null(), line.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 1, DETACHED_PROCESS,
+            std::ptr::null_mut(), std::ptr::null(), &mut startup, &mut info);
+        if started == 0 {
+            eprintln!("testkit: cannot start the guard [WinError {}]", GetLastError());
+            return NO_HIDDEN_STATION_EXIT;
+        }
+        CloseHandle(info.thread);
+        if WaitForSingleObject(info.process, WAIT_LIMIT_MS) != 0 {
+            TerminateProcess(info.process, 1);
+            eprintln!("testkit: the guard did not end within {} milliseconds", WAIT_LIMIT_MS);
+            return WAIT_TIMEOUT_EXIT;
+        }
+        let mut status = 0u32;
+        GetExitCodeProcess(info.process, &mut status);
+        CloseHandle(info.process);
+        status as i32
+    }
+}
+
+/// STARTUPINFOEXW: the startup information and a list of attributes.
+#[repr(C)]
+struct StartupInfoEx {
+    startup: StartupInfo,
+    attributes: *mut c_void,
+}
+
+/// The code of `pty-guard` when no pseudo console could be made (before Windows 10 1809, or a host that refuses one).
+const NO_PSEUDO_CONSOLE_EXIT: i32 = 95;
+
+/// The text of terminal output without the escape sequences that move the cursor and set the
+/// colours (a control sequence ends at a letter, an operating system command at a bell or a string
+/// terminator), and with carriage returns left out.
+fn plain_text(bytes: &[u8]) -> String {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b if bytes.get(i + 1) == Some(&b'[') => {
+                i += 2;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            0x1b if bytes.get(i + 1) == Some(&b']') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != 0x07 && !(bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\')) {
+                    i += 1;
+                }
+                i += if bytes.get(i) == Some(&0x1b) { 2 } else { 1 };
+            }
+            0x0d => i += 1,
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// JOBOBJECT_BASIC_ACCOUNTING_INFORMATION: what a job has counted, with the number of its processes that are alive.
+#[repr(C)]
+#[derive(Default)]
+struct JobAccounting {
+    times: [i64; 4],
+    page_faults: u32,
+    total_processes: u32,
+    active_processes: u32,
+    terminated_processes: u32,
+}
+
+/// The number of processes of `job` that are alive, or None when that cannot be read.
+fn active_processes(job: *mut c_void) -> Option<u32> {
+    let mut information = JobAccounting::default();
+    let read = unsafe {
+        QueryInformationJobObject(job, 1, &mut information as *mut JobAccounting as *mut c_void,
+            std::mem::size_of::<JobAccounting>() as u32, std::ptr::null_mut())
+    };
+    (read != 0).then_some(information.active_processes)
+}
+
+/// The time the process `id` was created, as the system counts it; None when it cannot be read.
+fn started_at(id: u32) -> Option<u64> {
+    unsafe {
+        let handle = OpenProcess(0x1000, 0, id);
+        if handle.is_null() {
+            return None;
+        }
+        let (mut created, mut exited, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+        let read = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user);
+        CloseHandle(handle);
+        (read != 0).then_some(created)
+    }
+}
+
+/// The path of the file of the process `id`, in lower case; empty when it cannot be read.
+fn image_of(id: u32) -> String {
+    unsafe {
+        let handle = OpenProcess(0x1000, 0, id);
+        if handle.is_null() {
+            return String::new();
+        }
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as u32;
+        let read = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+        if read == 0 { String::new() } else { String::from_utf16_lossy(&buffer[..size as usize]).to_ascii_lowercase() }
+    }
+}
+
+/// The Windows folder in lower case, without a final separator; empty when it cannot be read.
+fn windows_folder() -> String {
+    let mut buffer = [0u16; 512];
+    let length = unsafe { GetSystemWindowsDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..length]).trim_end_matches('\\').to_ascii_lowercase()
+}
+
+/// The file names, in lower case, of the live processes above this one, nearest first, walked by
+/// the two rules of the walk of the guard that refuses a run that another guard started: each
+/// parent must have started before its child (a reused process identifier is not a parent), and
+/// the walk stops at the shell of the desktop and at system processes only when the file is in
+/// the Windows folder (a copy of one of those names in another folder is walked past).
+fn ancestor_names() -> Vec<String> {
+    let windows = windows_folder();
+    let mut table = std::collections::HashMap::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(2, 0);
+        if snapshot as isize != -1 && !snapshot.is_null() {
+            let mut entry: ProcessEntry = std::mem::zeroed();
+            entry.size = std::mem::size_of::<ProcessEntry>() as u32;
+            let mut more = Process32FirstW(snapshot, &mut entry);
+            while more != 0 {
+                let length = entry.exe_file.iter().position(|unit| *unit == 0).unwrap_or(entry.exe_file.len());
+                table.insert(entry.process_id, (entry.parent_process_id, String::from_utf16_lossy(&entry.exe_file[..length]).to_ascii_lowercase()));
+                more = Process32NextW(snapshot, &mut entry);
+            }
+            CloseHandle(snapshot);
+        }
+    }
+    let (mut names, mut child) = (Vec::new(), unsafe { GetCurrentProcessId() });
+    let mut child_started = started_at(child).unwrap_or(u64::MAX);
+    for _ in 0..32 {
+        let Some((parent, _)) = table.get(&child) else { break };
+        let Some((_, name)) = table.get(parent) else { break };
+        if *parent == 0 || *parent == 4 {
+            break;
+        }
+        if ["explorer.exe", "services.exe", "wininit.exe", "winlogon.exe", "svchost.exe", "smss.exe"].contains(&name.as_str()) {
+            let image = image_of(*parent);
+            if !windows.is_empty() && image.strip_prefix(&windows).map_or(false, |rest| rest.starts_with('\\')) {
+                break;
+            }
+        }
+        let Some(started) = started_at(*parent) else { break };
+        if started > child_started {
+            break;
+        }
+        names.push(name.clone());
+        child = *parent;
+        child_started = started;
+    }
+    names
+}
+
+/// Run `guard args...` in a pseudo console: a console that is really one (standard input passes
+/// the test for a console), with nothing shown on any desktop. With `type_enter`, an Enter is
+/// typed every 300 milliseconds until the program ends, which answers a prompt with an empty user
+/// name and an empty password for as long as it asks; without it nothing is typed, and a prompt
+/// stays unanswered. Prints `exit CODE` and the text written to the console, which is collected
+/// until every process that was started in it has ended (the program that was run is in a job
+/// with them, and a program that it started may outlive it) and the console has been quiet for a second.
+fn run_in_pseudo_console(limit: f64, guard: &str, args: &[String], type_enter: bool) -> i32 {
+    const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+    const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
+    // A run over the default cap by the desktop method would show a prompt on the desktop of whoever runs this (a pseudo
+    // console does not hide the desktop). Only the options of the guard count, up to the first `--`: the arguments of
+    // its command are not options, and an option given twice is read as the guard reads it, the last one winning.
+    let options = &args[..args.iter().position(|arg| arg == "--").unwrap_or(args.len())];
+    let method = options.iter().enumerate().rev().find_map(|(at, arg)| {
+        if arg == "--authenticate" { options.get(at + 1).map(String::as_str) } else { arg.strip_prefix("--authenticate=") }
+    });
+    if method != Some("console") {
+        usage("pty-guard runs a guard only with --authenticate console");
+    }
+    unsafe {
+        let none = std::ptr::null_mut::<c_void>();
+        let (mut input_read, mut input_write, mut output_read, mut output_write) = (none, none, none, none);
+        if CreatePipe(&mut input_read, &mut input_write, std::ptr::null_mut(), 0) == 0 || CreatePipe(&mut output_read, &mut output_write, std::ptr::null_mut(), 0) == 0 {
+            usage("cannot make a pipe");
+        }
+        // 2000 columns, so that no line of the guard wraps.
+        let mut console: *mut c_void = std::ptr::null_mut();
+        if CreatePseudoConsole(50 << 16 | 2000, input_read, output_write, 0, &mut console) < 0 {
+            eprintln!("testkit: cannot make a pseudo console");
+            return NO_PSEUDO_CONSOLE_EXIT;
+        }
+        CloseHandle(input_read);
+        CloseHandle(output_write);
+        let mut size = 0usize;
+        InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size);
+        let mut list = vec![0u64; size / 8 + 1];
+        let list_pointer = list.as_mut_ptr() as *mut c_void;
+        if InitializeProcThreadAttributeList(list_pointer, 1, 0, &mut size) == 0
+            || UpdateProcThreadAttribute(list_pointer, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, console, std::mem::size_of::<*mut c_void>(),
+                std::ptr::null_mut(), std::ptr::null_mut()) == 0 {
+            usage(&format!("cannot attach the pseudo console [WinError {}]", GetLastError()));
+        }
+        // The console asks for the position of the cursor; a terminal answers it.
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let (reader_output, reader_input, sink) = (output_read as usize, input_write as usize, collected.clone());
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            loop {
+                let mut read = 0u32;
+                if ReadFile(reader_output as *mut c_void, buffer.as_mut_ptr(), buffer.len() as u32, &mut read, std::ptr::null_mut()) == 0 || read == 0 {
+                    break;
+                }
+                let chunk = &buffer[..read as usize];
+                if chunk.windows(4).any(|window| window == b"\x1b[6n") {
+                    let mut written = 0u32;
+                    WriteFile(reader_input as *mut c_void, b"\x1b[1;1R".as_ptr(), 6, &mut written, std::ptr::null_mut());
+                }
+                sink.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).extend_from_slice(chunk);
+            }
+        });
+        let mut startup: StartupInfoEx = std::mem::zeroed();
+        startup.startup.cb = std::mem::size_of::<StartupInfoEx>() as u32;
+        startup.attributes = list_pointer;
+        // Standard handles that are asked for and null: the guard gets those of the pseudo console, not the ones this process was given.
+        startup.startup.flags = 0x100;
+        let mut all: Vec<&str> = vec![guard];
+        all.extend(args.iter().map(String::as_str));
+        let mut line = wide(&command_line(&all));
+        let mut info = ProcessInfo { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), process_id: 0, thread_id: 0 };
+        // The program is started suspended and put in a job before it runs, so that every process it starts is in the job, and the
+        // run is over only when the job is empty: a guard that a shell started and left behind still holds the lock of the prompts
+        // of the session until it has ended, and the next test must not start before that.
+        const CREATE_SUSPENDED: u32 = 0x4;
+        if CreateProcessW(std::ptr::null(), line.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 0, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            std::ptr::null_mut(), std::ptr::null(), &mut startup as *mut StartupInfoEx as *mut StartupInfo, &mut info) == 0 {
+            eprintln!("testkit: cannot start the guard [WinError {}]", GetLastError());
+            return NO_PSEUDO_CONSOLE_EXIT;
+        }
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() || AssignProcessToJobObject(job, info.process) == 0 {
+            eprintln!("testkit: cannot put the guard in a job [WinError {}]", GetLastError());
+            TerminateProcess(info.process, 1);
+            return NO_PSEUDO_CONSOLE_EXIT;
+        }
+        ResumeThread(info.thread);
+        CloseHandle(info.thread);
+        let begun = Instant::now();
+        let mut timed_out = false;
+        while WaitForSingleObject(info.process, 300) != 0 {
+            if begun.elapsed().as_secs_f64() > limit {
+                TerminateJobObject(job, 1);
+                timed_out = true;
+                break;
+            }
+            if type_enter {
+                let mut written = 0u32;
+                WriteFile(input_write, b"\r".as_ptr(), 1, &mut written, std::ptr::null_mut());
+            }
+        }
+        let mut status = 0u32;
+        GetExitCodeProcess(info.process, &mut status);
+        CloseHandle(info.process);
+        // The processes that the program started: wait for them to end, within the same limit (a count that cannot be read is
+        // taken as none, and the settling below is then all that waits).
+        while !timed_out && active_processes(job).map_or(false, |alive| alive > 0) {
+            if begun.elapsed().as_secs_f64() > limit {
+                TerminateJobObject(job, 1);
+                timed_out = true;
+                break;
+            }
+            sleep(Duration::from_millis(100));
+        }
+        CloseHandle(job);
+        // A program that was started in the console may outlive the one that was run (a starter that ended while the
+        // guard it started goes on to refuse its run): the console stays open until it has been quiet for a second, at
+        // most five seconds. The reader ends when the console is closed; closing it waits for the last of the output.
+        let settling = Instant::now();
+        let length = || collected.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
+        let (mut seen, mut changed) = (length(), Instant::now());
+        while changed.elapsed() < Duration::from_millis(1000) && settling.elapsed() < Duration::from_secs(5) {
+            sleep(Duration::from_millis(100));
+            if length() != seen {
+                seen = length();
+                changed = Instant::now();
+            }
+        }
+        ClosePseudoConsole(console);
+        let _ = reader.join();
+        CloseHandle(input_write);
+        CloseHandle(output_read);
+        DeleteProcThreadAttributeList(list_pointer);
+        let text = plain_text(&collected.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        println!("exit {}", if timed_out { -1 } else { status as i64 });
+        println!("{}", text);
+        if timed_out { WAIT_TIMEOUT_EXIT } else { 0 }
     }
 }
 
@@ -1026,6 +1483,47 @@ fn main() {
             let status = code(&rest[0]);
             unsafe { CloseHandle(GetStdHandle(STD_OUTPUT_HANDLE)) };
             exit(status as i32);
+        }
+        "ancestors" => {
+            // The file names of the live processes above this one, nearest first, one to a line: the tests use it to tell
+            // whether a guard is above them, which makes a guard they start a run that another guard started.
+            for name in ancestor_names() {
+                println!("{}", name);
+            }
+        }
+        "account-name" => {
+            // The account this process runs as, as the system names it (DOMAIN\user, the form of
+            // NameSamCompatible): the tests compare it with the account that a log line names.
+            let mut name = [0u16; 1024];
+            let mut size = name.len() as u32;
+            if unsafe { GetUserNameExW(2, name.as_mut_ptr(), &mut size) } == 0 || size == 0 || size as usize >= name.len() {
+                exit(1);
+            }
+            println!("{}", String::from_utf16_lossy(&name[..size as usize]));
+        }
+        "hidden-station-guard" => {
+            // Run GUARD --extendable --max-extension CAP --timeout SECONDS -- CHILD... on a window
+            // station that is not visible, with the default (desktop) method of asking, and exit
+            // with its code. The guard must refuse at once, because it has no interactive window
+            // station. If its test for that were defective, the real secure prompt could appear on
+            // the desktop of whoever runs the tests; where it would appear is not established. The
+            // station is made and checked first, and nothing starts if it cannot be.
+            need_at_least(rest, 4, "hidden-station-guard GUARD CAP SECONDS CHILD...");
+            exit(run_on_hidden_station(&rest[0], &rest[1], &rest[2], &rest[3..]));
+        }
+        "pty-guard" => {
+            // Run GUARD ARGS... in a pseudo console for at most LIMIT seconds, typing an Enter every 300
+            // milliseconds, and print `exit CODE` and what the guard wrote to the console. ARGS must
+            // say `--authenticate console`. Exits 0 when the guard ended, 95 where no pseudo console can be made.
+            need_at_least(rest, 3, "pty-guard LIMIT GUARD ARGS...");
+            exit(run_in_pseudo_console(seconds(&rest[0]), &rest[1], &rest[2..], true));
+        }
+        "pty-guard-quiet" => {
+            // `pty-guard` that types nothing, so that a prompt stays unanswered. The program may be a shell that starts the
+            // guard and ends (`cmd.exe /d /c start /b "" GUARD ARGS... & ping ...`), the guard then being run by a starter that
+            // exits; ARGS must still say `--authenticate console` among the options of the guard.
+            need_at_least(rest, 3, "pty-guard-quiet LIMIT PROGRAM ARGS...");
+            exit(run_in_pseudo_console(seconds(&rest[0]), &rest[1], &rest[2..], false));
         }
         _ => usage(&format!("unknown subcommand: {}", name)),
     }

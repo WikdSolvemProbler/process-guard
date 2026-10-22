@@ -26,6 +26,11 @@ extern "system" {
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
+    fn CreateMutexW(attributes: *mut c_void, initial_owner: i32, name: *const u16) -> *mut c_void;
+    fn ReleaseMutex(handle: *mut c_void) -> i32;
+    fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+    fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+    fn GetCurrentProcess() -> *mut c_void;
 }
 
 const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -78,12 +83,29 @@ fn built(recorded: &str) -> PathBuf {
 /// alias through 2.x. Each also has an automatic copy, the same name with `-auto`.
 pub const NAMES: [&str; 2] = ["process-tree-guard", "process-guard"];
 
+/// Put this test process in a job of its own with no limit, nested in the job it is in already. The guard refuses an exception
+/// above the cap to a run that sits in a job that kills its processes when it closes, because every job of a guard does; cargo
+/// puts the tests it runs in such a job, so without this every guard a test starts would be refused for that and the tests could
+/// not reach the checks they are for. The new job kills nothing, so the job that cargo made still holds. Done once, before the
+/// first program of the guard is named; if the system does not take a nested job the tests go on and say so.
+fn leave_the_job_of_the_runner() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| unsafe {
+        let job = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() || AssignProcessToJobObject(job, GetCurrentProcess()) == 0 {
+            eprintln!("NOTICE the test process could not be put in a job of its own; \
+                a guard that a test starts may be refused as a run inside a job that kills on close");
+        }
+    });
+}
+
 /// The guard under test: the built binary, or the one named by
 /// PROCESS_TREE_GUARD_EXE, else by the 1.x name PROCESS_GUARD_EXE. The tests never
 /// depend on the name of this file; they copy it to the names they need.
 pub fn guard() -> &'static str {
     static GUARD: OnceLock<String> = OnceLock::new();
     GUARD.get_or_init(|| {
+        leave_the_job_of_the_runner();
         let named = std::env::var_os("PROCESS_TREE_GUARD_EXE").or_else(|| std::env::var_os("PROCESS_GUARD_EXE")).map(PathBuf::from);
         let raw = named.unwrap_or_else(|| built(env!("CARGO_BIN_EXE_process-tree-guard")));
         long_path(&raw)
@@ -100,7 +122,10 @@ pub fn copy_guard(dir: &Path, name: &str) -> String {
 /// The helper executable that stands in for every child process.
 pub fn testkit() -> &'static str {
     static TESTKIT: OnceLock<String> = OnceLock::new();
-    TESTKIT.get_or_init(|| long_path(&built(env!("CARGO_BIN_EXE_testkit"))))
+    TESTKIT.get_or_init(|| {
+        leave_the_job_of_the_runner();
+        long_path(&built(env!("CARGO_BIN_EXE_testkit")))
+    })
 }
 
 // ------------------------------------------------------- role programs, layouts
@@ -113,12 +138,15 @@ pub const ROLES: [&str; 4] = ["process-tree-guard", "process-tree-guard-deadline
 /// this run. Unlike `guard()`, it is not replaced by PROCESS_TREE_GUARD_EXE.
 pub fn role(name: &str) -> &'static str {
     static PATHS: OnceLock<[String; 4]> = OnceLock::new();
-    let paths = PATHS.get_or_init(|| [
-        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard"))),
-        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-deadline"))),
-        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-gate"))),
-        long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-contain"))),
-    ]);
+    let paths = PATHS.get_or_init(|| {
+        leave_the_job_of_the_runner();
+        [
+            long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard"))),
+            long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-deadline"))),
+            long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-gate"))),
+            long_path(&built(env!("CARGO_BIN_EXE_process-tree-guard-contain"))),
+        ]
+    });
     let index = ROLES.iter().position(|known| *known == name).unwrap_or_else(|| panic!("{} is not a program of this crate", name));
     &paths[index]
 }
@@ -294,6 +322,7 @@ pub fn exec(command: Command) -> Out {
 
 /// Run a command to completion with captured output and a hard time limit.
 pub fn exec_with(mut command: Command, opts: Opts) -> Out {
+    refuse_prompt_in(&command);
     let Opts { input, limit_secs, keep_stdout } = opts;
     command
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -325,6 +354,7 @@ pub fn exec_with(mut command: Command, opts: Opts) -> Out {
 
 /// Run a command whose standard streams the caller has already set.
 pub fn run_status(mut command: Command, limit_secs: u64) -> u32 {
+    refuse_prompt_in(&command);
     let mut child = command.spawn().unwrap_or_else(|e| panic!("cannot start {:?}: {}", command.get_program(), e));
     match wait_limited(&mut child, limit_secs) {
         Some(status) => status.code().unwrap_or(-1) as u32,
@@ -348,7 +378,202 @@ pub fn without_deadline_variables(command: &mut Command) -> &mut Command {
     command
 }
 
+/// The default cap, in seconds: a `--max-extension` over it is asked for with a prompt.
+pub const DEFAULT_CAP: f64 = 21600.0;
+
+/// The arguments of a guard up to the first `--`: what follows is the command it runs, whose own arguments (a helper that
+/// reports them) are not options of the guard.
+pub fn guard_options<'a, 'b>(args: &'b [&'a str]) -> &'b [&'a str] {
+    args.iter().position(|arg| *arg == "--").map_or(args, |at| &args[..at])
+}
+
+/// The arguments of a guard that is the command of this one (`-- process-tree-guard ...`), when it is one.
+fn nested_guard<'a, 'b>(args: &'b [&'a str]) -> Option<&'b [&'a str]> {
+    let rest = args.get(guard_options(args).len() + 1..)?;
+    let name = std::path::Path::new(rest.first()?).file_stem()?.to_string_lossy().to_ascii_lowercase();
+    (name.starts_with("process-tree-guard") || name.starts_with("process-guard")).then(|| &rest[1..])
+}
+
+/// True when `args` hold a `--max-extension` (or `--max-extension=`) that is over the default cap and within the largest cap,
+/// which a guard would go on to ask a person about. A larger value or one that is not a number is refused by the guard
+/// as an argument error before anything is asked. Only the options of the guard count, not the arguments of its command.
+pub fn asks_for_a_password(args: &[&str]) -> bool {
+    let args = guard_options(args);
+    args.iter().enumerate().any(|(i, arg)| {
+        let value = if *arg == "--max-extension" { args.get(i + 1).copied() } else { arg.strip_prefix("--max-extension=") };
+        value.and_then(|text| text.trim().parse::<f64>().ok()).map_or(false, |seconds| seconds > DEFAULT_CAP && seconds <= 86400.0)
+    })
+}
+
+/// True when the options of a guard make it ask by the console, as the guard reads them: the last `--authenticate` wins (also in
+/// the form `--authenticate=console`), so `--authenticate console --authenticate desktop` is the desktop prompt.
+pub fn asks_by_console(options: &[&str]) -> bool {
+    let method = options.iter().enumerate().rev().find_map(|(at, arg)| {
+        if *arg == "--authenticate" { options.get(at + 1).copied() } else { arg.strip_prefix("--authenticate=") }
+    });
+    method == Some("console")
+}
+
+/// Panic when `args` would make a guard show a prompt: a cap over the default without `--authenticate console`, in the guard or in a
+/// guard that it starts as its command. A test that needs the desktop prompt for such a run does it on a window station that nobody
+/// can see (`hidden-station-guard` of the helper). The scan of the test sources (G93) finds a cap written as a number; this finds
+/// one that is built when the test runs.
+pub fn refuse_prompt(args: &[&str]) {
+    refuse_prompt_of(args, args);
+    for line in guard_lines_in(args) {
+        refuse_prompt_of(&line.iter().map(String::as_str).collect::<Vec<_>>(), args);
+    }
+}
+
+fn refuse_prompt_of(args: &[&str], whole: &[&str]) {
+    let mut current = args;
+    loop {
+        let options = guard_options(current);
+        if asks_for_a_password(options) && !asks_by_console(options) {
+            panic!("a test would run a cap over the default without --authenticate console, which would show a prompt \
+                on the desktop of whoever runs it: {:?}", whole);
+        }
+        match nested_guard(current) {
+            Some(inner) => current = inner,
+            None => return,
+        }
+    }
+}
+
+/// Standard Base64, as far as a test needs to read the command text of a `--command-b64`: text that is not valid gives None.
+fn base64_text(text: &str) -> Option<String> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut out, mut accumulator, mut bits) = (Vec::new(), 0u32, 0u32);
+    for byte in text.trim_end_matches('=').bytes() {
+        accumulator = accumulator << 6 | ALPHABET.iter().position(|letter| *letter == byte)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The texts among `args` that hold a guard line written as one string, to be read by a shell (`cmd /c "guard --extendable
+/// --max-extension CAP"`, `bash -c`, or the decoded text of a `--command-b64`): those that name the option and have more than
+/// one word. Each is returned as its words, with the quotes around a word taken off.
+fn guard_lines_in(args: &[&str]) -> Vec<Vec<String>> {
+    let mut lines = Vec::new();
+    for (at, arg) in args.iter().enumerate() {
+        let decoded = if at > 0 && args[at - 1] == "--command-b64" { base64_text(arg) } else { None };
+        for text in std::iter::once(arg.to_string()).chain(decoded) {
+            if text.contains("--max-extension") && text.chars().any(char::is_whitespace) {
+                lines.push(text.split_whitespace().map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_string()).collect());
+            }
+        }
+    }
+    lines
+}
+
+/// True when the environment variable `name` is set and not empty: the meaning of every variable of the tests that switches a check
+/// on or makes it required, so that `set NAME=` and an empty value in a workflow file mean the same as not setting it.
+pub fn variable_set(name: &str) -> bool {
+    std::env::var_os(name).map_or(false, |value| !value.is_empty())
+}
+
+/// The file names (lower case) of the programs of the guard that run a command. A guard started by one of them is a run that
+/// another guard started, and is refused when it asks for a cap over the default before anything is shown. Any other file name
+/// whose stem ends in -auto counts too, because that ending selects automatic mode (the tests that need one name it themselves).
+pub const GUARD_PROGRAMS: [&str; 7] = [
+    "process-tree-guard.exe", "process-guard.exe", "process-tree-guard-deadline.exe", "process-tree-guard-contain.exe",
+    "process-tree-guard-auto.exe", "process-guard-auto.exe", "process-tree-guard-deadline-auto.exe",
+];
+
+/// The start of the reason a run over the cap is refused for when a guard started it.
+pub const WRAPPED_REASON: &str = "an exception above the cap is not asked for by a run that another guard started";
+
+/// What that reason says when the names above the guard found a program of the guard: the file name follows it.
+pub const FOUND_ABOVE_REASON: &str = "found above the guard: ";
+
+/// What that reason says when the job the guard is in kills its processes when it closes.
+pub const JOB_REASON: &str = "the job the guard is in kills its processes when it closes";
+
+/// The start of the reason a run over the cap with the console method is refused for when its standard input is not a console.
+pub const NO_CONSOLE_REASON: &str = "standard input is not an interactive console";
+
+/// The first program of the guard above the test process, nearest first (its file name), when there is one. The tests are run
+/// under a guard in some places (the command that runs them can be `process-guard -- cargo test`, and a shell can be wrapped by the
+/// automatic wrapper), and then every guard that a test starts is a run that a guard started.
+pub fn guard_above_the_tests() -> Option<String> {
+    static ABOVE: OnceLock<Option<String>> = OnceLock::new();
+    ABOVE.get_or_init(|| {
+        let output = Command::new(testkit()).arg("ancestors").stdin(Stdio::null()).output().expect("run the helper that lists the processes above");
+        String::from_utf8_lossy(&output.stdout).lines().map(str::trim).map(str::to_ascii_lowercase)
+            .find(|name| {
+                GUARD_PROGRAMS.contains(&name.as_str()) || name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem).ends_with("-auto")
+            })
+    }).clone()
+}
+
+/// The account the test process runs as, as the system names it (`DOMAIN\user`, or `NT AUTHORITY\SYSTEM` for a service account),
+/// which is not read from the environment: a launcher can change `USERNAME`, and for a service account it is the name of the computer.
+pub fn own_account() -> String {
+    static ACCOUNT: OnceLock<String> = OnceLock::new();
+    ACCOUNT.get_or_init(|| {
+        let output = Command::new(testkit()).arg("account-name").stdin(Stdio::null()).output().expect("run the helper that names the account");
+        assert!(output.status.success(), "the helper could not read the name of the account");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }).clone()
+}
+
+/// The start of the reason that a run over the cap, started by a test with the console method and a standard input that is not a
+/// console, is refused for: the standard input where no guard is above the test, and the guard above it where one is (the
+/// guard is then asked nothing, whatever its standard input is).
+pub fn nobody_reason() -> &'static str {
+    if guard_above_the_tests().is_some() { WRAPPED_REASON } else { NO_CONSOLE_REASON }
+}
+
+/// The turn of one test process, among all the processes of the session, to start a guard that asks for a password: the
+/// guards of a session take one lock for their prompts, and a guard that finds it taken is refused. The turn is a named mutex of
+/// the session, `Local\ProcessTreeGuardTestsPromptTurn`, which every suite running at the same time takes too. The mutex belongs
+/// to the thread that took it and is released when the turn is dropped.
+pub struct SessionTurn {
+    handle: *mut c_void,
+    held: bool,
+}
+
+/// Wait for the turn for at most ten minutes (a turn is short). If the mutex cannot be made, or the wait ends without it, the test
+/// goes on without the turn, and its own tries (see `prompt_lock_is_taken` in `tests/guard.rs`) are what is left.
+pub fn session_turn() -> SessionTurn {
+    const WAIT_ABANDONED: u32 = 0x80;
+    let name: Vec<u16> = "Local\\ProcessTreeGuardTestsPromptTurn".encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return SessionTurn { handle, held: false };
+    }
+    // An owner that ended without releasing leaves the mutex abandoned, and the wait then gives it to this thread.
+    let result = unsafe { WaitForSingleObject(handle, 600_000) };
+    SessionTurn { handle, held: result == WAIT_OBJECT_0 || result == WAIT_ABANDONED }
+}
+
+impl Drop for SessionTurn {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe {
+                if self.held {
+                    ReleaseMutex(self.handle);
+                }
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+/// `refuse_prompt` for the arguments of a command that is about to be started.
+pub fn refuse_prompt_in(command: &Command) {
+    let args: Vec<String> = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+    refuse_prompt(&args.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
 pub fn guard_cmd(args: &[&str]) -> Command {
+    refuse_prompt(args);
     let mut command = Command::new(guard());
     command.args(args);
     command
@@ -431,6 +656,7 @@ pub fn log_field(line: &str, name: &str) -> Option<String> {
 
 /// Start the guard (or anything else) with all standard streams null.
 pub fn spawn_quiet(program: &str, args: &[&str]) -> Child {
+    refuse_prompt(args);
     Command::new(program)
         .args(args)
         .stdin(Stdio::null())

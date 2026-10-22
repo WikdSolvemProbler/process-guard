@@ -2,7 +2,7 @@
 // Copyright 2026 Peter Shiller
 
 //! Behaviour tests for automatic mode: the wrapper a host puts in front of every
-//! shell command (inventory U1 to U22), including the deadline role and the hook
+//! shell command (inventory U1 to U25), including the deadline role and the hook
 //! role in both install layouts. Git Bash, Windows PowerShell and cmd are
 //! required. The parity table is in tests/PARITY.md.
 
@@ -527,6 +527,66 @@ fn u23_automatic_mode_is_never_extendable_and_asks_the_run_that_encloses_it() {
     let lines = extension_lines(&within.err());
     checks.check("U23", "inside an extendable run a deadline within the cap is granted, logged, and the command runs with its exit code",
         within.code == 5 && lines.len() == 1 && lines[0].contains("requested=3 granted=3 decision=granted"), shown(&within));
+    checks.finish();
+}
+
+// ------------------------- the exception above the cap, and automatic mode (U24)
+
+#[test]
+fn u24_automatic_mode_never_takes_a_cap_over_the_default_and_never_prompts() {
+    let mut checks = Checks::new("automatic mode and the exception");
+    let (_dir, auto) = auto_copy();
+    let tree = Tree::new(Layout::Install, "u24-");
+    let deadline_auto = tree.exe("process-tree-guard-deadline-auto");
+    // Automatic mode refuses the extension options, so a cap over the default, which would need the signed-in user's password, is
+    // refused before anything else. The console method and a standard input that is null or a pipe are used so that, whatever
+    // a defect did, no prompt could show on the desktop of whoever runs the tests.
+    let forms: [(&str, Vec<&str>); 3] = [
+        ("--extendable --max-extension 86400 --authenticate console", vec!["--extendable", "--max-extension", "86400", "--authenticate", "console"]),
+        ("--max-extension 86400 --authenticate console", vec!["--max-extension", "86400", "--authenticate", "console"]),
+        ("--authenticate console", vec!["--authenticate", "console"]),
+    ];
+    for (name, options) in &forms {
+        let mut args = options.clone();
+        args.extend(["--timeout", "5", "--", "echo", "SHOULD_NOT_RUN"]);
+        let mut subcommand_args = vec!["auto"];
+        subcommand_args.extend(args.iter().copied());
+        let by_name = exec(guard_cmd_of(&auto, &args));
+        let by_subcommand = run_guard(&subcommand_args);
+        let by_deadline_role = exec_with(guard_cmd_of(&deadline_auto, &args), Opts { input: Some(b"hunter2\r\n".to_vec()), ..Opts::default() });
+        for (how, result) in [("by the file name -auto", &by_name), ("by the auto subcommand", &by_subcommand),
+            ("by the deadline role's -auto copy, with a pipe on standard input", &by_deadline_role)] {
+            checks.check("U24", &format!("{}, {}: exit 125, the message says automatic mode is never extendable, the command never runs and no exception is logged", name, how),
+                result.code == 125 && result.err().contains("never extendable") && !result.out().contains("SHOULD_NOT_RUN")
+                    && !result.err().contains("decision=exception-") && !result.err().contains("hunter2"), format!("exit {} {} {}", result.code, result.out().trim(), result.err().trim()));
+        }
+    }
+    checks.finish();
+}
+
+// ----- a guard that is the command of automatic mode is not asked, because a guard started it (U25)
+
+#[test]
+fn u25_a_guard_run_as_the_command_of_automatic_mode_is_a_run_that_another_guard_started_and_is_not_asked() {
+    let mut checks = Checks::new("exception under automatic mode");
+    let (_dir, auto) = auto_copy();
+    let dir = TempDir::new("u25-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    // Automatic mode refuses the options itself (U24), but a guard that it runs as its command is not under it in any way that
+    // matters: it is a top-level guard with a fixed-deadline parent, and the exception is decided by it. This is the form a hook
+    // gives a line that carries the options (the rewriting hooks wrap it whole), and the form of every command that an agent runs
+    // under the wrapper. A guard that another guard started is not asked, so that an agent cannot summon a prompt: it is refused
+    // before anything is shown, for that reason, and not as automatic mode, not as nested and not for its standard input.
+    let args = ["--timeout", "30", "--", guard(), "--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--", testkit(), "mark", marker_text.as_str(), "20"];
+    let result = exec(guard_cmd_of(&auto, &args));
+    let lines: Vec<String> = extension_lines(&result.err()).into_iter().filter(|line| line.contains("decision=exception-")).collect();
+    checks.check("U25", "the automatic copy around a guard with a cap over the default: exit 125, one exception-refused line with attempt 0 \
+        and the reason that another guard started it, and the command never runs",
+        result.code == 125 && !marker.exists() && lines.len() == 1 && lines[0].contains("attempt=0") && lines[0].contains(&format!("reason=\"{}", WRAPPED_REASON)),
+        format!("exit {} {} {}", result.code, result.out().trim(), result.err().trim()));
+    checks.check("U25", "and it is not refused as automatic mode, as nested or for its standard input",
+        !result.err().contains("never extendable") && !result.err().contains("inside another run") && !result.err().contains("standard input is not"), result.err().trim().to_string());
     checks.finish();
 }
 

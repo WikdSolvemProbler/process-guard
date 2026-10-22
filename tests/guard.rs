@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the process guard binary (inventory G1 to G85).
+//! Behaviour tests for the process guard binary (inventory G1 to G101).
 //!
 //! They run the built guard, or the one named by PROCESS_TREE_GUARD_EXE (the 1.x
 //! name PROCESS_GUARD_EXE also works), through timeouts, descendant cleanup,
@@ -18,6 +18,7 @@ mod common;
 use common::*;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn reject(checks: &mut Checks, id: &str, name: &str, args: &[&str]) {
     let result = run_guard(args);
@@ -424,7 +425,7 @@ const DESCRIPTIONS: [&str; 4] = ["Process Tree Guard", "Process Tree Guard: Dead
 /// on a continuous integration runner (CI is set) and wherever
 /// PROCESS_TREE_GUARD_REQUIRE_RESOURCES is set, so a toolchain mix-up cannot go green.
 fn resources_required() -> bool {
-    ["CI", "PROCESS_TREE_GUARD_REQUIRE_RESOURCES"].iter().any(|name| std::env::var_os(name).map_or(false, |value| !value.is_empty()))
+    ["CI", "PROCESS_TREE_GUARD_REQUIRE_RESOURCES"].iter().any(|name| variable_set(name))
 }
 
 #[test]
@@ -1157,8 +1158,10 @@ fn g59_extension_arguments_are_checked_before_anything_runs() {
         let result = run_guard(args);
         checks.check("G59", &format!("{}: exit 125 and the command never runs", name), result.code == 125 && !result.out().contains("SHOULD_NOT_RUN"), shown(&result));
     }
-    let high = extendable(&["--max-extension", "86400"], "86400", &[testkit(), "print", "ran"]);
-    checks.check("G59", "--timeout 86400 is allowed when --max-extension is 86400", high.code == 0 && high.out().contains("ran"), shown(&high));
+    // A cap over the default is an exception that needs the signed-in user's password (G87 to G93), so the largest cap is not run here
+    // with no one to ask. The cap itself, with the run's own deadline at it, is allowed.
+    let high = extendable(&["--max-extension", "21600", "--authenticate", "console"], "21600", &[testkit(), "print", "ran"]);
+    checks.check("G59", "--timeout 21600 is allowed when --max-extension is 21600, the default cap", high.code == 0 && high.out().contains("ran"), shown(&high));
     // The options after the command belong to the command.
     let after = guarded("5", &[testkit(), "args-json", "--extendable", "--max-extension"]);
     checks.check("G59", "an option after the command is the command's own argument", after.code == 0 && after.out().contains("[\"--extendable\",\"--max-extension\"]"), shown(&after));
@@ -2115,6 +2118,7 @@ fn g83_a_command_that_ends_on_its_own_inside_its_hold_is_not_reported_as_a_timeo
     // supervisor looks at the command and at the deadline is fixed by the unit test in engine.rs, which fails without the second look.
     let args = extendable_args(&["--max-extension", "20"], "2", &[testkit(), "extend-self", "8", "4"]);
     let began = std::time::Instant::now();
+    refuse_prompt(&args);
     let mut running = Command::new(guard()).args(&args).stdin(Stdio::null()).stdout(files(&out)).stderr(files(&err)).spawn().expect("start the guard");
     let mut stall = stall_supervisor(running.id(), "3", "3");
     let status = wait_limited(&mut running, 40);
@@ -2208,4 +2212,912 @@ fn g86_without_an_audit_file_a_grant_that_no_record_can_hold_is_not_made() {
         ready.trim() == "ready" && piped.code == 125 && piped.err().contains("must be a regular file") && !marker.exists(),
         format!("host {:?}: {}", ready.trim(), shown(&piped)));
     checks.finish();
+}
+
+// ------------------------------- the exception above the cap, which never shows a prompt here (G87 to G94 and G99)
+//
+// A run whose --max-extension is over the default cap needs the signed-in user's password at its start, and the live prompts
+// are a manual check (CONTRIBUTING.md, "Manual check of the prompts"). Every run below that is over the cap says `--authenticate
+// console` and is given a standard input that is null, a pipe or a file, never a console, so that it is refused and no prompt
+// is shown on the desktop of whoever runs the tests. G93 scans the test sources for a run over the cap that does not say so.
+
+/// The arguments of a run over the default cap that can never show a prompt: the console method, with `value` as the cap.
+fn over_cap<'a>(value: &'a str, extra: &[&'a str], child: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--extendable", "--max-extension", value, "--authenticate", "console"];
+    args.extend_from_slice(extra);
+    args.extend(["--timeout", "5", "--"]);
+    args.extend_from_slice(child);
+    args
+}
+
+/// The one log line a refused exception writes, from a standard error text.
+fn exception_refusal(err: &str) -> Option<String> {
+    let lines: Vec<String> = extension_lines(err).into_iter().filter(|line| line.contains("decision=exception-")).collect();
+    if lines.len() == 1 { lines.into_iter().next() } else { None }
+}
+
+#[test]
+fn g87_a_run_over_the_cap_is_refused_when_standard_input_is_not_a_console_and_its_command_never_starts() {
+    let mut checks = Checks::new("exception without a console");
+    if let Some(above) = guard_above_the_tests() {
+        checks.notice(format!("NOT ASSERTED G87 for standard input: {} is above these tests, so each guard they start is refused for that first (see G94) and never reaches the test of its standard input; \
+            a run that is not under a guard asserts it", above));
+    }
+    let dir = TempDir::new("g87-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    let log = text(&dir.join("extension.log"));
+    let child = [testkit(), "mark", marker_text.as_str(), "20"];
+    let typed: &[u8] = b"hunter2\r\nhunter2\r\n";
+    // Standard input that is null, a pipe holding what a person would type, and a file holding it.
+    let file_input = dir.join("input.txt");
+    std::fs::write(&file_input, typed).expect("write the input file");
+    let from_null = run_guard(&over_cap("86400", &[], &child));
+    let from_pipe = exec_with(guard_cmd(&over_cap("86400", &[], &child)), Opts { input: Some(typed.to_vec()), ..Opts::default() });
+    let mut from_file_command = guard_cmd(&over_cap("86400", &[], &child));
+    from_file_command.stdin(Stdio::from(std::fs::File::open(&file_input).expect("open the input file"))).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let from_file_output = from_file_command.output().expect("run the guard");
+    let from_file = Out { code: from_file_output.status.code().unwrap_or(-1) as u32, stdout: from_file_output.stdout, stdout_len: 0, stderr: from_file_output.stderr,
+        elapsed: Duration::ZERO, began_unix_ms: 0 };
+    for (name, result) in [("null", &from_null), ("a pipe", &from_pipe), ("a file", &from_file)] {
+        let line = exception_refusal(&result.err()).unwrap_or_default();
+        checks.check("G87", &format!("standard input is {}: exit 125, the command never runs and the run says why", name),
+            result.code == 125 && !marker.exists() && result.out().is_empty() && result.err().contains("exception refused") && result.err().contains(nobody_reason()), shown(result));
+        checks.check("G87", &format!("standard input is {}: one exception-refused line, attempt 0 (nothing was shown), with the cap in seconds and hours, the guard's own process and the reason", name),
+            line.contains(&format!("requested=86400 hours=24 granted=0 decision=exception-refused attempt=0 reason=\"{}", nobody_reason()))
+                && log_field(&line, "image").as_deref() == Some("process-tree-guard.exe") && log_field(&line, "pid").map_or(false, |pid| pid.parse::<u32>().is_ok())
+                && log_field(&line, "time").map_or(false, |time| time.len() == 24 && time.ends_with('Z')), line.clone());
+        checks.check("G87", &format!("standard input is {}: nothing that was typed is in the log, and no line says the exception was approved", name),
+            !result.err().contains("hunter2") && !result.err().contains("exception-approved"), shown(result));
+        // The record says what the decision was about and for whom: the account the guard runs as and the command line.
+        let (account, command) = (log_field(&line, "account").unwrap_or_default(), log_field(&line, "command").unwrap_or_default());
+        checks.check("G87", &format!("standard input is {}: the line names the account the guard runs as (DOMAIN\\user, as the system names it) and the command line, between the image and the cap", name),
+            account.contains('\\') && account.eq_ignore_ascii_case(&own_account()) && command.contains("testkit") && command.contains("mark")
+                && line.find(" account=").zip(line.find(" requested=")).map_or(false, |(at, cap)| at < cap), line.clone());
+        // And how the user was asked, the deadline the run starts with and the process that started the guard (this test program).
+        let this_program = std::env::current_exe().ok().and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase())).unwrap_or_default();
+        checks.check("G87", &format!("standard input is {}: the line names the method (console), the deadline the run starts with (5 seconds) and the process that started the guard, after the command", name),
+            log_field(&line, "method").as_deref() == Some("console") && log_field(&line, "timeout").as_deref() == Some("5")
+                && log_field(&line, "started_by").map_or(false, |starter| !this_program.is_empty() && starter.to_ascii_lowercase().ends_with(&this_program))
+                && line.find(" command=").zip(line.find(" method=")).map_or(false, |(at, method)| at < method)
+                && line.find(" started_by=").zip(line.find(" requested=")).map_or(false, |(at, cap)| at < cap), line.clone());
+    }
+    checks.timing("G87", "the refusal is at once: nobody is waited for", from_null.elapsed.as_secs_f64() < 5.0 * UNIT + GRACE, shown(&from_null));
+    // The same line is in the audit file, and the file is the record when there is one.
+    let filed = run_guard(&over_cap("86400", &["--extension-log", log.as_str()], &child));
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    checks.check("G87", "the audit file holds the same line as standard error",
+        filed.code == 125 && !marker.exists() && contents.lines().eq(extension_lines(&filed.err()).iter().map(String::as_str)) && contents.lines().count() == 1, format!("{} / {:?}", shown(&filed), contents));
+    // Every cap over the default is an exception, down to the smallest step over it.
+    for value in ["21600.5", "21601", "43200", "86399", "86400"] {
+        let result = run_guard(&over_cap(value, &[], &child));
+        checks.check("G87", &format!("a cap of {} is over the default and is refused the same way", value),
+            result.code == 125 && !marker.exists() && exception_refusal(&result.err()).map_or(false, |line| line.contains("decision=exception-refused")), shown(&result));
+    }
+    // A shell run is an exception too: the encoded command is not run.
+    let payload = base64(b"echo SHOULD_NOT_RUN");
+    let via_shell = run_guard(&["--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--shell", "cmd", "--command-b64", payload.as_str()]);
+    checks.check("G87", "the shell form of a run over the cap is refused with 125 and its command never runs",
+        via_shell.code == 125 && !via_shell.out().contains("SHOULD_NOT_RUN") && exception_refusal(&via_shell.err()).is_some(), shown(&via_shell));
+    // The widest request there is: the largest first deadline under the largest cap goes through the argument checks to the decision.
+    let widest = run_guard(&["--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "86400", "--", testkit(), "mark", marker_text.as_str(), "20"]);
+    checks.check("G87", "the largest deadline under the largest cap passes the argument checks and is refused as an exception for its standard input",
+        widest.code == 125 && !marker.exists() && !widest.err().contains("is over --max-extension")
+            && exception_refusal(&widest.err()).map_or(false, |line| line.contains("requested=86400 hours=24") && line.contains(nobody_reason())), shown(&widest));
+    checks.finish();
+}
+
+#[test]
+fn g88_the_authenticate_option_takes_desktop_or_console_and_belongs_to_extendable_runs() {
+    let mut checks = Checks::new("authenticate argument");
+    let print = [testkit(), "print", "SHOULD_NOT_RUN"];
+    let mut cases: Vec<(String, Vec<&str>, &str)> = Vec::new();
+    for bad in ["bogus", "Console", "DESKTOP", "windows-hello", "", "console "] {
+        cases.push((format!("--authenticate {:?}", bad), [vec!["--extendable", "--authenticate", bad, "--timeout", "5", "--"], print.to_vec()].concat(), "invalid choice"));
+    }
+    cases.push(("--authenticate=bogus".into(), [vec!["--extendable", "--authenticate=bogus", "--timeout", "5", "--"], print.to_vec()].concat(), "invalid choice"));
+    cases.push(("--authenticate with no value".into(), vec!["--extendable", "--timeout", "5", "--authenticate"], "expected one argument"));
+    cases.push(("--authenticate console without --extendable".into(), [vec!["--authenticate", "console", "--timeout", "5", "--"], print.to_vec()].concat(), "need --extendable"));
+    cases.push(("--authenticate desktop without --extendable".into(), [vec!["--authenticate", "desktop", "--timeout", "5", "--"], print.to_vec()].concat(), "need --extendable"));
+    cases.push(("--authenticate bogus without --extendable".into(), [vec!["--authenticate", "bogus", "--timeout", "5", "--"], print.to_vec()].concat(), "invalid choice"));
+    for (name, args, message) in &cases {
+        let result = run_guard(args);
+        checks.check("G88", &format!("{}: exit 125, the reason is given and the command never runs", name),
+            result.code == 125 && !result.out().contains("SHOULD_NOT_RUN") && result.err().contains(message), shown(&result));
+    }
+    // After the command it is the command's own argument.
+    let after = guarded("5", &[testkit(), "args-json", "--authenticate", "bogus"]);
+    checks.check("G88", "an --authenticate after the command is the command's own argument", after.code == 0 && after.out().contains("[\"--authenticate\",\"bogus\"]"), shown(&after));
+    // The usage names the option.
+    let help = run_guard(&["--help"]);
+    checks.check("G88", "--help names --authenticate with its two values", help.code == 0 && help.out().contains("[--authenticate {desktop,console}]"), shown(&help));
+    checks.finish();
+}
+
+#[test]
+fn g89_the_deadline_role_refuses_a_run_over_the_cap_the_same_way_in_both_layouts() {
+    let mut checks = Checks::new("exception in the deadline role");
+    let dir = TempDir::new("g89-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    let child = [testkit(), "mark", marker_text.as_str(), "20"];
+    for layout in LAYOUTS {
+        let tree = Tree::new(layout, "g89-");
+        let deadline = tree.exe(ROLES[1]);
+        let args = over_cap("86400", &[], &child);
+        let from_null = run_named(&deadline, &args, None);
+        let from_pipe = run_named(&deadline, &args, Some(b"hunter2\r\n"));
+        for (name, result) in [("null", &from_null), ("a pipe", &from_pipe)] {
+            let line = exception_refusal(&result.err()).unwrap_or_default();
+            checks.check("G89", &format!("the deadline role in the {}, standard input {}: exit 125, an exception-refused line naming the role, and the command never runs", layout.name(), name),
+                result.code == 125 && !marker.exists() && line.contains("attempt=0") && line.contains(nobody_reason())
+                    && log_field(&line, "image").as_deref() == Some("process-tree-guard-deadline.exe"), format!("{} / {}", shown(result), line));
+        }
+    }
+    checks.finish();
+}
+
+#[test]
+fn g90_the_contain_role_takes_no_authenticate_option_and_is_not_an_exception() {
+    let mut checks = Checks::new("exception in the contain role");
+    let contain = role(ROLES[3]);
+    let print = [testkit(), "print", "SHOULD_NOT_RUN"];
+    for (name, args) in [
+        ("--authenticate alone", [vec!["--authenticate", "console", "--timeout", "5", "--"], print.to_vec()].concat()),
+        ("--max-extension 86400 with --authenticate console", [vec!["--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--"], print.to_vec()].concat()),
+        ("--extendable with --authenticate console", [vec!["--extendable", "--authenticate", "console", "--timeout", "5", "--"], print.to_vec()].concat()),
+    ] {
+        let alone = run_named(contain, &args, None);
+        checks.check("G90", &format!("the contain role with {} outside a run: exit 125 as an unrecognized argument, and nothing runs", name),
+            alone.code == 125 && alone.err().contains("unrecognized arguments") && !alone.out().contains("SHOULD_NOT_RUN") && extension_lines(&alone.err()).is_empty(), shown(&alone));
+        let mut inside_args = vec![contain];
+        inside_args.extend(args.iter().copied());
+        let inside = extendable(&[], "30", &inside_args);
+        checks.check("G90", &format!("the contain role with {} inside an extendable run: exit 125 as an unrecognized argument, no exception line and nothing runs", name),
+            inside.code == 125 && inside.err().contains("unrecognized arguments") && !inside.out().contains("SHOULD_NOT_RUN")
+                && !inside.err().contains("decision=exception-"), shown(&inside));
+    }
+    checks.finish();
+}
+
+#[test]
+fn g91_a_run_over_the_cap_inside_another_run_is_refused_before_anyone_is_asked() {
+    let mut checks = Checks::new("exception inside a run");
+    let dir = TempDir::new("g91-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    // The outer run is at the default cap, with no audit file, so its grant is on standard error before it is answered; the
+    // nested guard asks for a cap of 86400 with the console method and has a standard input that is not a console. It is refused
+    // as nested, which comes first, and not for its standard input.
+    let nested = extendable(&[], "30", &[guard(), "--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "10", "--", testkit(), "mark", marker_text.as_str(), "20"]);
+    let lines = extension_lines(&nested.err());
+    let position = |needle: &str| lines.iter().position(|line| line.contains(needle));
+    checks.check("G91", "the nested guard exits 125 with the nested reason, and its command never runs",
+        nested.code == 125 && !marker.exists() && nested.err().contains("exception refused: an exception above the cap cannot be granted inside another run"), shown(&nested));
+    checks.check("G91", "the line says exception-refused, attempt 0 (none was made) and the nested reason, not the reason of standard input",
+        lines.iter().any(|line| line.contains("requested=86400 hours=24 granted=0 decision=exception-refused attempt=0 reason=\"an exception above the cap cannot be granted inside another run\""))
+            && !nested.err().contains("standard input"), format!("{:?}", lines));
+    checks.check("G91", "the nested guard is refused before it asks the outer run for anything, so the outer run granted it no hold: the only line is the refusal",
+        lines.len() == 1 && position("decision=granted").is_none() && position("decision=exception-refused").is_some(), format!("{:?}", lines));
+    checks.finish();
+}
+
+#[test]
+fn g92_a_cap_at_or_below_the_default_never_prompts_and_runs_as_before() {
+    let mut checks = Checks::new("no exception at the default cap");
+    // `--authenticate console` is read and ignored at or below the default cap. If a run at the cap did ask, the console
+    // method would refuse it here (standard input is null), so these runs prove that it did not.
+    let dir = TempDir::new("g92-");
+    let log = text(&dir.join("extension.log"));
+    for (name, options, timeout) in [
+        ("--max-extension 21600 with --timeout 21600, the cap itself", vec!["--max-extension", "21600", "--authenticate", "console"], "21600"),
+        ("--max-extension 21600 with a short timeout", vec!["--max-extension", "21600", "--authenticate", "console"], "5"),
+        ("a lower cap", vec!["--max-extension", "100", "--authenticate", "console"], "100"),
+        ("no cap given, which is the default", vec!["--authenticate", "console"], "21600"),
+        ("a cap of one second", vec!["--max-extension", "1", "--authenticate", "console"], "1"),
+    ] {
+        let result = extendable(&options, timeout, &[testkit(), "args-exit", "7", "ran"]);
+        checks.check("G92", &format!("{}: the command runs and its exit code passes through, with no exception line", name),
+            result.code == 7 && result.out().contains("[\"ran\"]") && !result.err().contains("decision=exception-") && !result.err().contains("exception refused"), shown(&result));
+    }
+    let piped = exec_with(guard_cmd(&extendable_args(&["--max-extension", "21600", "--authenticate", "console", "--extension-log", log.as_str()], "21600", &[testkit(), "print", "ran"])),
+        Opts { input: Some(b"hunter2\r\n".to_vec()), ..Opts::default() });
+    checks.check("G92", "with standard input a pipe the run at the cap is not refused for it, and the audit file has no exception line",
+        piped.code == 0 && piped.out().contains("ran") && !std::fs::read_to_string(&log).unwrap_or_default().contains("exception"), shown(&piped));
+    // A cap over the default is the only thing that changes it: the same arguments one second over are refused.
+    let over = run_guard(&over_cap("21601", &[], &[testkit(), "print", "SHOULD_NOT_RUN"]));
+    checks.check("G92", "one second over the default cap, the same arguments are an exception and are refused", over.code == 125 && !over.out().contains("SHOULD_NOT_RUN"), shown(&over));
+    checks.finish();
+}
+
+/// The part of a line of source that is the options of a guard: up to the first `--` that ends them, written as a quoted
+/// element (`"--"`) or as a word of a command line (` -- `). What follows is the command that is run, whose own arguments are
+/// not options of the guard.
+fn guard_part(line: &str) -> &str {
+    [line.find("\"--\""), line.find(" -- ")].into_iter().flatten().min().map_or(line, |at| &line[..at])
+}
+
+/// The lines of `source` that write a `--max-extension` over the default cap as a number (after the option, past quotes,
+/// commas, spaces and an equals sign) without `--authenticate` on the same line, both in the options of the guard: an option that
+/// follows a `--` belongs to the command. A value that is a variable is not a number.
+fn over_cap_without_authenticate(source: &str) -> Vec<String> {
+    let option = "--max-extension";
+    let mut found = Vec::new();
+    for line in source.lines() {
+        let part = guard_part(line);
+        let mut rest = part;
+        while let Some(at) = rest.find(option) {
+            rest = &rest[at + option.len()..];
+            let value: String = rest.trim_start_matches(|c: char| matches!(c, '"' | ',' | ' ' | '=')).chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            if value.parse::<f64>().map_or(false, |seconds| seconds > 21600.0) && !part.contains("--authenticate") {
+                found.push(line.trim().to_string());
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no_stub() {
+    let mut checks = Checks::new("exception guard rails");
+    // The scanner, on text that is built so that these lines are not themselves a hit.
+    let sample = |value: &str, authenticate: &str| format!("let a = [\"--extendable\", \"--max-extension\", \"{}\"{}];\nlet b = format!(\"--extendable --max-extension {} {}\");", value, authenticate, value, authenticate);
+    let flagged = over_cap_without_authenticate(&sample("86400", ""));
+    let covered = over_cap_without_authenticate(&sample("86400", ", \"--authenticate\", \"console\""));
+    let at_cap = over_cap_without_authenticate(&sample("21600", ""));
+    let equals = over_cap_without_authenticate(&format!("x --max-extension={} y", "21601"));
+    let variable = over_cap_without_authenticate("[\"--max-extension\", bad, \"--timeout\"]");
+    checks.check("G93", "the scan flags a number over the cap written without --authenticate, in a list and in a string, and the form with an equals sign",
+        flagged.len() == 2 && equals.len() == 1, format!("{:?} {:?}", flagged, equals));
+    checks.check("G93", "and passes the same text with --authenticate, a value at the cap, and a value that is a variable", covered.is_empty() && at_cap.is_empty() && variable.is_empty(), format!("{:?} {:?} {:?}", covered, at_cap, variable));
+    // Only the options of the guard count: a cap that follows a `--` is an argument of the command, and an `--authenticate console`
+    // that follows it is not the guard's.
+    let option = "--max-extension";
+    let cap = 86_400.to_string();
+    let after_dashes = over_cap_without_authenticate(&format!("[\"--timeout\", \"5\", \"--\", \"tool\", \"{} {}\"]\nx --timeout 5 -- tool {} {}", option, cap, option, cap));
+    let console_after = over_cap_without_authenticate(&format!("[\"--extendable\", \"{}\", \"{}\", \"--\", \"tool\", \"--authenticate\", \"console\"]\nx {} {} -- tool --authenticate console", option, cap, option, cap));
+    checks.check("G93", "the scan passes a cap that follows the `--` of a guard, and flags a cap whose --authenticate console follows it",
+        after_dashes.is_empty() && console_after.len() == 2, format!("{:?} {:?}", after_dashes, console_after));
+    let sources = [("guard.rs", include_str!("guard.rs")), ("auto.rs", include_str!("auto.rs")), ("battery.rs", include_str!("battery.rs")),
+        ("antigravity.rs", include_str!("antigravity.rs")), ("common/mod.rs", include_str!("common/mod.rs"))];
+    for (name, source) in sources {
+        let hits = over_cap_without_authenticate(source);
+        checks.check("G93", &format!("{}: no line names a --max-extension over the default cap without --authenticate, so no test can show a prompt", name), hits.is_empty(), format!("{:?}", hits));
+    }
+    // The stubs exist only in the unit tests: the production part of the module has the three real types and nothing that reads
+    // an environment variable or a file, and the manifest has no feature that could select anything.
+    let auth = include_str!("../src/auth.rs").replace("\r\n", "\n");
+    let (production, unit_tests) = auth.split_once("#[cfg(test)]\nmod tests {").unwrap_or((auth.as_str(), ""));
+    checks.check("G93", "src/auth.rs: the production part implements Prompt for the desktop and console prompts and Verifier for the system logon only",
+        production.matches("impl Prompt for ").count() == 2 && production.contains("impl Prompt for DesktopPrompt") && production.contains("impl Prompt for ConsolePrompt")
+            && production.matches("impl Verifier for ").count() == 1 && production.contains("impl Verifier for LogonVerifier") && !production.contains("Stub"), "");
+    checks.check("G93", "src/auth.rs: both prompts make all their calls on one thread of a run (the desktop prompt too: a second call on a new thread was cancelled at once for the console prompt)",
+        production.matches("worker: std::cell::RefCell<Option<PromptWorker>>").count() == 2 && !production.contains("fn ask_bounded"), "");
+    checks.check("G93", "src/auth.rs: the stubs are in the unit test module, which is compiled for tests only",
+        unit_tests.contains("impl Prompt for StubPrompt") && unit_tests.contains("impl Verifier for StubVerifier"), "");
+    checks.check("G93", "src/auth.rs: the production part reads no environment variable, no file and no argument",
+        !production.contains("env::") && !production.contains("std::fs") && !production.contains("File::") && !production.contains("args"), "");
+    // A guard that another guard started is refused after the refusal of a nested run and before any prompt, lock or logon, by the
+    // names of the programs of the guard that the tests know too.
+    let within = production.find("pub(crate) fn decide(").map_or("", |at| &production[at..]);
+    let at_in = |needle: &str| within.find(needle).unwrap_or(usize::MAX);
+    checks.check("G93", "src/auth.rs: the refusals of a run that another guard started (by the names above it and by its job) come after the refusal of a nested run \
+        and before the prompts and the logon, and every program the tests know is in the list",
+        at_in("&subject, 0, NESTED") < at_in("guard_above(ancestors)") && at_in("guard_above(ancestors)") < at_in("DesktopPrompt::new(")
+            && at_in("guard_above(ancestors)") < at_in("ConsolePrompt::new(") && at_in("guard_above(ancestors)") < at_in("LogonVerifier { owners }")
+            && at_in("&subject, 0, NESTED") < at_in("in_guard_job()") && at_in("in_guard_job()") < at_in("DesktopPrompt::new(") && at_in("in_guard_job()") < at_in("ConsolePrompt::new(")
+            && production.contains("fn in_guard_job() -> bool") && production.contains("limit_flags & KILL_ON_JOB_CLOSE != 0")
+            && production.contains(&format!("const GUARD_PROGRAMS: [&str; {}]", GUARD_PROGRAMS.len()))
+            && GUARD_PROGRAMS.iter().all(|name| production.contains(&format!("\"{}\"", name))), "");
+    // No test source holds a NUL byte (the escape `\0` is used instead), which makes editors and search tools take the file for a binary.
+    let binary_sources: [(&str, &[u8]); 6] = [("guard.rs", include_bytes!("guard.rs")), ("auto.rs", include_bytes!("auto.rs")), ("battery.rs", include_bytes!("battery.rs")),
+        ("antigravity.rs", include_bytes!("antigravity.rs")), ("common/mod.rs", include_bytes!("common/mod.rs")), ("testkit.rs", include_bytes!("../src/bin/testkit.rs"))];
+    for (name, bytes) in binary_sources {
+        checks.check("G93", &format!("{}: no NUL byte in the source, so that editors and search tools do not take it for a binary file", name), !bytes.contains(&0), "");
+    }
+    let manifest = include_str!("../Cargo.toml").replace("\r\n", "\n");
+    let features = manifest.split("[features]\n").nth(1).unwrap_or("").split("\n[").next().unwrap_or("").trim().to_string();
+    checks.check("G93", "Cargo.toml declares no feature but the test helper's, so no feature can build a stub into a program", features == "testkit = []", features.clone());
+    // And no other part of a program can differ between a test build and a release: nothing is compiled by a feature or by the
+    // debug setting, and the only items compiled for a build that is not a test are the wait and the choice of the thread
+    // whose buffers the panic hook zeroes, both in `src/auth.rs`, which the unit tests replace with their own and which decide nothing.
+    let program_sources = [("auth.rs", include_str!("../src/auth.rs")), ("cli.rs", include_str!("../src/cli.rs")), ("engine.rs", include_str!("../src/engine.rs")),
+        ("extend.rs", include_str!("../src/extend.rs")), ("hook.rs", include_str!("../src/hook.rs")), ("lib.rs", include_str!("../src/lib.rs")),
+        ("sys.rs", include_str!("../src/sys.rs")), ("base64.rs", include_str!("../src/base64.rs")), ("main.rs", include_str!("../src/main.rs")),
+        ("process-tree-guard-contain.rs", include_str!("../src/bin/process-tree-guard-contain.rs")), ("process-tree-guard-deadline.rs", include_str!("../src/bin/process-tree-guard-deadline.rs")),
+        ("process-tree-guard-gate.rs", include_str!("../src/bin/process-tree-guard-gate.rs"))];
+    let counted = |needles: &[&str]| -> Vec<(String, usize)> {
+        program_sources.iter().map(|(name, source)| {
+            let source = source.replace("\r\n", "\n");
+            (name.to_string(), needles.iter().map(|needle| source.matches(needle).count()).sum())
+        }).filter(|(_, count)| *count > 0).collect()
+    };
+    checks.check("G93", "src/: no file is compiled by a feature or by the debug setting, so no branch can skip the decision in a release",
+        counted(&["cfg(feature", "cfg!(feature", "feature = \"", "debug_assert"]).is_empty(), format!("{:?}", counted(&["cfg(feature", "cfg!(feature", "feature = \"", "debug_assert"])));
+    let not_test = counted(&["cfg(not(test))", "cfg!(not(test"]);
+    let auth_source = include_str!("../src/auth.rs").replace("\r\n", "\n");
+    checks.check("G93", "src/: the only items compiled for a build that is not a test are the wait and the choice of the thread for the panic hook in src/auth.rs (`fn wait_ms`, `fn only_this_thread`), which decide nothing",
+        not_test == [("auth.rs".to_string(), 2)] && auth_source.contains("#[cfg(not(test))]\nfn wait_ms(normal: u64, _cooling: bool) -> u64 {\n    normal\n}")
+            && auth_source.contains("#[cfg(not(test))]\nfn only_this_thread() -> Option<std::thread::ThreadId> {\n    None\n}")
+            && auth_source.contains("#[cfg(test)]\nstatic HOOK_FOR_THIS_THREAD"), format!("{:?}", not_test));
+    // The order that keeps a prompt from showing for a run that cannot start, and the refusals that never reach it.
+    let engine = include_str!("../src/engine.rs").replace("\r\n", "\n");
+    let at = |needle: &str| engine.find(needle).unwrap_or(usize::MAX);
+    let last = |needle: &str| engine.rfind(needle).unwrap_or(0);
+    checks.check("G93",
+        "src/engine.rs: the command is resolved, a run inside another run is refused before it asks that run for anything, the run is then registered with an enclosing run, and the decision comes after that and before the job is made",
+        at("let executable = which(") < at("if enclosed() {") && at("if enclosed() {") < at("auth::decide(") && at("auth::decide(") < at("register_start(seconds")
+            && at("register_start(seconds") < last("auth::decide(") && last("auth::decide(") < at("CreateJobObjectW(std::ptr::null_mut()") && engine.matches("auth::decide(").count() == 2, "");
+    checks.check("G93", "src/engine.rs: the log is opened before the starter is, the handle of the starter that the prompt watched is the one the run is watched against, and the run does not open its parent a second time",
+        at("open_log(settings)") < at("auth::Owners::open(") && at("auth::Owners::open(") < last("auth::decide(") && at("owners.into_handles()") < at("CreateJobObjectW(std::ptr::null_mut()")
+            && engine.matches("OpenProcess(SYNCHRONIZE, 0, *id)").count() == 1 && engine.contains("} else if kept.is_empty() {"), "");
+    checks.check("G93", "src/engine.rs: the live processes above the guard that the search reaches are read before the decision and handed to it, so the decision can refuse a run that another guard started",
+        at("ancestor_images()") < last("auth::decide(") && engine.contains("&parent, &ancestors, &owners, &opened"), "");
+    let cli = include_str!("../src/cli.rs").replace("\r\n", "\n");
+    checks.check("G93", "src/cli.rs: automatic mode refuses --authenticate with the other extension options",
+        cli.contains("\"--extendable\" | \"--max-extension\" | \"--extension-log\" | \"--authenticate\" => {"), "");
+    // The check that runs when a test runs: a cap that is built by the test, and so is not a number in its source, is caught by the helpers.
+    let panics = |args: &[&str]| std::panic::catch_unwind(|| refuse_prompt(args)).is_err();
+    let (built, over, largest, beyond) = (format!("{}", 86_400), "21601", "86400", "86401");
+    let equals = format!("--max-extension={}", largest);
+    checks.check("G93", "a cap over the default that a test builds, without the console method, makes the helper panic before anything starts",
+        panics(&["--extendable", "--max-extension", built.as_str(), "--timeout", "5"]) && panics(&[equals.as_str()]) && panics(&["--extendable", "--max-extension", over]), "");
+    checks.check("G93", "and the same with the console method, a cap at the default, or a value the guard refuses as an argument error before it asks, does not",
+        !panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate", "console"]) && !panics(&["--authenticate=console", equals.as_str()])
+            && !panics(&["--max-extension", "21600"]) && !panics(&["--max-extension", beyond]) && !panics(&["--max-extension", "inf"]) && !panics(&["--max-extension", "x"])
+            && !panics(&["--timeout", "5", "--", "tool"]), "");
+    checks.check("G93", "only the options of the guard count: an --authenticate console after the -- is the command's, so the cap still makes the helper panic; \
+        a cap after it is the command's too, so it does not; a guard that is the command is checked by its own options",
+        panics(&["--extendable", "--max-extension", built.as_str(), "--timeout", "5", "--", "tool", "--authenticate", "console"])
+            && !panics(&["--timeout", "5", "--", "tool", "--max-extension", largest])
+            && panics(&["--timeout", "5", "--", "process-tree-guard.exe", "--extendable", "--max-extension", largest, "--timeout", "5"])
+            && !panics(&["--timeout", "5", "--", "process-tree-guard.exe", "--extendable", "--max-extension", largest, "--authenticate", "console", "--timeout", "5"]), "");
+    // A guard line built at run time and passed as one string to a shell is read too: as an argument of the shell, or as the decoded
+    // text of a `--command-b64`.
+    let line = format!("x --extendable --max-extension {}", built);
+    let line_console = format!("{} --authenticate console", line);
+    let (encoded, encoded_console) = (base64(line.as_bytes()), base64(line_console.as_bytes()));
+    checks.check("G93", "a guard line that a test builds and passes as one string to a shell makes the helper panic, as an argument or as the text of a --command-b64, and does not with the console method",
+        panics(&["cmd", "/c", line.as_str()]) && panics(&["bash", "-c", line.as_str()]) && panics(&["--shell", "cmd", "--command-b64", encoded.as_str()])
+            && panics(&["--timeout", "5", "--", "cmd", "/c", line.as_str()])
+            && !panics(&["cmd", "/c", line_console.as_str()]) && !panics(&["--shell", "cmd", "--command-b64", encoded_console.as_str()])
+            && !panics(&["cmd", "/c", "echo --max-extension 21600"]) && !panics(&["--command-b64", "not base64 --max-extension"]), "");
+    // An option given twice is read as the guard reads it, the last one winning: a console method that is taken back by a later
+    // desktop method is the desktop method.
+    checks.check("G93", "an --authenticate given twice counts as the last one: console then desktop makes the helper panic, desktop then console does not (also with an equals sign)",
+        panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate", "console", "--authenticate", "desktop"])
+            && panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate=console", "--authenticate=desktop"])
+            && panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate", "console", "--authenticate=desktop"])
+            && !panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate", "desktop", "--authenticate", "console"])
+            && !panics(&["--extendable", "--max-extension", built.as_str(), "--authenticate=desktop", "--authenticate=console"])
+            && asks_by_console(&["--authenticate", "console"]) && !asks_by_console(&["--authenticate", "console", "--authenticate", "desktop"]) && !asks_by_console(&["--timeout", "5"]), "");
+    // The same rule in the helper that runs a guard in a pseudo console. It is tried with a cap of 100, which never asks, so that a
+    // fault in the rule could not put a prompt on the screen. Only the options of the guard count, and the last one wins.
+    let pty = |options: &[&str]| -> i32 {
+        let mut args = vec!["pty-guard", "5", guard(), "--extendable", "--max-extension", "100", "--timeout", "5"];
+        args.extend_from_slice(options);
+        args.extend(["--", testkit(), "args-json", "--authenticate", "console"]);
+        Command::new(testkit()).args(&args).stdin(std::process::Stdio::null()).output().map_or(-1, |output| output.status.code().unwrap_or(-1))
+    };
+    checks.check("G93", "the helper that runs a guard in a pseudo console refuses a guard without --authenticate console, whatever its command's arguments say, and one whose last --authenticate is not console",
+        pty(&[]) == 97 && pty(&["--authenticate", "desktop"]) == 97 && pty(&["--authenticate", "console", "--authenticate", "desktop"]) == 97
+            && pty(&["--authenticate=console", "--authenticate=desktop"]) == 97 && pty(&["--authenticate", "bogus"]) == 97, "");
+    checks.check("G93", "and it starts one whose last --authenticate is console, in either form",
+        pty(&["--authenticate", "desktop", "--authenticate", "console"]) != 97 && pty(&["--authenticate=console"]) != 97, "");
+    let started = std::panic::catch_unwind(|| guard_cmd(&["--extendable", "--max-extension", largest])).is_err()
+        && std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut command = Command::new(guard());
+            command.args(["--extendable", "--max-extension", largest]);
+            exec(command)
+        })).is_err()
+        && std::panic::catch_unwind(|| spawn_quiet(guard(), &["--extendable", "--max-extension", largest])).is_err();
+    checks.check("G93", "the helpers that start a guard (guard_cmd, exec, spawn_quiet) panic on such a cap, so no entry point starts one", started, "");
+    checks.finish();
+}
+
+// ------- a guard that another guard started is not asked, whether or not that guard is extendable (G94)
+
+#[test]
+fn g94_a_guard_that_another_guard_started_is_not_asked_even_when_that_guard_is_not_extendable() {
+    let mut checks = Checks::new("exception under a plain guard");
+    let dir = TempDir::new("g94-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    // Only a guard inside an extendable run is nested. This one is inside a guard with a fixed deadline and no channel, so it is
+    // a top-level run, not a nested one. A guard started by another guard is not asked either: a command that an agent runs under
+    // the automatic wrapper is such a run, and the agent must not be able to summon a prompt. It is refused before anything is
+    // shown, for the guard above it, and not for its standard input (null here) or as nested.
+    let inner = [guard(), "--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--", testkit(), "mark", marker_text.as_str(), "20"];
+    let result = guarded("30", &inner);
+    let line = exception_refusal(&result.err()).unwrap_or_default();
+    checks.check("G94", "a plain guard around an extendable guard over the cap: the inner guard is refused because another guard started it, with attempt 0, and its command never runs",
+        result.code == 125 && !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), shown(&result));
+    checks.check("G94", "the reason says what to do (start it from a terminal that is not under a guard), and the refusal is neither for its standard input nor as nested, which it is not",
+        result.err().contains("start it from a terminal that is not under a guard") && !result.err().contains("standard input is not") && !result.err().contains("inside another run") && !line.contains("inside another run"), shown(&result));
+    // Piped input changes nothing: no input can answer a prompt that is not shown.
+    let piped = exec_with(guard_cmd(&[vec!["--timeout", "30", "--"], inner.to_vec()].concat()), Opts { input: Some(b"hunter2\r\n".to_vec()), ..Opts::default() });
+    checks.check("G94", "with a pipe on standard input: the same refusal, and nothing that was typed is in the output",
+        piped.code == 125 && !marker.exists() && piped.err().contains(WRAPPED_REASON) && !piped.err().contains("hunter2") && !piped.out().contains("hunter2"), shown(&piped));
+    checks.finish();
+}
+
+// ---- the desktop prompt is refused where nobody can see it, through the real window station test (G95)
+
+/// The cap that the hidden station test asks for: a variable and not a number written after the option, because this is the one
+/// run over the cap that does not say `--authenticate console`. It asks by the default method, on a window station that is not
+/// visible, which the helper makes and checks before it starts anything. This is the one test whose failure mode is a real
+/// prompt: if the guard's test for a window station that is not visible were defective, the secure prompt could appear on the
+/// desktop of whoever runs the suite, and where it would appear is not established. The test therefore runs only where
+/// PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set (the continuous integration workflow sets it; CI alone does not, since
+/// it is set on machines where a person sits), the helper waits only ten seconds for the refusal, which is immediate,
+/// and the manual check (CONTRIBUTING.md, step 11) runs this test once with the screen watched.
+const HIDDEN_STATION_CAP: &str = "86400";
+
+/// True, after reporting it, when a guard is above the tests: a guard that a test starts is then a run that another guard started
+/// and is refused for that before its window station or its console is looked at, so the check that needs them cannot be made.
+/// It is a failure where `require` names the variable that makes the check required (the continuous integration workflow sets
+/// it, and runs the tests under no guard), and otherwise a notice that the check was not asserted. The caller finishes and returns.
+fn under_a_guard(checks: &mut Checks, id: &str, require: &str, needs: &str) -> bool {
+    let Some(above) = guard_above_the_tests() else { return false };
+    checks.check(id, &format!("no guard is above the tests, so that the guard a test starts reaches {} (not asserted where one is, unless {} is set)", needs, require),
+        !variable_set(require), above.clone());
+    checks.notice(format!("NOT ASSERTED {}: {} is above these tests, so the guard they start is refused as a run that another guard started, before {} is looked at", id, above, needs));
+    true
+}
+
+/// True where the test on a window station that is not visible may run: wherever
+/// PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set and not empty.
+fn desktop_prompt_test_wanted() -> bool {
+    variable_set("PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST")
+}
+
+#[test]
+fn g95_the_desktop_prompt_is_refused_without_being_shown_on_a_window_station_that_is_not_visible() {
+    let mut checks = Checks::new("exception on a hidden window station");
+    if !desktop_prompt_test_wanted() {
+        checks.notice("G95 NOT ASSERTED: the test on a window station that is not visible runs only when PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set, \
+            because a defect it exists to find would show a real prompt");
+        checks.finish();
+        return;
+    }
+    if under_a_guard(&mut checks, "G95", "PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION", "the window station") {
+        checks.finish();
+        return;
+    }
+    let dir = TempDir::new("g95-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    let mut command = Command::new(testkit());
+    command.args(["hidden-station-guard", guard(), HIDDEN_STATION_CAP, "5", testkit(), "mark", marker_text.as_str(), "20"]);
+    let result = exec(command);
+    if result.code == 96 {
+        // The helper could not make a window station (some hosts refuse a process that is not a service). Nothing was started.
+        let required = variable_set("PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION");
+        checks.check("G95", "the helper makes a window station that is not visible (not asserted where the host refuses it, unless PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION is set)",
+            !required, shown(&result));
+        checks.notice(format!("NOT ASSERTED G95: no window station could be made here: {}", shown(&result)));
+        checks.finish();
+        return;
+    }
+    let line = exception_refusal(&result.err()).unwrap_or_default();
+    checks.check("G95", "the guard on a window station that is not visible, with the default method: exit 125, nothing shown, and its command never runs",
+        result.code == 125 && !marker.exists() && result.out().is_empty() && result.err().contains("exception refused"), shown(&result));
+    checks.check("G95", "one exception-refused line, attempt 0, with the reason that the process has no interactive window station (or, on a host that runs in session 0, that it runs in session 0)",
+        line.contains("decision=exception-refused attempt=0") && (line.contains("no interactive window station") || line.contains("session 0")) && log_field(&line, "image").as_deref() == Some("process-tree-guard.exe"), line.clone());
+    checks.timing("G95", "the refusal is at once: nobody is waited for", result.elapsed.as_secs_f64() < 5.0 * UNIT + GRACE, shown(&result));
+    checks.finish();
+}
+
+// ------- the guard imports nothing for the prompt: a run at or below the cap does not pay for it (G96)
+
+/// The libraries that the program at `path` imports, from the import table of its file, each with the names of the functions it
+/// imports from it (an import by number has no name and is left out).
+fn import_table(path: &str) -> Option<Vec<(String, Vec<String>)>> {
+    let bytes = std::fs::read(path).ok()?;
+    let u16_at = |at: usize| bytes.get(at..at + 2).map(|part| u16::from_le_bytes([part[0], part[1]]) as usize);
+    let u32_at = |at: usize| bytes.get(at..at + 4).map(|part| u32::from_le_bytes([part[0], part[1], part[2], part[3]]) as usize);
+    let pe = u32_at(0x3c)?;
+    if bytes.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16_at(pe + 6)?;
+    let optional = pe + 24;
+    let wide = u16_at(optional)? == 0x20b;
+    let directories = optional + if wide { 112 } else { 96 };
+    let import_table = u32_at(directories + 8)?;
+    let headers = optional + u16_at(pe + 20)?;
+    let offset = |rva: usize| -> Option<usize> {
+        (0..sections).find_map(|index| {
+            let header = headers + 40 * index;
+            let (size, address, raw_size, raw) = (u32_at(header + 8)?, u32_at(header + 12)?, u32_at(header + 16)?, u32_at(header + 20)?);
+            (rva >= address && rva < address + size.max(raw_size)).then(|| raw + rva - address)
+        })
+    };
+    let text_at = |at: usize| -> Option<String> {
+        let end = bytes.get(at..)?.iter().position(|byte| *byte == 0)?;
+        Some(String::from_utf8_lossy(&bytes[at..at + end]).into_owned())
+    };
+    let step = if wide { 8 } else { 4 };
+    let mut libraries = Vec::new();
+    let mut entry = offset(import_table)?;
+    while u32_at(entry + 12)? != 0 {
+        let library = text_at(offset(u32_at(entry + 12)?)?)?;
+        // The table of names: the lookup table when there is one, else the address table.
+        let table = match u32_at(entry)? {
+            0 => u32_at(entry + 16)?,
+            lookup => lookup,
+        };
+        let mut functions = Vec::new();
+        let mut thunk = offset(table)?;
+        loop {
+            let value = u32_at(thunk)? | if wide { u32_at(thunk + 4)? << 32 } else { 0 };
+            if value == 0 {
+                break;
+            }
+            // The top bit marks an import by number.
+            let by_number = if wide { value >> 63 == 1 } else { value >> 31 == 1 };
+            if !by_number {
+                functions.push(text_at(offset(value & 0x7fff_ffff)? + 2)?);
+            }
+            thunk += step;
+        }
+        libraries.push((library, functions));
+        entry += 20;
+    }
+    Some(libraries)
+}
+
+/// The names of the libraries that the program at `path` imports.
+fn imported_libraries(path: &str) -> Option<Vec<String>> {
+    import_table(path).map(|table| table.into_iter().map(|(library, _)| library).collect())
+}
+
+/// The names of the functions that the program at `path` imports, from any library.
+fn imported_functions(path: &str) -> Option<Vec<String>> {
+    import_table(path).map(|table| table.into_iter().flat_map(|(_, functions)| functions).collect())
+}
+
+#[test]
+fn g96_no_program_imports_the_libraries_of_the_prompt_so_a_run_under_the_cap_does_not_load_them() {
+    let mut checks = Checks::new("imports");
+    // The sign-in prompt needs credui.dll, user32.dll and ole32.dll, and the name of the account secur32.dll. They are loaded from the system folder when a prompt is first
+    // wanted, so that every other command pays nothing for them and a host where one cannot be loaded still runs its commands.
+    for name in ROLES {
+        let libraries: Vec<String> = imported_libraries(role(name)).unwrap_or_default().iter().map(|library| library.to_ascii_lowercase()).collect();
+        checks.check("G96", &format!("{}: the import table is read (it names kernel32.dll)", name), libraries.iter().any(|library| library == "kernel32.dll"), format!("{:?}", libraries));
+        checks.check("G96", &format!("{}: credui.dll, user32.dll, ole32.dll and secur32.dll are not imported", name),
+            !libraries.iter().any(|library| ["credui.dll", "user32.dll", "ole32.dll", "secur32.dll"].contains(&library.as_str())), format!("{:?}", libraries));
+        // LogonUserW and LookupAccountNameW are in advapi32.dll, which every program imports for other functions, so it is the names that are checked.
+        let functions = imported_functions(role(name)).unwrap_or_default();
+        checks.check("G96", &format!("{}: the function names are read (GetLastError is among them) and LogonUserW and LookupAccountNameW are not imported", name),
+            functions.iter().any(|function| function == "GetLastError") && !functions.iter().any(|function| function == "LogonUserW" || function == "LookupAccountNameW"),
+            format!("{} functions", functions.len()));
+    }
+    // The declarations that would import them are not in the source.
+    let sys = include_str!("../src/sys.rs").replace("\r\n", "\n");
+    checks.check("G96", "src/sys.rs links none of the four libraries and loads them from the system folder, and declares no static import of LogonUserW or LookupAccountNameW",
+        !sys.contains("link(name = \"credui\")") && !sys.contains("link(name = \"user32\")") && !sys.contains("link(name = \"ole32\")") && !sys.contains("link(name = \"secur32\")") && sys.contains("LOAD_LIBRARY_SEARCH_SYSTEM32")
+            && !sys.contains("pub fn LogonUserW") && !sys.contains("pub fn LookupAccountNameW"), "");
+    checks.finish();
+}
+
+// ------- the console prompt is called for real, in a pseudo console, with nothing shown on any desktop (G97)
+
+/// The tests that call the console prompt for real (G97, G98) do not run at the same time: a guard takes the right to have a prompt
+/// open in its session while it asks, and refuses to open one beside another's, so two of them together would refuse each other.
+/// The turn is taken among the threads of this suite and among the processes of the session (another suite, run at the same time,
+/// takes the same one), and it is the first thing the test takes.
+fn console_prompt_turn() -> (std::sync::MutexGuard<'static, ()>, SessionTurn) {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let thread_turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    (thread_turn, session_turn())
+}
+
+/// What the guard writes when it is refused the lock that keeps the prompts of a session apart.
+const PROMPT_LOCK_TAKEN: &str = "another sign-in prompt of the guard is open or was refused";
+
+/// The tries a test that calls the console prompt for real makes, and the wait between them: the lock is held by a guard that is
+/// asking, and for 10 seconds after a refusal that followed a prompt, so a program of the session that is not one of these tests
+/// (a real prompt, a manual check, a suite of another worktree that is not waiting for its turn) can hold it for a while.
+const PROMPT_LOCK_TRIES: usize = 6;
+const PROMPT_LOCK_WAIT_SECONDS: u64 = 12;
+
+/// Run `once` (it makes the files of one try, runs the guard in a pseudo console and gives them back with the result), and run
+/// it again with fresh files while the guard was refused the lock of the prompts of its session, up to `PROMPT_LOCK_TRIES` times,
+/// 12 seconds apart (the lock is kept for 10 seconds after a refusal). The last element is true when the guard was refused on
+/// every try; the result is then the last one.
+fn until_the_prompt_lock_is_free<T>(mut once: impl FnMut() -> (T, Out)) -> (T, Out, bool) {
+    for attempt in 1..=PROMPT_LOCK_TRIES {
+        let (state, result) = once();
+        let refused = result.code != 95 && result.out().contains(PROMPT_LOCK_TAKEN);
+        if !refused || attempt == PROMPT_LOCK_TRIES {
+            return (state, result, refused);
+        }
+        std::thread::sleep(Duration::from_secs(PROMPT_LOCK_WAIT_SECONDS));
+    }
+    unreachable!("the last try returns")
+}
+
+/// The report of a test that could not get the lock of the prompts of its session in any try: a failure where the pseudo console is
+/// required (the continuous integration and release workflows), and otherwise a notice that the check was not asserted.
+fn prompt_lock_not_free(checks: &mut Checks, id: &str, result: &Out) {
+    checks.check(id, "the lock that keeps the prompts of the session apart was free in one of the tries (not asserted where it is not, unless PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE is set)",
+        !variable_set("PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE"), shown(result));
+    checks.notice(format!("NOT ASSERTED {}: another sign-in prompt of the guard holds the lock of this session", id));
+}
+
+#[test]
+fn g97_the_console_prompt_runs_in_a_pseudo_console_and_three_empty_answers_end_the_attempts() {
+    let mut checks = Checks::new("console prompt in a pseudo console");
+    if under_a_guard(&mut checks, "G97", "PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE", "the console") {
+        checks.finish();
+        return;
+    }
+    let _turn = console_prompt_turn();
+    // The helper makes a console that is really one, starts the guard in it with `--authenticate console`, and presses Enter
+    // every 300 milliseconds: an empty answer to every question. An empty password never reaches the logon, so no failed logon is
+    // written to the audit log of the machine. The prompt is on that console and nowhere else.
+    let ((_dir, marker, log), result, lock_taken) = until_the_prompt_lock_is_free(|| {
+        let dir = TempDir::new("g97-");
+        let marker = dir.join("ran.txt");
+        let marker_text = text(&marker);
+        let log = text(&dir.join("extension.log"));
+        let child = [testkit(), "mark", marker_text.as_str(), "20"];
+        let args = over_cap("86400", &["--extension-log", log.as_str()], &child);
+        let mut command = Command::new(testkit());
+        command.args(["pty-guard", "40", guard()]).args(&args);
+        let result = exec(command);
+        ((dir, marker, log), result)
+    });
+    if lock_taken {
+        prompt_lock_not_free(&mut checks, "G97", &result);
+        checks.finish();
+        return;
+    }
+    if result.code == 95 {
+        // No pseudo console can be made here (before Windows 10 1809, or a host that refuses one). Nothing was started.
+        let required = variable_set("PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE");
+        checks.check("G97", "the helper makes a pseudo console (not asserted where the host refuses it, unless PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE is set)", !required, shown(&result));
+        checks.notice(format!("NOT ASSERTED G97: no pseudo console could be made here: {}", shown(&result)));
+        checks.finish();
+        return;
+    }
+    let output = result.out();
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = contents.lines().collect();
+    checks.check("G97", "the guard ended by itself in the pseudo console with exit 125, and its command never ran",
+        result.code == 0 && output.lines().next() == Some("exit 125") && !marker.exists(), shown(&result));
+    checks.check("G97", "the console prompt was shown on the console: the message, then the question for the password of the account",
+        output.contains("Process Tree Guard is asked to run:") && output.contains("Account: [") && output.matches("Process Tree Guard").count() >= 2, shown(&result));
+    checks.check("G97", "the call was accepted by the system: neither the error for invalid flags (1004) nor any failure of the prompt is in the output or the log",
+        !output.contains("1004") && !output.contains("the console prompt failed") && !contents.contains("1004"), shown(&result));
+    checks.check("G97", "three attempts, one line each, in order, and the third says that no attempts are left",
+        lines.len() == 3 && (1..=3).all(|n| lines[n - 1].contains("decision=exception-refused") && lines[n - 1].contains(&format!("attempt={} ", n)))
+            && lines[2].contains("no attempts are left") && !lines[0].contains("no attempts are left") && !lines[1].contains("no attempts are left"), format!("{:?}", lines));
+    checks.check("G97", "an empty password is turned away before any logon is tried, with the reason that no password was entered, and nothing is approved",
+        lines.iter().all(|line| line.contains("reason=\"no password was entered, so no logon was tried")) && !output.contains("exception-approved") && !contents.contains("exception-approved"), format!("{:?}", lines));
+    checks.check("G97", "the same lines are on the console, and the run ends with the error that says that it did not start",
+        output.contains("attempt=3 ") && output.contains("PROCESS_GUARD_ERROR: exception refused:") && output.contains("no attempts are left; the run did not start"), shown(&result));
+    checks.finish();
+}
+
+// ------- the watch on the process that started the guard, end to end, with the real guard (G98)
+
+#[test]
+fn g98_a_guard_whose_starter_exits_while_the_console_prompt_is_open_is_refused_because_nobody_is_waiting_for_it() {
+    let mut checks = Checks::new("starter exits during the console prompt");
+    if under_a_guard(&mut checks, "G98", "PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE", "the console") {
+        checks.finish();
+        return;
+    }
+    let _turn = console_prompt_turn();
+    // In a pseudo console, cmd.exe starts the guard in the background with the console method and then waits about three seconds and
+    // exits: it is the process that started the guard. Nothing is typed, so the prompt is open and unanswered when the starter
+    // exits, and the real wiring (the starter opened for the prompt, watched during the wait, refused when it is gone) is what ends it,
+    // long before the 300 seconds that the prompt would wait.
+    let ((_dir, marker, log), result, lock_taken) = until_the_prompt_lock_is_free(|| {
+        let dir = TempDir::new("g98-");
+        let marker = dir.join("ran.txt");
+        let marker_text = text(&marker);
+        let log = text(&dir.join("extension.log"));
+        let child = [testkit(), "mark", marker_text.as_str(), "20"];
+        let mut command = Command::new(testkit());
+        command.args(["pty-guard-quiet", "40", "cmd.exe", "/d", "/c", "start", "/b", "", guard()]);
+        command.args(over_cap("86400", &["--extension-log", log.as_str()], &child));
+        command.args(["&", "ping", "-n", "4", "127.0.0.1", ">nul"]);
+        let result = exec(command);
+        ((dir, marker, log), result)
+    });
+    if lock_taken {
+        prompt_lock_not_free(&mut checks, "G98", &result);
+        checks.finish();
+        return;
+    }
+    if result.code == 95 {
+        // No pseudo console can be made here. Nothing was started.
+        let required = variable_set("PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE");
+        checks.check("G98", "the helper makes a pseudo console (not asserted where the host refuses it, unless PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE is set)", !required, shown(&result));
+        checks.notice(format!("NOT ASSERTED G98: no pseudo console could be made here: {}", shown(&result)));
+        checks.finish();
+        return;
+    }
+    let output = result.out();
+    let contents = std::fs::read_to_string(&log).unwrap_or_default();
+    let lines: Vec<&str> = contents.lines().collect();
+    checks.check("G98", "the console prompt was shown to the guard's console before the starter left: the message and the question for the password",
+        output.contains("Process Tree Guard is asked to run:") && output.contains("Account: [") && output.matches("Process Tree Guard").count() >= 2, shown(&result));
+    checks.check("G98", "one exception-refused line, attempt 1 (the prompt was open), saying that the process that started the run exited and nobody is waiting for it",
+        lines.len() == 1 && lines[0].contains("decision=exception-refused") && lines[0].contains("attempt=1 ") && lines[0].contains("nobody is waiting for it"), format!("{:?}", lines));
+    checks.check("G98", "nothing was approved and the command of the guard never ran",
+        !contents.contains("exception-approved") && !output.contains("exception-approved") && !marker.exists(), shown(&result));
+    checks.check("G98", "the refusal is on the console as an error of its own, on a line of its own after the prompt",
+        output.contains("PROCESS_GUARD_ERROR: exception refused:") && output.contains("nobody is waiting for it; the run did not start")
+            && output.lines().filter(|line| line.contains("PROCESS_TREE_GUARD_EXTENSION")).all(|line| line.trim_start().starts_with("PROCESS_TREE_GUARD_EXTENSION")), shown(&result));
+    checks.timing("G98", "the guard ended well before the 300 seconds of the prompt: the starter's exit ends the wait", result.elapsed.as_secs_f64() < 30.0, shown(&result));
+    checks.finish();
+}
+
+// ------- every program of the guard that runs a command makes a guard under it a run that another guard started (G99)
+
+#[test]
+fn g99_a_guard_under_any_program_of_the_guard_is_refused_by_name() {
+    let mut checks = Checks::new("exception under each program of the guard");
+    let dir = TempDir::new("g99-");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    let inner = [guard(), "--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--", testkit(), "mark", marker_text.as_str(), "20"];
+    // The program that is the file name, and the role it is a copy of. The contain role runs only inside an extendable run, where
+    // a guard under it is refused as nested before anything else (G91), so its name is checked by the unit tests of the module.
+    let programs: [(&str, &str); 6] = [
+        ("process-tree-guard", ROLES[0]), ("process-guard", ROLES[0]), ("process-tree-guard-deadline", ROLES[1]),
+        ("process-tree-guard-auto", ROLES[0]), ("process-guard-auto", ROLES[0]), ("process-tree-guard-deadline-auto", ROLES[1]),
+    ];
+    assert!(programs.iter().all(|(name, _)| GUARD_PROGRAMS.contains(&format!("{}.exe", name).as_str())) && GUARD_PROGRAMS.len() == programs.len() + 1);
+    for (name, role_name) in programs {
+        let copy = copy_role(dir.path(), role_name, name);
+        let mut args = vec!["--timeout", "30", "--"];
+        args.extend(inner);
+        refuse_prompt(&args);
+        let result = exec(guard_cmd_of(&copy, &args));
+        let line = exception_refusal(&result.err()).unwrap_or_default();
+        checks.check("G99", &format!("under {}.exe: exit 125, one exception-refused line with attempt 0 and the reason that another guard started it, and the command never runs", name),
+            result.code == 125 && !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), shown(&result));
+    }
+    // Automatic mode is selected by any file name that ends in -auto, so a wrapper that a host names freely is a guard by name too.
+    for free_name in ["harness-auto", "Host-Auto"] {
+        let copy = copy_role(dir.path(), ROLES[0], free_name);
+        let mut args = vec!["--timeout", "30", "--"];
+        args.extend(inner);
+        refuse_prompt(&args);
+        let result = exec(guard_cmd_of(&copy, &args));
+        let line = exception_refusal(&result.err()).unwrap_or_default();
+        checks.check("G99", &format!("under {}.exe, a name the guard does not list but whose ending selects automatic mode: refused because another guard started it, and the command never runs", free_name),
+            result.code == 125 && !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), shown(&result));
+    }
+    // A program of another name is not taken for a guard by its name (the unit test of the names asserts that), but the copy is the
+    // full command, which makes a job that kills on close for the inner guard, so the inner guard is refused by that job.
+    let other = copy_role(dir.path(), ROLES[0], "launcher");
+    let mut args = vec!["--timeout", "30", "--"];
+    args.extend(inner);
+    refuse_prompt(&args);
+    let result = exec(guard_cmd_of(&other, &args));
+    let line = exception_refusal(&result.err()).unwrap_or_default();
+    checks.check("G99", "under a copy of the guard with another file name, which the names do not recognise: still refused as a run that another guard started, by the job that copy makes",
+        result.code == 125 && !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), shown(&result));
+    checks.finish();
+}
+
+// ------- a guard whose parents were left to exit is still taken for a run that another guard started, by its job (G100)
+
+/// The batch files of a chain of three shells in which the middle one has gone before the last one starts: `first` starts `middle`
+/// and goes on waiting, `middle` starts `last` and ends at once, and `last` waits two seconds, so that `middle` has exited, then
+/// runs the guard over the cap with the console method and the null device for standard input, writing everything to `report`.
+/// The parent of `last` is then a process that has gone, which ends the search of the names above the guard.
+fn orphan_chain(dir: &Path, report: &Path, marker: &Path) -> String {
+    let (first, middle, last) = (dir.join("first.cmd"), dir.join("middle.cmd"), dir.join("last.cmd"));
+    std::fs::write(&first, format!("@echo off
+
+start /b \"\" cmd /d /c \"{}\"
+
+ping -n 9 127.0.0.1 > nul
+
+", text(&middle))).expect("write the first script");
+    std::fs::write(&middle, format!("@echo off
+
+start /b \"\" cmd /d /c \"{}\"
+
+", text(&last))).expect("write the middle script");
+    std::fs::write(&last, format!("@echo off
+
+ping -n 3 127.0.0.1 > nul
+
+\"{}\" --extendable --max-extension 86400 --authenticate console --timeout 5 -- \"{}\" mark \"{}\" 20 < nul > \"{}\" 2>&1
+
+",
+        guard(), testkit(), text(marker), text(report))).expect("write the last script");
+    text(&first)
+}
+
+#[test]
+fn g100_a_guard_whose_parents_have_exited_is_still_refused_as_a_run_that_another_guard_started() {
+    let mut checks = Checks::new("exception under an orphaned chain");
+    let dir = TempDir::new("g100-");
+    let marker = dir.join("ran.txt");
+    let report = dir.join("report.txt");
+    // Under a guard: the names above the last shell are hidden by the one that exited, and the job it is in is what is left. The
+    // refusal is for another guard having started it, at attempt 0, and not for its standard input, which it never reaches.
+    let first = orphan_chain(dir.path(), &report, &marker);
+    let outer = guarded("30", &["cmd", "/d", "/c", first.as_str()]);
+    let reported = std::fs::read_to_string(&report).unwrap_or_default();
+    let line = exception_refusal(&reported).unwrap_or_default();
+    checks.check("G100", "a guard under a guard whose chain of parents has a process that exited: refused as a run that another guard started, with attempt 0, and its command never runs",
+        !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), format!("{} / {}", shown(&outer), reported));
+    checks.check("G100", "and not for its standard input, which it never reaches",
+        !reported.contains(NO_CONSOLE_REASON) && reported.contains("start it from a terminal that is not under a guard"), reported.clone());
+    checks.check("G100", "and the reason names the cause: the job, and not a program found above the guard",
+        line.contains(JOB_REASON) && !line.contains(FOUND_ABOVE_REASON), line.clone());
+    // The control: the same chain started by this test and not by a guard. Its last shell has no live parent either, so the names
+    // above it are hidden here too, even where a guard is above the tests; the test process is in a job of its own that kills nothing
+    // (see `leave_the_job_of_the_runner`), so the run reaches the test of its standard input. That shows that the job around the
+    // guard, and not the chain of names, made the refusal above.
+    let control_report = dir.join("control.txt");
+    let control_first = orphan_chain(dir.path(), &control_report, &marker);
+    let mut command = Command::new("cmd");
+    command.args(["/d", "/c", control_first.as_str()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let status = run_status(command, 60);
+    let control = std::fs::read_to_string(&control_report).unwrap_or_default();
+    checks.check("G100", "the same chain with no guard around it reaches the test of the standard input and is refused for that, so it was the job that refused the run above",
+        !marker.exists() && control.contains(NO_CONSOLE_REASON) && !control.contains(WRAPPED_REASON), format!("{} / {}", status, control));
+    checks.finish();
+}
+
+// ------- a copy of an ordinary program under the name of the desktop shell does not hide the guards above it (G101)
+
+/// The two batch files of a chain `outer` waits on: `outer` is a copy of the command interpreter under the name of a program of
+/// the guard that runs `first`, which runs the copy of the command interpreter named `explorer.exe` in `shell` on `second`,
+/// which runs the guard over the cap with the console method and the null device for standard input, writing everything to
+/// `report`. Returns the command line of `outer`.
+fn masquerade_chain(dir: &Path, shell: &Path, report: &Path, marker: &Path) -> Command {
+    let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    let interpreter = Path::new(&system).join("System32").join("cmd.exe");
+    std::fs::create_dir_all(shell).expect("make the folder of the copy");
+    let outer = dir.join("process-guard-auto.exe");
+    let masquerade = shell.join("explorer.exe");
+    std::fs::copy(&interpreter, &outer).expect("copy the command interpreter");
+    std::fs::copy(&interpreter, &masquerade).expect("copy the command interpreter");
+    let (first, second) = (dir.join("one.cmd"), dir.join("two.cmd"));
+    std::fs::write(&first, format!("@echo off\r\n\"{}\" /d /c \"{}\"\r\n", text(&masquerade), text(&second))).expect("write the first script");
+    std::fs::write(&second, format!("@echo off\r\n\"{}\" --extendable --max-extension 86400 --authenticate console --timeout 5 -- \"{}\" mark \"{}\" 20 < nul > \"{}\" 2>&1\r\n",
+        guard(), testkit(), text(marker), text(report))).expect("write the second script");
+    let mut command = Command::new(&outer);
+    command.args(["/d", "/c", text(&first).as_str()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    command
+}
+
+#[test]
+fn g101_a_copy_of_a_program_named_explorer_outside_the_windows_folder_does_not_end_the_search_of_the_names() {
+    let mut checks = Checks::new("exception under a copy named explorer");
+    let dir = TempDir::new("g101-");
+    let (marker, report) = (dir.join("ran.txt"), dir.join("report.txt"));
+    // The test process is in a job of its own that kills nothing (see `leave_the_job_of_the_runner`), so the job does not refuse
+    // this run: the names above it do. The nearest process above the guard is a copy of the command interpreter named
+    // `explorer.exe` in another folder, which is walked past like any other process; behind it is a process named like a program
+    // of the guard. Had the search ended at the copy, the run would have gone on to the test of its standard input.
+    let status = run_status(masquerade_chain(dir.path(), &dir.join("shell"), &report, &marker), 60);
+    let reported = std::fs::read_to_string(&report).unwrap_or_default();
+    let line = exception_refusal(&reported).unwrap_or_default();
+    checks.check("G101", "a guard under a copy named explorer.exe in another folder, under a program of the guard: refused as a run that another guard started, with attempt 0, and its command never runs",
+        !marker.exists() && line.contains("attempt=0") && line.contains(&format!("reason=\"{}", WRAPPED_REASON)), format!("{} / {}", status, reported));
+    checks.check("G101", "and not for its standard input, which it never reaches",
+        !reported.contains(NO_CONSOLE_REASON), reported.clone());
+    checks.check("G101", "and the reason names the cause: the program of the guard found above it, by its file name",
+        line.contains(&format!("{}process-guard-auto.exe", FOUND_ABOVE_REASON)) && !line.contains(JOB_REASON), line.clone());
+    checks.finish();
+}
+
+/// A command that runs the program at `exe` with `args`.
+fn guard_cmd_of(exe: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(exe);
+    command.args(args);
+    command
 }
