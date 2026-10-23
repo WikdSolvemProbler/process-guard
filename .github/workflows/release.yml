@@ -23,6 +23,14 @@ jobs:
       PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE: '1'
     steps:
       - uses: actions/checkout@v5
+      - name: Check that the tag names the version in Cargo.toml
+        shell: bash
+        run: |
+          version=$(tr -d '\r' < Cargo.toml | sed -n 's/^version = "\(.*\)"$/\1/p' | head -n 1)
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "the tag $GITHUB_REF_NAME does not name the version $version in Cargo.toml"
+            exit 1
+          fi
       - name: Test
         run: cargo test --release --locked --no-fail-fast
       - name: Package
@@ -84,4 +92,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md --verify-tag
+        run: |
+          # A version with a pre-release part (2.0.0-alpha.4) is published as a pre-release, which is never marked latest.
+          flags=()
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease --latest=false) ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md --verify-tag "${flags[@]}"
