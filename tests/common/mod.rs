@@ -523,11 +523,72 @@ pub fn own_account() -> String {
     }).clone()
 }
 
+/// The reason a run over the cap is refused for when the account has no lockout record, up to and including the name of the step that
+/// makes one; the account follows it (see `missing_reason`).
+pub const MISSING_REASON: &str = "no lockout record exists for this account; an administrator must run: process-tree-guard create-lockout-record";
+
+/// The whole reason: the step is named with the account of the run, in quotation marks when its name has a space in it, so that an
+/// administrator who elevates as another account makes the record of this one.
+pub fn missing_reason() -> String {
+    let account = own_account();
+    format!("{} {}", MISSING_REASON, if account.contains(char::is_whitespace) { format!("\"{}\"", account) } else { account })
+}
+
+/// The start of the reason a run over the cap is refused for when the account is locked out (the rest names the count and the times).
+pub const LOCKED_REASON: &str = "locked out after ";
+
+/// The whole reason a guard started by these tests, over the cap with the console method and a standard input that is the null
+/// device, is refused for where no guard is above them: learned once by starting one. It is the reason of the lockout record when
+/// the record is not set up (or cannot be used, or the account is locked out), and otherwise the standard input. Empty when it
+/// could not be read.
+pub fn learned_reason() -> &'static str {
+    static REASON: OnceLock<String> = OnceLock::new();
+    REASON.get_or_init(|| {
+        let result = exec(guard_cmd(&["--extendable", "--max-extension", "86400", "--authenticate", "console", "--timeout", "5", "--", testkit(), "print", "probe"]));
+        let err = result.err();
+        let after = err.find("exception refused: ").map(|at| &err[at + "exception refused: ".len()..]).unwrap_or("");
+        after.find("; the run did not start").map(|end| after[..end].to_string()).unwrap_or_default()
+    })
+}
+
+/// True when a guard that these tests start, over the cap with the console method, reaches the test of its standard input: no guard
+/// is above the tests, and the account has a lockout record that can be used and is not locked out. Only then is a refusal for
+/// the standard input, or a prompt on a window station, what a test sees.
+pub fn prompt_path_open() -> bool {
+    guard_above_the_tests().is_none() && learned_reason().starts_with(NO_CONSOLE_REASON)
+}
+
 /// The start of the reason that a run over the cap, started by a test with the console method and a standard input that is not a
-/// console, is refused for: the standard input where no guard is above the test, and the guard above it where one is (the
-/// guard is then asked nothing, whatever its standard input is).
+/// console, is refused for: the guard above the tests where one is (the guard is then asked nothing, whatever its standard input
+/// is); the lockout record where the account has none that can be used (the whole reason, which names the step that makes it);
+/// the start of the lockout where the account is locked out (the rest of it changes with the time); and otherwise the standard input.
 pub fn nobody_reason() -> &'static str {
-    if guard_above_the_tests().is_some() { WRAPPED_REASON } else { NO_CONSOLE_REASON }
+    if guard_above_the_tests().is_some() {
+        return WRAPPED_REASON;
+    }
+    let learned = learned_reason();
+    if learned.starts_with(NO_CONSOLE_REASON) || learned.is_empty() {
+        NO_CONSOLE_REASON
+    } else if learned.starts_with(LOCKED_REASON) {
+        LOCKED_REASON
+    } else {
+        learned
+    }
+}
+
+/// Whether the lockout record of the account is set up and usable where these tests run, as far as a guard started by them can
+/// tell: Some(true) when it is, Some(false) when the guard refuses for the record, None when a guard above the tests (or a reason
+/// that could not be read) keeps it from saying.
+pub fn record_is_set_up() -> Option<bool> {
+    if guard_above_the_tests().is_some() {
+        return None;
+    }
+    let learned = learned_reason();
+    if learned.is_empty() {
+        None
+    } else {
+        Some(learned.starts_with(NO_CONSOLE_REASON) || learned.starts_with(LOCKED_REASON))
+    }
 }
 
 /// The turn of one test process, among all the processes of the session, to start a guard that asks for a password: the

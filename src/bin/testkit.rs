@@ -747,6 +747,558 @@ fn run_in_pseudo_console(limit: f64, guard: &str, args: &[String], type_enter: b
     }
 }
 
+// ---------------------------------------------------------- the lockout record (the series L of the tests)
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut c_void;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, attributes: *mut c_void, disposition: u32, flags: u32, template: *mut c_void) -> *mut c_void;
+    fn GetFileSizeEx(file: *mut c_void, size: *mut i64) -> i32;
+    fn SetFilePointerEx(file: *mut c_void, distance: i64, new_position: *mut i64, method: u32) -> i32;
+    fn SetEndOfFile(file: *mut c_void) -> i32;
+    fn DeleteFileW(name: *const u16) -> i32;
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+    fn CreateHardLinkW(new: *const u16, existing: *const u16, attributes: *mut c_void) -> i32;
+    fn RemoveDirectoryW(name: *const u16) -> i32;
+    fn CreateDirectoryW(name: *const u16, attributes: *mut c_void) -> i32;
+    fn GetSystemTimePreciseAsFileTime(time: *mut u64);
+    fn LockFileEx(file: *mut c_void, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> i32;
+    fn DeviceIoControl(device: *mut c_void, code: u32, input: *mut c_void, input_size: u32, output: *mut c_void, output_size: u32, returned: *mut u32, overlapped: *mut c_void) -> i32;
+    fn SetFileInformationByHandle(file: *mut c_void, class: i32, information: *mut c_void, size: u32) -> i32;
+}
+
+/// OVERLAPPED, for the offset of a lock or a read.
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut c_void,
+}
+
+/// SID_AND_ATTRIBUTES.
+#[repr(C)]
+struct SidAndAttributes {
+    sid: *mut c_void,
+    attributes: u32,
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn GetTokenInformation(token: *mut c_void, class: u32, information: *mut c_void, length: u32, returned: *mut u32) -> i32;
+    fn CreateRestrictedToken(token: *mut c_void, flags: u32, disable_count: u32, disable: *mut SidAndAttributes, delete_count: u32, delete: *mut c_void,
+        restrict_count: u32, restrict: *mut SidAndAttributes, new_token: *mut *mut c_void) -> i32;
+    fn CreateProcessAsUserW(token: *mut c_void, application: *const u16, command_line: *mut u16, process_attributes: *mut c_void, thread_attributes: *mut c_void,
+        inherit_handles: i32, creation_flags: u32, environment: *mut c_void, current_directory: *const u16, startup: *mut StartupInfo, information: *mut ProcessInfo) -> i32;
+    fn ConvertSidToStringSidW(sid: *mut c_void, text: *mut *mut u16) -> i32;
+    fn RegGetValueW(key: isize, sub_key: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(text: *const u16, revision: u32, descriptor: *mut *mut c_void, size: *mut u32) -> i32;
+    fn SetKernelObjectSecurity(object: *mut c_void, information: u32, descriptor: *mut c_void) -> i32;
+}
+
+/// SECURITY_ATTRIBUTES.
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    descriptor: *mut c_void,
+    inherit: i32,
+}
+
+const READ_DATA: u32 = 1;
+const WRITE_DATA: u32 = 2;
+const APPEND_DATA: u32 = 4;
+const READ_ATTRIBUTES: u32 = 0x80;
+const DELETE_RIGHT: u32 = 0x10000;
+const WRITE_DAC_RIGHT: u32 = 0x40000;
+const WRITE_OWNER_RIGHT: u32 = 0x80000;
+const OPEN_EXISTING_DISPOSITION: u32 = 3;
+const SHARE_ALL: u32 = 7;
+const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const WRITE_THROUGH: u32 = 0x8000_0000;
+const ACCESS_DENIED: u32 = 5;
+
+fn open_file(path: &str, access: u32, disposition: u32, flags: u32) -> Result<*mut c_void, u32> {
+    let handle = unsafe { CreateFileW(wide(path).as_ptr(), access, SHARE_ALL, std::ptr::null_mut(), disposition, flags, std::ptr::null_mut()) };
+    if handle as isize == -1 { Err(unsafe { GetLastError() }) } else { Ok(handle) }
+}
+
+/// Open and close: the way an operation that must be refused is tried.
+fn try_open(path: &str, access: u32, disposition: u32, flags: u32) -> Result<String, u32> {
+    open_file(path, access, disposition, flags).map(|handle| {
+        unsafe { CloseHandle(handle) };
+        String::new()
+    })
+}
+
+fn done(ok: i32) -> Result<String, u32> {
+    if ok == 0 { Err(unsafe { GetLastError() }) } else { Ok(String::new()) }
+}
+
+/// What the file holds, read from its start with the right to read data alone.
+fn read_whole(path: &str) -> Option<Vec<u8>> {
+    let file = open_file(path, READ_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, 0).ok()?;
+    let mut size = 0i64;
+    let mut bytes = Vec::new();
+    if unsafe { GetFileSizeEx(file, &mut size) } != 0 {
+        bytes.resize(size as usize, 0u8);
+        let mut have = 0usize;
+        while have < bytes.len() {
+            let mut read = 0u32;
+            if unsafe { ReadFile(file, bytes[have..].as_mut_ptr(), (bytes.len() - have) as u32, &mut read, std::ptr::null_mut()) } == 0 || read == 0 {
+                break;
+            }
+            have += read as usize;
+        }
+        bytes.truncate(have);
+    }
+    unsafe { CloseHandle(file) };
+    Some(bytes)
+}
+
+fn write_to(file: *mut c_void, bytes: &[u8]) -> Result<String, u32> {
+    let mut written = 0u32;
+    if unsafe { WriteFile(file, bytes.as_ptr(), bytes.len() as u32, &mut written, std::ptr::null_mut()) } == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(format!("{} bytes", written))
+}
+
+/// Whether this process has an elevated token.
+fn is_elevated() -> bool {
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), 8, &mut token) == 0 {
+            return false;
+        }
+        let (mut elevation, mut returned) = (0u32, 0u32);
+        let read = GetTokenInformation(token, 20, &mut elevation as *mut u32 as *mut c_void, 4, &mut returned);
+        CloseHandle(token);
+        read != 0 && elevation != 0
+    }
+}
+
+/// The text of the security identifier of the user of this process.
+fn user_sid_text() -> Option<String> {
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), 8, &mut token) == 0 {
+            return None;
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, 1, std::ptr::null_mut(), 0, &mut needed);
+        let mut buffer = vec![0u64; needed as usize / 8 + 2];
+        let read = GetTokenInformation(token, 1, buffer.as_mut_ptr() as *mut c_void, (buffer.len() * 8) as u32, &mut needed);
+        CloseHandle(token);
+        if read == 0 {
+            return None;
+        }
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if ConvertSidToStringSidW(*(buffer.as_ptr() as *const *mut c_void), &mut text) == 0 {
+            return None;
+        }
+        let mut length = 0;
+        while *text.add(length) != 0 {
+            length += 1;
+        }
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, length));
+        LocalFree(text as *mut c_void);
+        Some(sid)
+    }
+}
+
+/// The folder of the lockout records and the record of the user of this process, where the guard puts them: the folder of the
+/// programs' data from the registry value of the machine, with the variable for the system drive replaced by the drive of the system folder.
+fn record_locations() -> Option<(String, String)> {
+    let mut buffer = vec![0u16; 520];
+    let mut size = (buffer.len() * 2) as u32;
+    let key = wide(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList");
+    let code = unsafe {
+        RegGetValueW(0x8000_0002u32 as i32 as isize, key.as_ptr(), wide("ProgramData").as_ptr(), 0x2 | 0x4 | 0x1000_0000, std::ptr::null_mut(), buffer.as_mut_ptr() as *mut c_void, &mut size)
+    };
+    if code != 0 {
+        return None;
+    }
+    let raw = String::from_utf16_lossy(&buffer[..(size as usize / 2).saturating_sub(1)]);
+    // The drive in the letter case the system writes it in, as the guard takes it (`windows_folder` writes in lower case).
+    let mut windows = [0u16; 512];
+    let length = unsafe { GetSystemWindowsDirectoryW(windows.as_mut_ptr(), windows.len() as u32) } as usize;
+    let drive: String = String::from_utf16_lossy(&windows[..length.min(windows.len())]).chars().take(2).collect();
+    let programdata = match raw.get(..13) {
+        Some(start) if start.eq_ignore_ascii_case("%SystemDrive%") => format!("{}{}", drive, &raw[13..]),
+        _ => raw,
+    };
+    let folder = format!("{}\\ProcessTreeGuard", programdata.trim_end_matches('\\'));
+    let record = format!("{}\\{}.lockout", folder, user_sid_text()?);
+    Some((folder, record))
+}
+
+/// Run PROGRAM ARGS... as a process of this user without administrator rights: the token is this one with the Administrators group
+/// turned to deny only and all privileges but one taken away, which is what the guard checks the record against. Its standard
+/// streams are this process's. The code of the program is returned.
+fn run_restricted(program: &str, args: &[String]) -> i32 {
+    // S-1-5-32-544 as the bytes of a security identifier.
+    let mut administrators: [u32; 4] = [0x0000_0201, 0x0500_0000, 32, 544];
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), 0xB, &mut token) == 0 {
+            eprintln!("testkit: cannot open the token of this process [WinError {}]", GetLastError());
+            return 96;
+        }
+        let mut disable = SidAndAttributes { sid: administrators.as_mut_ptr() as *mut c_void, attributes: 0 };
+        let mut restricted: *mut c_void = std::ptr::null_mut();
+        let made = CreateRestrictedToken(token, 1 | 4, 1, &mut disable, 0, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut restricted);
+        CloseHandle(token);
+        if made == 0 {
+            eprintln!("testkit: cannot restrict the token [WinError {}]", GetLastError());
+            return 96;
+        }
+        let mut all: Vec<&str> = vec![program];
+        all.extend(args.iter().map(String::as_str));
+        let mut line = wide(&command_line(&all));
+        let mut startup: StartupInfo = std::mem::zeroed();
+        startup.cb = std::mem::size_of::<StartupInfo>() as u32;
+        startup.flags = 0x100;
+        for (which, slot) in [(-10i32, 0usize), (-11, 1), (-12, 2)] {
+            let handle = GetStdHandle(which as u32);
+            if !handle.is_null() && handle as isize != -1 {
+                SetHandleInformation(handle, 1, 1);
+            }
+            match slot {
+                0 => startup.std_input = handle,
+                1 => startup.std_output = handle,
+                _ => startup.std_error = handle,
+            }
+        }
+        let mut info = ProcessInfo { process: std::ptr::null_mut(), thread: std::ptr::null_mut(), process_id: 0, thread_id: 0 };
+        let started = CreateProcessAsUserW(restricted, std::ptr::null(), line.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), 1, 0,
+            std::ptr::null_mut(), std::ptr::null(), &mut startup, &mut info);
+        CloseHandle(restricted);
+        if started == 0 {
+            eprintln!("testkit: cannot start the program with the restricted token [WinError {}]", GetLastError());
+            return 96;
+        }
+        CloseHandle(info.thread);
+        if WaitForSingleObject(info.process, 120_000) != 0 {
+            TerminateProcess(info.process, 1);
+            eprintln!("testkit: the program did not end within 120 seconds");
+            return WAIT_TIMEOUT_EXIT;
+        }
+        let mut status = 0u32;
+        GetExitCodeProcess(info.process, &mut status);
+        CloseHandle(info.process);
+        status as i32
+    }
+}
+
+/// One record as the guard writes it: a newline, `F `, the time as sixteen hexadecimal digits, a newline.
+fn lockout_record(filetime: u64) -> Vec<u8> {
+    format!("\nF {:016x}\n", filetime).into_bytes()
+}
+
+/// The error a read, an append or a lock gets from a range of a file that another handle holds locked.
+const LOCK_VIOLATION: u32 = 33;
+
+/// `LockFileEx` of `length` bytes from `offset`, exclusive, failing at once if another handle has any of them locked.
+fn lock_range(file: *mut c_void, offset: u64, length: u64) -> Result<String, u32> {
+    let mut at = Overlapped { internal: 0, internal_high: 0, offset: offset as u32, offset_high: (offset >> 32) as u32, event: std::ptr::null_mut() };
+    done(unsafe { LockFileEx(file, 2 | 1, 0, length as u32, (length >> 32) as u32, &mut at) })
+}
+
+/// `ReadFile` of one byte at the start through a handle, to see whether a lock held by another handle stops it.
+fn read_first_byte(file: *mut c_void) -> Result<String, u32> {
+    let (mut byte, mut read) = ([0u8; 1], 0u32);
+    let mut at = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+    if unsafe { ReadFile(file, byte.as_mut_ptr(), 1, &mut read, &mut at as *mut Overlapped as *mut c_void) } == 0 {
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(format!("{} byte", read))
+}
+
+/// `DeviceIoControl` with `code` and `input`, as a program that has a handle to the record can send it.
+fn control(file: *mut c_void, code: u32, input: &mut [u8]) -> Result<String, u32> {
+    let mut returned = 0u32;
+    let (pointer, size) = if input.is_empty() { (std::ptr::null_mut(), 0) } else { (input.as_mut_ptr() as *mut c_void, input.len() as u32) };
+    done(unsafe { DeviceIoControl(file, code, pointer, size, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut()) })
+}
+
+/// Try what a program of the user without administrator rights could try on the record, its folder and the folder of the
+/// programs' data, and say what came of each. What it may do (read, append, and lock a range of the record or set its sparse
+/// attribute, which change no byte of it) must work and land at the end; everything else (rewrite, truncate, delete, rename,
+/// replace, link, change the list or the owner, make anything in the folder) must fail with error 5, access denied, and what a lock
+/// held by another handle stops must fail with error 33. Returns 0 when each was as it should be. It only ever writes to the record
+/// by appending lines that are no record (the guard ignores them), and only fails to do anything else.
+fn lockout_probe(record: &str, folder: &str, free: &str) -> i32 {
+    let unexpected = std::cell::Cell::new(0);
+    let report = |id: &str, what: &str, good: bool, text: String| {
+        if !good {
+            unexpected.set(unexpected.get() + 1);
+        }
+        println!("{:<5} {:<72} {:<22} {}", id, what, text, if good { "as expected" } else { "UNEXPECTED" });
+    };
+    let say = |id: &str, what: &str, expect_ok: bool, result: Result<String, u32>| {
+        let (good, text) = match &result {
+            Ok(detail) => (expect_ok, format!("ok {}", detail)),
+            Err(code) => (!expect_ok && *code == ACCESS_DENIED, format!("error {}", code)),
+        };
+        report(id, what, good, text);
+    };
+    // An operation that must fail with the error of a lock held by another handle.
+    let say_locked = |id: &str, what: &str, result: Result<String, u32>| {
+        let (good, text) = match &result {
+            Ok(detail) => (false, format!("ok {}", detail)),
+            Err(code) => (*code == LOCK_VIOLATION, format!("error {}", code)),
+        };
+        report(id, what, good, text);
+    };
+    let size = |path: &str| read_whole(path).map_or(-1, |bytes| bytes.len() as i64);
+    let before = size(record);
+    say("P1", "open FILE_APPEND_DATA", true, try_open(record, APPEND_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, WRITE_THROUGH));
+    if let Ok(handle) = open_file(record, APPEND_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, WRITE_THROUGH) {
+        let line = b"\nx-probe-1\n";
+        say("P2", "WriteFile of one whole line on the append handle", true, write_to(handle, line));
+        let now = read_whole(record).unwrap_or_default();
+        say("P2b", "the line landed at the end and the old bytes are unchanged", true,
+            if now.len() as i64 == before + line.len() as i64 && now.ends_with(line) { Ok(format!("size {} -> {}", before, now.len())) } else { Err(0) });
+        let mut position = 0i64;
+        let moved = unsafe { SetFilePointerEx(handle, 0, &mut position, 0) } != 0;
+        let (kept, written) = (read_whole(record).unwrap_or_default(), write_to(handle, b"\nx-probe-2\n"));
+        let now = read_whole(record).unwrap_or_default();
+        say("P3", &format!("SetFilePointerEx(0) (moved={}) then WriteFile: still lands at the end", moved), true,
+            if written.is_ok() && now.starts_with(&kept) && now.ends_with(b"\nx-probe-2\n") { Ok(format!("size {} -> {}", kept.len(), now.len())) } else { Err(0) });
+        say("P9", "SetEndOfFile on the append handle", false, done(unsafe { SetEndOfFile(handle) }));
+        unsafe { CloseHandle(handle) };
+    }
+    say("P4", "open FILE_WRITE_DATA", false, try_open(record, WRITE_DATA, OPEN_EXISTING_DISPOSITION, 0));
+    say("P5", "open GENERIC_WRITE", false, try_open(record, 0x4000_0000, OPEN_EXISTING_DISPOSITION, 0));
+    say("P5b", "open GENERIC_WRITE, FILE_APPEND_DATA and FILE_READ_DATA", false, try_open(record, 0x4000_0000 | APPEND_DATA | READ_DATA, OPEN_EXISTING_DISPOSITION, 0));
+    say("P6", "open DELETE", false, try_open(record, DELETE_RIGHT, OPEN_EXISTING_DISPOSITION, 0));
+    say("P7", "open WRITE_DAC", false, try_open(record, WRITE_DAC_RIGHT, OPEN_EXISTING_DISPOSITION, 0));
+    say("P8", "open WRITE_OWNER", false, try_open(record, WRITE_OWNER_RIGHT, OPEN_EXISTING_DISPOSITION, 0));
+    say("P10", "open GENERIC_WRITE with TRUNCATE_EXISTING", false, try_open(record, 0x4000_0000, 5, 0));
+    say("P10b", "open GENERIC_WRITE with CREATE_ALWAYS", false, try_open(record, 0x4000_0000, 2, 0));
+    say("P11", "DeleteFileW(record)", false, done(unsafe { DeleteFileW(wide(record).as_ptr()) }));
+    say("P12", "MoveFileExW(record -> another name in the same folder)", false,
+        done(unsafe { MoveFileExW(wide(record).as_ptr(), wide(&format!("{}.renamed", record)).as_ptr(), 0) }));
+    say("P12b", "MoveFileExW(record -> a folder the user owns)", false,
+        done(unsafe { MoveFileExW(wide(record).as_ptr(), wide(&format!("{}\\moved-away", free)).as_ptr(), 0) }));
+    let replacement = format!("{}\\replacement", free);
+    let _ = fs::write(&replacement, b"empty");
+    say("P13", "MoveFileExW(a file of the user -> record, MOVEFILE_REPLACE_EXISTING)", false,
+        done(unsafe { MoveFileExW(wide(&replacement).as_ptr(), wide(record).as_ptr(), 1) }));
+    let _ = fs::remove_file(&replacement);
+    say("P14", "create a new file in the folder", false, try_open(&format!("{}\\new", folder), 0x4000_0000, 1, 0));
+    say("P14b", "create a new folder in the folder", false, done(unsafe { CreateDirectoryW(wide(&format!("{}\\newdir", folder)).as_ptr(), std::ptr::null_mut()) }));
+    say("P15", "CreateHardLinkW(a name in the user's folder -> record)", false,
+        done(unsafe { CreateHardLinkW(wide(&format!("{}\\hardlink", free)).as_ptr(), wide(record).as_ptr(), std::ptr::null_mut()) }));
+    say("P16", "create an alternate data stream record:ads", false, try_open(&format!("{}:ads", record), 0x4000_0000, 4, 0));
+    say("P17", "rename the folder (MoveFileExW)", false, done(unsafe { MoveFileExW(wide(folder).as_ptr(), wide(&format!("{}2", folder)).as_ptr(), 0) }));
+    say("P17b", "RemoveDirectoryW(folder)", false, done(unsafe { RemoveDirectoryW(wide(folder).as_ptr()) }));
+    say("P17c", "open the folder with DELETE", false, try_open(folder, DELETE_RIGHT, OPEN_EXISTING_DISPOSITION, BACKUP_SEMANTICS));
+    say("P17d", "open the folder with WRITE_DAC", false, try_open(folder, WRITE_DAC_RIGHT, OPEN_EXISTING_DISPOSITION, BACKUP_SEMANTICS));
+    say("P19", "open FILE_READ_DATA and read", true, read_whole(record).map(|bytes| format!("{} bytes", bytes.len())).ok_or(0));
+    // A program that can read the record can lock a range of it, which the list lets it: what that stops is the guard's own read of
+    // the range, its append and its lock. The guard takes the lock of the whole record for itself before the logon and is refused
+    // when it cannot, so a wrong password is never guessed and left uncounted; the lock is a denial of the use of exceptions by this
+    // account and nothing more (README, SECURITY.md).
+    let end = size(record).max(0) as u64;
+    let share = |access: u32, flags: u32| open_file(record, access, OPEN_EXISTING_DISPOSITION, flags);
+    if let (Ok(reader), Ok(writer), Ok(guardlike)) = (share(READ_DATA | READ_ATTRIBUTES, 0), share(APPEND_DATA | READ_ATTRIBUTES, WRITE_THROUGH), share(READ_DATA | APPEND_DATA | READ_ATTRIBUTES, WRITE_THROUGH)) {
+        say("P20", "LockFileEx of the end of the record on a FILE_READ_DATA handle", true, lock_range(reader, end, u64::MAX >> 1));
+        say_locked("P20b", "an append through another handle while the end is locked", write_to(writer, b"\nx-probe-3\n"));
+        say("P20c", "a read of the bytes that are there through another handle while only the end is locked", true, read_first_byte(guardlike));
+        unsafe { CloseHandle(reader) };
+        if let Ok(whole) = share(READ_DATA | READ_ATTRIBUTES, 0) {
+            say("P20d", "LockFileEx of the whole record on a FILE_READ_DATA handle", true, lock_range(whole, 0, u64::MAX >> 1));
+            say_locked("P20e", "a read through another handle while the whole record is locked", read_first_byte(guardlike));
+            say_locked("P20f", "a lock of the whole record through another handle while it is locked", lock_range(guardlike, 0, u64::MAX >> 1));
+            unsafe { CloseHandle(whole) };
+        }
+        unsafe {
+            CloseHandle(writer);
+            CloseHandle(guardlike);
+        }
+    }
+    // The other things the handle that the guard uses (read and append) could be used for, besides those it is for: the sparse
+    // attribute can be set (it changes no byte), and nothing else that changes the contents or the size is let.
+    if let Ok(handle) = share(READ_DATA | APPEND_DATA | READ_ATTRIBUTES, WRITE_THROUGH) {
+        let before = read_whole(record).unwrap_or_default();
+        let sparse = control(handle, 0x9_00C4, &mut []).and_then(|_| if read_whole(record).unwrap_or_default() == before { Ok("the contents are unchanged".to_string()) } else { Err(0) });
+        say("P21", "FSCTL_SET_SPARSE on a handle with FILE_READ_DATA and FILE_APPEND_DATA", true, sparse);
+        // Put it back as it was: not sparse.
+        let _ = control(handle, 0x9_00C4, &mut [0u8]);
+        let mut zero = [0u8; 16];
+        zero[8] = 16;
+        say("P21b", "FSCTL_SET_ZERO_DATA over the first 16 bytes", false, control(handle, 0x9_80C8, &mut zero));
+        let mut compression = [1u8, 0];
+        say("P21c", "FSCTL_SET_COMPRESSION", false, control(handle, 0x9_C040, &mut compression));
+        let mut nothing = [0u8; 8];
+        say("P21d", "SetFileInformationByHandle(FileEndOfFileInfo) to zero", false, done(unsafe { SetFileInformationByHandle(handle, 6, nothing.as_mut_ptr() as *mut c_void, 8) }));
+        say("P21e", "SetFileInformationByHandle(FileAllocationInfo) to zero", false, done(unsafe { SetFileInformationByHandle(handle, 5, nothing.as_mut_ptr() as *mut c_void, 8) }));
+        say("P21f", "the contents after all of them are what they were", true, if read_whole(record).unwrap_or_default() == before { Ok("unchanged".to_string()) } else { Err(0) });
+        unsafe { CloseHandle(handle) };
+    }
+    println!("PROBES {}", if unexpected.get() == 0 { "all as expected".to_string() } else { format!("{} UNEXPECTED", unexpected.get()) });
+    if unexpected.get() == 0 { 0 } else { 1 }
+}
+
+/// A security descriptor made from its text form; the caller frees it with `LocalFree`.
+fn descriptor_from(text: &str) -> Option<*mut c_void> {
+    let mut pointer: *mut c_void = std::ptr::null_mut();
+    let mut size = 0u32;
+    if unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(text).as_ptr(), 1, &mut pointer, &mut size) } == 0 {
+        eprintln!("testkit: the access list {} is not accepted [WinError {}]", text, unsafe { GetLastError() });
+        return None;
+    }
+    Some(pointer)
+}
+
+/// What a program of the user without administrator rights can do to make a record of its own that has exactly the lists the guard
+/// accepts: make FOLDER (users may make folders in the folder of the programs' data) and RECORD in it, owned by the user SID (the one
+/// owner it can give), and keep a handle that can write to the record, opened when it was made, before the list took that right
+/// away; then tighten the list of the folder, as the step does. The guard must still refuse it, because the user owns it.
+fn lockout_forge(folder: &str, record: &str, sid: &str) -> i32 {
+    // The system, the Administrators group and the signed-in accounts as in the lists of the step, owned by the user.
+    let record_list = format!("O:{}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x12008d;;;{})(A;;0x20000;;;OW)", sid, sid);
+    let folder_list = format!("O:{}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a0;;;AU)", sid);
+    // The folder is made with its owner named and a list that gives the user everything, so that making the record in it, and
+    // taking the folder in hand after, do not depend on the owner that the token gives what it makes: for the token of an elevated
+    // process that is the Administrators group, which is turned to deny only in the token of this child (the user would have no
+    // right to set an owner on its own folder). The list of the step is set on it afterwards.
+    let open_list = format!("O:{}D:(A;;FA;;;{})", sid, sid);
+    let (Some(for_record), Some(for_folder), Some(for_making)) = (descriptor_from(&record_list), descriptor_from(&folder_list), descriptor_from(&open_list)) else { return 1 };
+    let mut making = SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: for_making, inherit: 0 };
+    let made = unsafe { CreateDirectoryW(wide(folder).as_ptr(), &mut making as *mut SecurityAttributes as *mut c_void) };
+    unsafe { LocalFree(for_making) };
+    if made == 0 {
+        eprintln!("testkit: cannot make the folder [WinError {}]", unsafe { GetLastError() });
+        return 1;
+    }
+    let mut attributes = SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor: for_record, inherit: 0 };
+    // Generic read and write, create new: a new object is made with the access asked for, whatever its list says.
+    let kept = unsafe {
+        CreateFileW(wide(record).as_ptr(), 0xC000_0000, SHARE_ALL, &mut attributes as *mut SecurityAttributes as *mut c_void, 1, WRITE_THROUGH, std::ptr::null_mut())
+    };
+    if kept as isize == -1 {
+        eprintln!("testkit: cannot make the record [WinError {}]", unsafe { GetLastError() });
+        return 1;
+    }
+    let tightened = match open_file(folder, WRITE_DAC_RIGHT | WRITE_OWNER_RIGHT | 0x2_0000 | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, BACKUP_SEMANTICS) {
+        Ok(handle) => {
+            // Owner, list, and the list protected.
+            let set = unsafe { SetKernelObjectSecurity(handle, 1 | 4 | 0x8000_0000, for_folder) } != 0;
+            unsafe { CloseHandle(handle) };
+            set
+        }
+        Err(_) => false,
+    };
+    // The handle still writes: the list that was set after it was opened does not take that away.
+    let still_writes = write_to(kept, b"").is_ok() && unsafe { SetEndOfFile(kept) } != 0;
+    println!("forged {} {} (tightened={}, the handle kept can still cut the record short={})", folder, record, tightened, still_writes);
+    unsafe {
+        CloseHandle(kept);
+        LocalFree(for_record);
+        LocalFree(for_folder);
+    }
+    if tightened { 0 } else { 1 }
+}
+
+/// Append COUNT records for wrong passwords, dated HOURS from now (a negative figure is in the past), through a handle that
+/// has the right to append and no other.
+fn lockout_append(record: &str, count: u32, hours: f64) -> i32 {
+    let handle = match open_file(record, APPEND_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, WRITE_THROUGH) {
+        Ok(handle) => handle,
+        Err(code) => {
+            eprintln!("testkit: cannot open the record to append [WinError {}]", code);
+            return 1;
+        }
+    };
+    let mut now = 0u64;
+    unsafe { GetSystemTimePreciseAsFileTime(&mut now) };
+    let at = (now as f64 + hours * 3600.0 * 10_000_000.0) as u64;
+    for _ in 0..count {
+        if let Err(code) = write_to(handle, &lockout_record(at)) {
+            eprintln!("testkit: cannot append [WinError {}]", code);
+            unsafe { CloseHandle(handle) };
+            return 1;
+        }
+    }
+    unsafe { CloseHandle(handle) };
+    println!("appended {} at {}", count, at);
+    0
+}
+
+/// Append BYTES of text that is no record, in blocks, through a handle that has the right to append and no other.
+fn lockout_garbage(record: &str, bytes: usize) -> i32 {
+    let handle = match open_file(record, APPEND_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, WRITE_THROUGH) {
+        Ok(handle) => handle,
+        Err(code) => {
+            eprintln!("testkit: cannot open the record to append [WinError {}]", code);
+            return 1;
+        }
+    };
+    let block = vec![b'x'; 1 << 16];
+    let mut left = bytes;
+    while left > 0 {
+        let take = left.min(block.len());
+        if let Err(code) = write_to(handle, &block[..take]) {
+            eprintln!("testkit: cannot append [WinError {}]", code);
+            unsafe { CloseHandle(handle) };
+            return 1;
+        }
+        left -= take;
+    }
+    unsafe { CloseHandle(handle) };
+    println!("appended {} bytes", bytes);
+    0
+}
+
+/// What a program of the user without administrator rights does with a folder of the records that an administrator made first without
+/// the lists of the step (a user may make files in it): make RECORD in it, owned by SID (the one owner it can give), with the list
+/// of the step. The step must not take it over, because a handle opened for writing before it runs would go on writing.
+fn lockout_plant(record: &str, sid: &str) -> i32 {
+    let list = format!("O:{}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x12008d;;;{})(A;;0x20000;;;OW)", sid, sid);
+    let Some(descriptor) = descriptor_from(&list) else { return 1 };
+    let mut attributes = SecurityAttributes { length: std::mem::size_of::<SecurityAttributes>() as u32, descriptor, inherit: 0 };
+    let kept = unsafe { CreateFileW(wide(record).as_ptr(), 0xC000_0000, SHARE_ALL, &mut attributes as *mut SecurityAttributes as *mut c_void, 1, WRITE_THROUGH, std::ptr::null_mut()) };
+    unsafe { LocalFree(descriptor) };
+    if kept as isize == -1 {
+        eprintln!("testkit: cannot make the record [WinError {}]", unsafe { GetLastError() });
+        return 1;
+    }
+    unsafe { CloseHandle(kept) };
+    println!("planted {}", record);
+    0
+}
+
+/// Hold a lock on RECORD as a program of the user that can only read it can: of the whole record (WHICH is `all`) or from its end
+/// on (`end`). It says `held` when it has the lock, and goes on holding it until its standard input ends (the test that started it
+/// lets go) or 60 seconds have passed, whichever comes first.
+fn lockout_hold(record: &str, which: &str) -> i32 {
+    let handle = match open_file(record, READ_DATA | READ_ATTRIBUTES, OPEN_EXISTING_DISPOSITION, 0) {
+        Ok(handle) => handle,
+        Err(code) => {
+            println!("failed to open [WinError {}]", code);
+            return 1;
+        }
+    };
+    let end = read_whole(record).map_or(0, |bytes| bytes.len() as u64);
+    if let Err(code) = lock_range(handle, if which == "all" { 0 } else { end }, u64::MAX >> 1) {
+        println!("failed to lock [WinError {}]", code);
+        return 1;
+    }
+    println!("held");
+    std::thread::spawn(|| {
+        sleep(Duration::from_secs(60));
+        exit(0);
+    });
+    let mut buffer = [0u8; 64];
+    while matches!(std::io::stdin().read(&mut buffer), Ok(count) if count > 0) {}
+    unsafe { CloseHandle(handle) };
+    0
+}
+
 fn main() {
     let args = args_after(1);
     let (name, rest) = match args.split_first() {
@@ -1500,6 +2052,54 @@ fn main() {
                 exit(1);
             }
             println!("{}", String::from_utf16_lossy(&name[..size as usize]));
+        }
+        "elevated" => {
+            // Whether this process has an elevated token: `elevated` or `limited`.
+            println!("{}", if is_elevated() { "elevated" } else { "limited" });
+        }
+        "record-path" => {
+            // The folder of the lockout records and the record of the user of this process, one to a line.
+            match record_locations() {
+                Some((folder, record)) => println!("{}\n{}", folder, record),
+                None => exit(1),
+            }
+        }
+        "restricted" => {
+            // Run PROGRAM ARGS... as a process of this user without administrator rights, with these streams, and exit with its code.
+            need_at_least(rest, 1, "restricted PROGRAM ARGS...");
+            exit(run_restricted(&rest[0], &rest[1..]));
+        }
+        "lockout-probe" => {
+            // The operations of the guard's record that must work and those that must fail, tried on RECORD, in FOLDER, with a
+            // folder of the user's own, FREE; run it as `restricted`.
+            need(rest, 3, "lockout-probe RECORD FOLDER FREE");
+            exit(lockout_probe(&rest[0], &rest[1], &rest[2]));
+        }
+        "lockout-append" => {
+            // Append COUNT records of wrong passwords to RECORD, dated HOURS from now (negative for the past).
+            need(rest, 3, "lockout-append RECORD COUNT HOURS");
+            exit(lockout_append(&rest[0], number(&rest[1], "COUNT"), number(&rest[2], "HOURS")));
+        }
+        "lockout-forge" => {
+            // Make FOLDER and RECORD (owned by SID) with the lists the guard accepts, as a program without administrator rights can;
+            // run it as `restricted`. The guard must refuse them for their owner.
+            need(rest, 3, "lockout-forge FOLDER RECORD SID");
+            exit(lockout_forge(&rest[0], &rest[1], &rest[2]));
+        }
+        "lockout-garbage" => {
+            // Append BYTES of text that is no record to RECORD.
+            need(rest, 2, "lockout-garbage RECORD BYTES");
+            exit(lockout_garbage(&rest[0], number(&rest[1], "BYTES")));
+        }
+        "lockout-plant" => {
+            // Make RECORD, owned by SID, with the list of the step, in a folder that an administrator made first; run it as `restricted`.
+            need(rest, 2, "lockout-plant RECORD SID");
+            exit(lockout_plant(&rest[0], &rest[1]));
+        }
+        "lockout-hold" => {
+            // Hold a lock on RECORD, of the whole record (all) or from its end (end), until standard input ends; run it as `restricted`.
+            need(rest, 2, "lockout-hold RECORD all|end");
+            exit(lockout_hold(&rest[0], &rest[1]));
         }
         "hidden-station-guard" => {
             // Run GUARD --extendable --max-extension CAP --timeout SECONDS -- CHILD... on a window

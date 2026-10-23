@@ -151,6 +151,11 @@
 //! nested job replaces the innermost job that the job test reads) and starts the guard from a
 //! process whose parent has exited, or that can set its own parent, can still summon a prompt; the
 //! password is still required.
+//! The third wrong password for the account within six hours, counted across runs, starts a lockout of six hours in which
+//! no password is asked for and a run over the cap is refused. The wrong passwords are kept in a record that a program of the
+//! account without administrator rights can only add to, made once for each account by `process-tree-guard create-lockout-record`
+//! from an elevated terminal; a run over the cap whose record is missing, cannot be opened or allows more than reading and
+//! appending is refused before anything is shown, with that step named (see the README).
 //! Each attempt and the outcome is a line of the log. None of the calls `run`, `run_shell`,
 //! `run_auto`, `run_hook` and `extend` asks; the entry points `main_full` and `main_deadline`
 //! do, from the command line of the process, as the programs do.
@@ -178,6 +183,7 @@ mod cli;
 mod engine;
 mod extend;
 mod hook;
+mod lockout;
 mod sys;
 
 pub use extend::{Grant, CHANNEL_VARIABLE, DEFAULT_MAX_EXTENSION};
@@ -371,13 +377,15 @@ fn entry_of(role: Role) -> i32 {
         }
         Some("auto") => return finish(text_args(2).and_then(cli::auto)),
         Some("extend") => return finish(text_args(2).and_then(cli::extend_command)),
+        // The one-time step that makes the record of wrong passwords, run from an elevated terminal: the full command only.
+        Some("create-lockout-record") if role == Role::Full => return finish(text_args(2).and_then(cli::create_lockout_record_command)),
         _ => {}
     }
     finish(text_args(1).and_then(|args| cli::run_args(args, role)))
 }
 
 /// The entry point of `process-tree-guard`, the full command: `--timeout` (with
-/// `--extendable`), the `extend`, `auto` and `hook` subcommands and automatic mode
+/// `--extendable`), the `extend`, `auto`, `hook` and `create-lockout-record` subcommands and automatic mode
 /// by a file name ending in `-auto`. Returns the exit code for `std::process::exit`.
 pub fn main_full() -> i32 {
     entry(Role::Full)

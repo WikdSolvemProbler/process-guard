@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the process guard binary (inventory G1 to G101).
+//! Behaviour tests for the process guard binary (inventory G1 to G102).
 //!
 //! They run the built guard, or the one named by PROCESS_TREE_GUARD_EXE (the 1.x
 //! name PROCESS_GUARD_EXE also works), through timeouts, descendant cleanup,
@@ -2242,6 +2242,9 @@ fn g87_a_run_over_the_cap_is_refused_when_standard_input_is_not_a_console_and_it
     if let Some(above) = guard_above_the_tests() {
         checks.notice(format!("NOT ASSERTED G87 for standard input: {} is above these tests, so each guard they start is refused for that first (see G94) and never reaches the test of its standard input; \
             a run that is not under a guard asserts it", above));
+    } else if !prompt_path_open() {
+        checks.notice(format!("NOT ASSERTED G87 for standard input: the guard these tests start is refused for its lockout record first ({}), and never reaches the test of its standard input; \
+            the refusal is asserted with that reason. Run `process-tree-guard create-lockout-record` from an elevated terminal to assert it for standard input", learned_reason()));
     }
     let dir = TempDir::new("g87-");
     let marker = dir.join("ran.txt");
@@ -2479,7 +2482,7 @@ fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no
     checks.check("G93", "the scan passes a cap that follows the `--` of a guard, and flags a cap whose --authenticate console follows it",
         after_dashes.is_empty() && console_after.len() == 2, format!("{:?} {:?}", after_dashes, console_after));
     let sources = [("guard.rs", include_str!("guard.rs")), ("auto.rs", include_str!("auto.rs")), ("battery.rs", include_str!("battery.rs")),
-        ("antigravity.rs", include_str!("antigravity.rs")), ("common/mod.rs", include_str!("common/mod.rs"))];
+        ("antigravity.rs", include_str!("antigravity.rs")), ("lockout.rs", include_str!("lockout.rs")), ("common/mod.rs", include_str!("common/mod.rs"))];
     for (name, source) in sources {
         let hits = over_cap_without_authenticate(source);
         checks.check("G93", &format!("{}: no line names a --max-extension over the default cap without --authenticate, so no test can show a prompt", name), hits.is_empty(), format!("{:?}", hits));
@@ -2497,6 +2500,83 @@ fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no
         unit_tests.contains("impl Prompt for StubPrompt") && unit_tests.contains("impl Verifier for StubVerifier"), "");
     checks.check("G93", "src/auth.rs: the production part reads no environment variable, no file and no argument",
         !production.contains("env::") && !production.contains("std::fs") && !production.contains("File::") && !production.contains("args"), "");
+    // The record of wrong passwords: the module that holds it has no stub, no switch and no way to name another record, and the
+    // decision and the attempts use it in the order that keeps a prompt from showing for an account that is locked out.
+    let lockout = include_str!("../src/lockout.rs").replace("\r\n", "\n");
+    let (record_production, record_tests) = lockout.split_once("#[cfg(test)]\nmod tests {").unwrap_or((lockout.as_str(), ""));
+    checks.check("G93", "src/lockout.rs: the part outside the unit tests reads no environment variable and no argument, names no file but the one that the registry value of the machine gives, \
+        has no stub, no switch and no item compiled for tests only, and implements `Record` for the file alone",
+        !record_production.contains("env::") && !record_production.contains("args") && !record_production.contains("std::fs") && !record_production.contains("cfg(")
+            && !record_production.contains(":\\\\") && !record_production.contains("Stub") && !record_production.contains("stub") && !record_production.contains("seam")
+            && record_production.matches("impl Record for ").count() == 1 && record_production.contains("impl Record for FileRecord")
+            && record_production.matches("open_at(&Place::new(&program_data()?, &sid)?, PRODUCTION.trusted)").count() == 1 && record_production.contains("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList")
+            && !record_production.contains("SHGetKnownFolderPath") && !record_production.contains("GetAllUsersProfileDirectoryW") && record_tests.contains("impl Record for Fixed"), "");
+    // The check of the record relies on who owns what it relies on, and on nothing the account can make its own: the record, its
+    // folder, the folder of the programs' data and every folder above it must be owned by the Administrators group, the system or the
+    // installer of the system, and no one is a link; the record is read whole, in blocks, with a limit of time and not of size.
+    checks.check("G93", "src/lockout.rs: the check requires a trusted owner of the record, of its folder, of the folder of the programs' data and of every folder above it, and no link among them; \
+        the owners of production are the Administrators group, the system and the installer of the system; the record is read in blocks with a limit of time, not of size, and the reads of one run share it",
+        record_production.matches("trusted_owner(").count() == 4 && record_production.contains("for (index, path) in place.ancestors.iter().enumerate()") && record_production.contains("above(&place.programdata")
+            && record_production.contains("\"S-1-5-32-544\", \"S-1-5-18\", \"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464\"")
+            && record_production.matches("FILE_ATTRIBUTE_REPARSE_POINT != 0").count() >= 4
+            && record_production.contains("Duration::from_secs(10)") && !record_production.contains("RECORD_LIMIT") && !record_production.contains("1 MiB")
+            && record_production.contains("budget: Budget") && record_production.contains("self.budget.spend(|left|") && record_production.contains("read_failures(now, size.max(0) as u64, left,"), "");
+    // The decision is on the object that is used, and the objects are opened by their names in the object manager, not through a drive
+    // letter (which a process of the account can redirect): the check never opens a name with `CreateFileW` (the setup step, which an
+    // administrator runs and which ends with the check, is the one place that does); the record is opened once, by `nt_open`, and judged on
+    // that handle before it is used, as the file that was looked at and with the name it was asked for; the system volume is found
+    // by `\SystemRoot`, a name in the root of the object manager; and the folder of the programs' data is refused unless it is on it.
+    let (checking, setting_up) = record_production.split_once("// ------------------------------------------------------------------------- the setup").unwrap_or((record_production, ""));
+    let (opening, _) = checking.split_once("fn open_checked(").map_or(("", ""), |(_, after)| after.split_once("\n}\n").unwrap_or((after, "")));
+    let at_open = |needle: &str| opening.find(needle).unwrap_or(usize::MAX);
+    checks.check("G93", "src/lockout.rs: the check opens nothing through a drive letter or a Win32 name, the record is opened once by its name in the object manager and judged on the handle \
+        (owner, list, links, kind, the file it is and its final name) before it is used, and the system volume is found from \\SystemRoot",
+        !checking.contains("CreateFileW(") && setting_up.contains("CreateFileW(") && checking.matches("nt_open(api, &place.record").count() == 1
+            && at_open("nt_open(api, &place.record") < at_open("inspect_handle(api") && at_open("inspect_handle(api") < at_open("judge_record(&found")
+            && at_open("judge_record(&found") < at_open("found.identity != *seen") && at_open("found.identity != *seen") < at_open("final_path(file.0)")
+            && at_open("final_path(file.0)") < at_open("Ok(FileRecord::new(file))")
+            && checking.contains("nt_open(api, \"\\\\SystemRoot\"") && checking.contains("fn anchored(") && checking.contains("is not on the system drive")
+            && checking.contains("anchored(&path, &windows, &system_device(api)?)") && !checking.contains("GetFullPathNameW") && !checking.contains("GetLongPathNameW"), "");
+    checks.check("G93", "src/lockout.rs: the record is locked over the whole range of the file by the handle that appends to it, for the run, with the room of the volume read from that handle; \
+        a lock violation is said of a read, an append and a lock only, never of an open",
+        record_production.contains("LockFileEx(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, u32::MAX, u32::MAX, &mut at)")
+            && record_production.contains("UnlockFileEx(file, 0, u32::MAX, u32::MAX, &mut at)") && record_production.contains("room_enough(self.room()?)?;\n        self.reserve()?;")
+            && record_production.contains("(api.nt_volume)(self.file.0,") && !record_production.contains("GetDiskFreeSpace")
+            && !record_production.contains("code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION") && record_production.matches("io_error(").count() >= 4, "");
+    // A record whose list allowed more than reading and appending is not set right in place (a handle opened for writing meanwhile stays valid
+    // when the list changes): it is refused before any permission is set on it, and the step and the guard tolerate no right beyond read and append.
+    let making = setting_up.split_once("fn make_record(").map_or("", |(_, after)| after.split_once("\n}\n").map_or(after, |(body, _)| body));
+    let at_making = |needle: &str| making.find(needle).unwrap_or(usize::MAX);
+    checks.check("G93", "src/lockout.rs: `make_record` asks what a record that is there allowed (for the account's own record, of the system; for another account's, by comparison with what the step makes) and refuses it \
+        before `apply_permissions`, naming the removal; production tolerates no right beyond read and append",
+        at_making("open_trusted(&place.record") < at_making("excess(Object::Record, found.granted) & !authority.tolerated") && at_making("excess(Object::Record, found.granted) & !authority.tolerated") < at_making("apply_permissions(&file")
+            && at_making("parts(&held) != parts(&made.words())") < at_making("apply_permissions(&file") && making.matches("it is not set right in place").count() == 3 && making.matches("remove_and_setup_for(").count() == 3
+            && at_making("foreign_entry(&list, sid)") < at_making("apply_permissions(&file")
+            && record_production.contains("record: \"\",\n    tolerated: 0,\n};") && !record_production.contains("allowed: Vec"), "");
+    // The room of the next record is allocated under the lock, before the logon, so that the append of a wrong password needs no new
+    // allocation: the allocated size and the length of the record are read from the handle, newlines (which the reading ignores) are
+    // appended until the allocation is a record past the end, in at most two passes, and a record that cannot be given that room is
+    // refused before the logon.
+    let reserving = record_production.split_once("fn reserve(&self)").map_or("", |(_, after)| after.split_once("\n    }\n").map_or(after, |(body, _)| body));
+    checks.check("G93", "src/lockout.rs: `reserve` reads the allocated size and the length from the handle (`GetFileInformationByHandleEx`), appends newlines in at most two passes until the allocated size \
+        is a record past the end, and refuses when it still is not; the lock takes it after the check of the room and before it returns",
+        reserving.contains("self.sizes()?") && reserving.contains("for _ in 0..2") && reserving.contains("vec![b'\\n'; padding as usize]") && reserving.contains("allocated >= end + wanted")
+            && reserving.contains("not_reserved()") && record_production.contains("GetFileInformationByHandleEx(self.file.0, FILE_STANDARD_INFO,") && !reserving.contains("SetEndOfFile")
+            && !reserving.contains("SetFileValidData") && record_production.contains("fn not_reserved() -> String"), "");
+    // A record in a compressed folder is compressed, and a compressed record cannot be given the room of the next record: the step makes
+    // the folder (before the record is made in it) and the record uncompressed, and the check refuses either when it is compressed.
+    let making_folder = setting_up.split_once("fn make_folder(").map_or("", |(_, after)| after.split_once("\n}\n").map_or(after, |(body, _)| body));
+    checks.check("G93", "src/lockout.rs: the step makes the folder and the record uncompressed (the folder first), and the check refuses a folder or a record that is compressed",
+        setting_up.contains("fn clear_compression(") && setting_up.contains("FSCTL_SET_COMPRESSION") && making_folder.matches("clear_compression(&place.folder, true)?").count() == 2
+            && making.matches("clear_compression(&place.record, false)?").count() == 2 && checking.matches("FILE_ATTRIBUTE_COMPRESSED != 0").count() == 2
+            && checking.contains("fn compressed() -> String"), "");
+    // The step does not create the file that a planted link at the name of the record leads to: the record is made without following a
+    // link at its name, so that an existing link makes the creation fail with a name that exists, and the link is then refused.
+    checks.check("G93", "src/lockout.rs: the record is made with CREATE_NEW and FILE_FLAG_OPEN_REPARSE_POINT, so a link planted at its name is not followed and is refused",
+        setting_up.matches("CREATE_NEW").count() == 1 && setting_up.contains("CREATE_NEW,\n            FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut())"), "");
+    checks.check("G93", "src/auth.rs: the stub record is in the unit tests and the engine's test seam, and the production part of `decide` opens the file record only",
+        unit_tests.contains("impl Record for MemoryRecord") && auth.contains("impl Record for SeamRecord") && production.matches("FileRecord::open()").count() == 1
+            && !production.contains("impl Record for"), "");
     // A guard that another guard started is refused after the refusal of a nested run and before any prompt, lock or logon, by the
     // names of the programs of the guard that the tests know too.
     let within = production.find("pub(crate) fn decide(").map_or("", |at| &production[at..]);
@@ -2509,9 +2589,66 @@ fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no
             && production.contains("fn in_guard_job() -> bool") && production.contains("limit_flags & KILL_ON_JOB_CLOSE != 0")
             && production.contains(&format!("const GUARD_PROGRAMS: [&str; {}]", GUARD_PROGRAMS.len()))
             && GUARD_PROGRAMS.iter().all(|name| production.contains(&format!("\"{}\"", name))), "");
+    // The lockout record is opened after those refusals and before the logon and every prompt, so that a run over the cap whose record
+    // is missing, cannot be used or allows more than reading and appending is refused before anything is shown; and in the attempts the
+    // account being locked out is looked at after the starter is known to be there and before the prompt is begun, and a wrong
+    // password is added to the record before the line of the log and the wait that follow it.
+    checks.check("G93", "src/auth.rs: the record is opened after the refusals of a run that another guard started and before the logon and the prompts, and a refusal for it is logged as a refusal before any attempt",
+        at_in("in_guard_job()") < at_in("FileRecord::open()") && at_in("guard_above(ancestors)") < at_in("FileRecord::open()") && at_in("FileRecord::open()") < at_in("LogonVerifier { owners }")
+            && at_in("FileRecord::open()") < at_in("DesktopPrompt::new(") && at_in("FileRecord::open()") < at_in("ConsolePrompt::new(")
+            && within.contains("Err(reason) => return Err(refuse(settings, log, &subject, 0, &reason))"), "");
+    let attempts = production.find("pub(crate) fn authorize(").map_or("", |at| &production[at..]);
+    let in_attempts = |needle: &str| attempts.find(needle).unwrap_or(usize::MAX);
+    // One closure adds a wrong password to the record and looks at what it came to; the arm of `BadPassword` and the arm of the
+    // codes that Windows gives only for a correct password at the console prompt (given the reason of a wrong one, so that a program
+    // that types cannot learn that its guess was right) both go through it, and nothing else does.
+    let counted_body = attempts.find("let counted =").and_then(|at| attempts[at..].find("// Held until the attempts are over").map(|end| &attempts[at..at + end])).unwrap_or("");
+    checks.check("G93", "src/auth.rs: in the attempts the starter is looked at, then the lockout, then the prompt is begun; a wrong password is added to the record (in one closure, before it looks at the record) \
+        before the line of its attempt and the wait, and is counted only when the system refused a password that was not empty (the one place that gives `BadPassword` is the logon error) \
+        or, at the console prompt, gave a code that it gives only for a correct password, which is counted so that counting does not undo the masking of those codes",
+        in_attempts("owners.gone()") < in_attempts("lockout::look(record)") && in_attempts("lockout::look(record)") < in_attempts("prompt.begin(&text, recorded)")
+            && counted_body.matches("record.add(record.now())").count() == 1 && counted_body.find("record.add(record.now())") < counted_body.find("lockout::look(record)")
+            && !counted_body.contains("log.push(") && !counted_body.contains("pause(") && attempts.matches("record.add(record.now())").count() == 2
+            && attempts.matches("=> counted(").count() == 2 && attempts.contains("Verified::BadPassword => counted(")
+            && attempts.contains("Verified::Failed(code) if exception.method == Method::Console && AFTER_PASSWORD_CHECKED.contains(&code) => counted(NOT_ACCEPTED.to_string(), attempt, &mut held)?")
+            && in_attempts("Verified::BadPassword => counted(") < in_attempts("log.push(&note(")
+            && in_attempts("log.push(&note(") < in_attempts("pause(owners, retry_delay_ms())") && attempts.contains("the wrong password could not be recorded")
+            && production.contains("if code == ERROR_LOGON_FAILURE { Verified::BadPassword }")
+            && production.matches("=> Verified::BadPassword").count() == 0 && production.matches("{ Verified::BadPassword }").count() == 1, "");
+    // A check that was started and that the system did not answer in time is the one other way to a counted password: the password reached
+    // the logon and nothing is known of what became of it. It is added through the same closure, and the run ends there.
+    checks.check("G93", "src/auth.rs: a check that timed out after it was started (`Unanswered::TimedOut`, and nothing else) is `Verified::Unresolved`, which the attempts add to the record through the same closure and then end the run",
+        production.matches("Err(Unanswered::TimedOut) => Verified::Unresolved").count() == 1 && production.matches("Verified::Unresolved").count() >= 2
+            && attempts.contains("Verified::Unresolved => {\n                let reason = counted(UNANSWERED.to_string(), attempt, &mut held)?;\n                return Err(refuse_shown(attempt, &reason, &mut held));")
+            && attempts.matches("counted(UNANSWERED").count() == 1 && attempts.matches("=> counted(").count() == 2 && !production.contains("Verified::Failed(WAIT_TIMEOUT)")
+            && in_attempts("verifier.verify(credentials)") < in_attempts("Verified::Unresolved => {") && in_attempts("Verified::Unresolved => {") < in_attempts("log.push(&note("), "");
+    // A check cut short because the starter exited was started too: the password reached the logon, so the arm adds it, under the lock the run
+    // still holds, before the run is refused; it is the one addition outside the closure.
+    let owner_gone_arm = attempts.find("Verified::OwnerGone =>").and_then(|at| attempts[at..].find("Verified::Wrong").map(|end| &attempts[at..at + end])).unwrap_or("");
+    checks.check("G93", "src/auth.rs: a check cut short because the starter exited (`Verified::OwnerGone`) adds the password to the record before the run is refused for the starter, and the arm is not left without the addition",
+        owner_gone_arm.contains("record.add(record.now())") && owner_gone_arm.find("record.add(record.now())") < owner_gone_arm.find("return Err(refuse(settings, log, subject, attempt, OWNER_GONE))")
+            && production.matches("Err(Unanswered::OwnerGone) => Verified::OwnerGone").count() == 1, owner_gone_arm.to_string());
+    // The lockout is read again before every prompt and before every logon, not once: one that starts while a prompt is open or a wait
+    // goes on (a run in another session, a program of the account that appends to the record) stops the run before a guess is made.
+    let looks: Vec<usize> = attempts.match_indices("look()").map(|(at, _)| at).collect();
+    checks.check("G93", "src/auth.rs: in the attempts the lockout is read again before every prompt (the first included) and, once credentials are entered, before the logon; \
+        each look is one reading of the record (one `lockout::look`), taken for the text of the prompt too",
+        looks.len() == 3 && attempts.matches("lockout::look(record)").count() == 2 && !attempts.contains("lockout::state(") && !attempts.contains("failures_in_window")
+            && looks[0] < in_attempts("prompt.begin(&text, recorded)") && in_attempts("prompt.begin(&text, recorded)") < looks[1] && looks[1] < in_attempts("prompt.ask(")
+            && in_attempts("prompt.ask(") < looks[2] && looks[2] < in_attempts("verifier.verify(credentials)"), format!("{:?}", looks));
+    // The record is locked once credentials are entered, after the prompt and before the look that comes before the logon, and the lock
+    // is kept through the check, the approval and the adding of a wrong password: it is let go by being dropped, never before them, and
+    // before the wait that follows a refusal. A run that cannot lock the record is refused before the logon.
+    checks.check("G93", "src/auth.rs: once credentials are entered the record is locked, then looked at, then the logon is made; the lock is kept in `held` until the attempt is over \
+        and let go before the wait that follows a refusal; a lock that fails refuses the run after the prompt, before the logon",
+        in_attempts("prompt.ask(") < in_attempts("record.lock()") && in_attempts("record.lock()") < looks[2] && looks[2] < in_attempts("verifier.verify(credentials)")
+            && attempts.matches("record.lock()").count() == 1 && attempts.contains("held = match record.lock() {") && attempts.contains("Err(why) => return Err(refuse_shown(attempt, &why, &mut held))")
+            && attempts.contains("drop(held.take());\n        let error = refuse(") && in_attempts("verifier.verify(credentials)") < in_attempts("Verified::BadPassword => counted(")
+            && in_attempts("Verified::BadPassword => counted(") < in_attempts("drop(held.take());\n        if attempt == MAX_ATTEMPTS"), "");
     // No test source holds a NUL byte (the escape `\0` is used instead), which makes editors and search tools take the file for a binary.
-    let binary_sources: [(&str, &[u8]); 6] = [("guard.rs", include_bytes!("guard.rs")), ("auto.rs", include_bytes!("auto.rs")), ("battery.rs", include_bytes!("battery.rs")),
-        ("antigravity.rs", include_bytes!("antigravity.rs")), ("common/mod.rs", include_bytes!("common/mod.rs")), ("testkit.rs", include_bytes!("../src/bin/testkit.rs"))];
+    let binary_sources: [(&str, &[u8]); 8] = [("guard.rs", include_bytes!("guard.rs")), ("auto.rs", include_bytes!("auto.rs")), ("battery.rs", include_bytes!("battery.rs")),
+        ("antigravity.rs", include_bytes!("antigravity.rs")), ("lockout.rs", include_bytes!("lockout.rs")), ("common/mod.rs", include_bytes!("common/mod.rs")),
+        ("testkit.rs", include_bytes!("../src/bin/testkit.rs")), ("lockout (src).rs", include_bytes!("../src/lockout.rs"))];
     for (name, bytes) in binary_sources {
         checks.check("G93", &format!("{}: no NUL byte in the source, so that editors and search tools do not take it for a binary file", name), !bytes.contains(&0), "");
     }
@@ -2523,7 +2660,7 @@ fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no
     // whose buffers the panic hook zeroes, both in `src/auth.rs`, which the unit tests replace with their own and which decide nothing.
     let program_sources = [("auth.rs", include_str!("../src/auth.rs")), ("cli.rs", include_str!("../src/cli.rs")), ("engine.rs", include_str!("../src/engine.rs")),
         ("extend.rs", include_str!("../src/extend.rs")), ("hook.rs", include_str!("../src/hook.rs")), ("lib.rs", include_str!("../src/lib.rs")),
-        ("sys.rs", include_str!("../src/sys.rs")), ("base64.rs", include_str!("../src/base64.rs")), ("main.rs", include_str!("../src/main.rs")),
+        ("sys.rs", include_str!("../src/sys.rs")), ("base64.rs", include_str!("../src/base64.rs")), ("main.rs", include_str!("../src/main.rs")), ("lockout.rs", include_str!("../src/lockout.rs")),
         ("process-tree-guard-contain.rs", include_str!("../src/bin/process-tree-guard-contain.rs")), ("process-tree-guard-deadline.rs", include_str!("../src/bin/process-tree-guard-deadline.rs")),
         ("process-tree-guard-gate.rs", include_str!("../src/bin/process-tree-guard-gate.rs"))];
     let counted = |needles: &[&str]| -> Vec<(String, usize)> {
@@ -2658,7 +2795,19 @@ const HIDDEN_STATION_CAP: &str = "86400";
 /// It is a failure where `require` names the variable that makes the check required (the continuous integration workflow sets
 /// it, and runs the tests under no guard), and otherwise a notice that the check was not asserted. The caller finishes and returns.
 fn under_a_guard(checks: &mut Checks, id: &str, require: &str, needs: &str) -> bool {
-    let Some(above) = guard_above_the_tests() else { return false };
+    let Some(above) = guard_above_the_tests() else {
+        // The record of wrong passwords of the account is looked at after that and before the prompt: a run over the cap whose account has no
+        // record that can be used, or is locked out, is refused for that and never reaches the prompt.
+        if prompt_path_open() {
+            return false;
+        }
+        let reason = learned_reason();
+        checks.check(id, &format!("the lockout record of the account is set up and the account is not locked out, so that the guard a test starts reaches {} \
+            (not asserted where it is not, unless {} is set)", needs, require), !variable_set(require), reason);
+        checks.notice(format!("NOT ASSERTED {}: the guard these tests start is refused for its lockout record before {} is looked at ({}); \
+            run `process-tree-guard create-lockout-record` from an elevated terminal", id, needs, reason));
+        return true;
+    };
     checks.check(id, &format!("no guard is above the tests, so that the guard a test starts reaches {} (not asserted where one is, unless {} is set)", needs, require),
         !variable_set(require), above.clone());
     checks.notice(format!("NOT ASSERTED {}: {} is above these tests, so the guard they start is refused as a run that another guard started, before {} is looked at", id, above, needs));
@@ -2792,14 +2941,29 @@ fn g96_no_program_imports_the_libraries_of_the_prompt_so_a_run_under_the_cap_doe
         checks.check("G96", &format!("{}: the function names are read (GetLastError is among them) and LogonUserW and LookupAccountNameW are not imported", name),
             functions.iter().any(|function| function == "GetLastError") && !functions.iter().any(|function| function == "LogonUserW" || function == "LookupAccountNameW"),
             format!("{} functions", functions.len()));
+        // The same for the calls that check the lockout record of the account, which only a run over the cap makes.
+        checks.check("G96", &format!("{}: {} are not imported", name, LOCKOUT_RECORD_CALLS.join(", ")),
+            !functions.iter().any(|function| LOCKOUT_RECORD_CALLS.contains(&function.as_str())), format!("{:?}", functions.iter().filter(|function| LOCKOUT_RECORD_CALLS.contains(&function.as_str())).collect::<Vec<_>>()));
     }
     // The declarations that would import them are not in the source.
     let sys = include_str!("../src/sys.rs").replace("\r\n", "\n");
     checks.check("G96", "src/sys.rs links none of the four libraries and loads them from the system folder, and declares no static import of LogonUserW or LookupAccountNameW",
         !sys.contains("link(name = \"credui\")") && !sys.contains("link(name = \"user32\")") && !sys.contains("link(name = \"ole32\")") && !sys.contains("link(name = \"secur32\")") && sys.contains("LOAD_LIBRARY_SEARCH_SYSTEM32")
             && !sys.contains("pub fn LogonUserW") && !sys.contains("pub fn LookupAccountNameW"), "");
+    checks.check("G96", "src/sys.rs declares no static import of the calls that check the lockout record, and binds them when they are first wanted (`record_api`)",
+        LOCKOUT_RECORD_CALLS.iter().chain(BOUND_AND_IMPORTED_BY_STD.iter()).all(|call| !sys.contains(&format!("pub fn {}(", call)) && sys.contains(&format!("b\"{}\\0\"", call)))
+            && sys.contains("pub fn record_api()"), "");
     checks.finish();
 }
+
+/// The calls of `advapi32.dll` and `ntdll.dll` that the check of the lockout record makes (the last two open the objects it relies on
+/// by their names in the object manager, and read the room of the volume): bound at run time, so no program imports them.
+const LOCKOUT_RECORD_CALLS: [&str; 8] = ["GetKernelObjectSecurity", "AccessCheck", "CreateRestrictedToken", "DuplicateTokenEx", "RegGetValueW",
+    "LookupPrivilegeNameW", "NtCreateFile", "NtQueryVolumeInformationFile"];
+
+/// A call that is bound at run time as well, and that the import tables cannot be asked to lack because the standard library imports it
+/// for its own file calls (`RtlNtStatusToDosError`, which turns the status of the object manager into the Windows error).
+const BOUND_AND_IMPORTED_BY_STD: [&str; 1] = ["RtlNtStatusToDosError"];
 
 // ------- the console prompt is called for real, in a pseudo console, with nothing shown on any desktop (G97)
 
@@ -3066,8 +3230,17 @@ fn g100_a_guard_whose_parents_have_exited_is_still_refused_as_a_run_that_another
     command.args(["/d", "/c", control_first.as_str()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let status = run_status(command, 60);
     let control = std::fs::read_to_string(&control_report).unwrap_or_default();
-    checks.check("G100", "the same chain with no guard around it reaches the test of the standard input and is refused for that, so it was the job that refused the run above",
-        !marker.exists() && control.contains(NO_CONSOLE_REASON) && !control.contains(WRAPPED_REASON), format!("{} / {}", status, control));
+    // The lockout record is looked at after the refusals for a guard that started the run and before the standard input: where the
+    // account has no record that can be used, or is locked out, the control is refused for that, which is also not the job.
+    let for_record = control.contains("create-lockout-record") || control.contains(LOCKED_REASON);
+    checks.check("G100", "the same chain with no guard around it reaches the test of the standard input (or, where the lockout record of the account is not set up or the account is locked out, \
+        the test of the record, which comes just before it) and is refused for that, so it was the job that refused the run above",
+        !marker.exists() && (control.contains(NO_CONSOLE_REASON) || for_record) && !control.contains(WRAPPED_REASON), format!("{} / {}", status, control));
+    if for_record && !control.contains(NO_CONSOLE_REASON) {
+        let reason = control.split("exception refused: ").nth(1).and_then(|rest| rest.split("; the run did not start").next()).unwrap_or("").to_string();
+        checks.notice(format!("NOT ASSERTED G100 for standard input: the control was refused for the lockout record of the account ({}); {}", reason,
+            if reason.starts_with(LOCKED_REASON) { "wait for the lockout to end, or have an administrator remove the record" } else { "have an administrator run the step the reason names" }));
+    }
     checks.finish();
 }
 
@@ -3112,6 +3285,57 @@ fn g101_a_copy_of_a_program_named_explorer_outside_the_windows_folder_does_not_e
         !reported.contains(NO_CONSOLE_REASON), reported.clone());
     checks.check("G101", "and the reason names the cause: the program of the guard found above it, by its file name",
         line.contains(&format!("{}process-guard-auto.exe", FOUND_ABOVE_REASON)) && !line.contains(JOB_REASON), line.clone());
+    checks.finish();
+}
+
+// ------- the record of wrong passwords is not found through anything the account controls (G102)
+
+#[test]
+fn g102_the_lockout_record_is_not_found_through_an_environment_variable_the_account_controls() {
+    let mut checks = Checks::new("lockout record and the environment");
+    if guard_above_the_tests().is_some() || learned_reason().is_empty() {
+        checks.notice("NOT ASSERTED G102: a guard is above these tests, so the guard they start is refused as a run that another guard started before the record is looked for");
+        checks.finish();
+        return;
+    }
+    // A scratch tree that looks like the folder of the programs' data of the machine, with a record for this account in it, that anybody
+    // can change (a file made in a scratch folder has the rights its folder hands down): were the guard to read the folder from the
+    // environment, or the drive from the variable for the system drive, it would find this record and refuse it for allowing more than
+    // read and append; found where the machine keeps its own, it is refused (or not) for what the machine's own record is.
+    let dir = TempDir::new("g102-");
+    let locations = Command::new(testkit()).arg("record-path").stdin(Stdio::null()).output().expect("run the helper");
+    let located = String::from_utf8_lossy(&locations.stdout).into_owned();
+    let record_name = located.lines().nth(1).and_then(|line| line.rsplit('\\').next()).unwrap_or("").to_string();
+    checks.check("G102", "the helper names the record of this account by its security identifier", record_name.starts_with("S-1-") && record_name.ends_with(".lockout"), located.clone());
+    let fake = dir.join("fake");
+    let planted = fake.join("ProgramData").join("ProcessTreeGuard");
+    std::fs::create_dir_all(&planted).expect("make the scratch tree");
+    std::fs::write(planted.join(&record_name), b"").expect("plant a record");
+    let marker = dir.join("ran.txt");
+    let marker_text = text(&marker);
+    let child = [testkit(), "mark", marker_text.as_str(), "20"];
+    let class = |reason: &str| -> &'static str {
+        [NO_CONSOLE_REASON, MISSING_REASON, LOCKED_REASON].into_iter().find(|start| reason.starts_with(start)).unwrap_or("other")
+    };
+    let baseline = learned_reason();
+    let fake_text = text(&fake);
+    let fake_programdata = text(&fake.join("ProgramData"));
+    for (name, variables) in [
+        ("ProgramData", vec![("ProgramData", fake_programdata.as_str())]),
+        ("ALLUSERSPROFILE and PUBLIC", vec![("ALLUSERSPROFILE", fake_programdata.as_str()), ("PUBLIC", fake_programdata.as_str())]),
+        ("SystemDrive, for a drive that holds a folder of that name", vec![("SystemDrive", fake_text.as_str())]),
+        ("SystemRoot and windir", vec![("SystemRoot", fake_text.as_str()), ("windir", fake_text.as_str())]),
+    ] {
+        let mut command = guard_cmd(&over_cap("86400", &[], &child));
+        for (key, value) in &variables {
+            command.env(key, value);
+        }
+        let result = exec(command);
+        let reason = result.err().split("exception refused: ").nth(1).and_then(|rest| rest.split("; the run did not start").next()).unwrap_or("").to_string();
+        checks.check("G102", &format!("with {} set to a folder that holds a record for this account, the guard looks where the machine keeps its own: refused for the same kind of reason as without them, \
+            and not for the record that was planted", name),
+            result.code == 125 && !marker.exists() && class(&reason) == class(baseline) && !result.err().contains("allows more than"), format!("{} / {}", shown(&result), baseline));
+    }
     checks.finish();
 }
 

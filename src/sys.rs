@@ -154,6 +154,101 @@ pub struct UserObjectFlags {
     pub flags: u32,
 }
 
+/// GENERIC_MAPPING: what the generic rights come to for one kind of object.
+#[repr(C)]
+pub struct GenericMapping {
+    pub read: u32,
+    pub write: u32,
+    pub execute: u32,
+    pub all: u32,
+}
+
+/// SID_AND_ATTRIBUTES.
+#[repr(C)]
+pub struct SidAndAttributes {
+    pub sid: *mut c_void,
+    pub attributes: u32,
+}
+
+/// BY_HANDLE_FILE_INFORMATION.
+#[repr(C)]
+#[derive(Default)]
+pub struct FileInformation {
+    pub attributes: u32,
+    pub created: [u32; 2],
+    pub accessed: [u32; 2],
+    pub written: [u32; 2],
+    pub volume: u32,
+    pub size_high: u32,
+    pub size_low: u32,
+    pub links: u32,
+    pub index_high: u32,
+    pub index_low: u32,
+}
+
+/// FILE_STANDARD_INFO: how much of the volume a file takes (`allocation_size`, in whole units of allocation) and how long it is.
+#[repr(C)]
+#[derive(Default)]
+pub struct FileStandard {
+    pub allocation_size: i64,
+    pub end_of_file: i64,
+    pub links: u32,
+    pub delete_pending: u8,
+    pub directory: u8,
+}
+
+/// UNICODE_STRING: a name as the object manager takes it (the length counts bytes, not characters, and not the end).
+#[repr(C)]
+pub struct UnicodeString {
+    pub length: u16,
+    pub maximum: u16,
+    pub buffer: *mut u16,
+}
+
+/// OBJECT_ATTRIBUTES: the name of an object to open, and how to look it up.
+#[repr(C)]
+pub struct ObjectAttributes {
+    pub length: u32,
+    pub root: Handle,
+    pub name: *mut UnicodeString,
+    pub attributes: u32,
+    pub descriptor: *mut c_void,
+    pub quality: *mut c_void,
+}
+
+/// IO_STATUS_BLOCK.
+#[repr(C)]
+#[derive(Default)]
+pub struct IoStatusBlock {
+    pub status: usize,
+    pub information: usize,
+}
+
+/// FILE_FS_FULL_SIZE_INFORMATION: the room on a volume, in units of allocation.
+#[repr(C)]
+#[derive(Default)]
+pub struct FsFullSize {
+    pub total: i64,
+    pub caller_available: i64,
+    pub actual_available: i64,
+    pub sectors_per_unit: u32,
+    pub bytes_per_sector: u32,
+}
+
+/// SYSTEMTIME.
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+pub struct SystemTime {
+    pub year: u16,
+    pub month: u16,
+    pub day_of_week: u16,
+    pub day: u16,
+    pub hour: u16,
+    pub minute: u16,
+    pub second: u16,
+    pub milliseconds: u16,
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> Handle;
@@ -249,6 +344,16 @@ extern "system" {
     pub fn CreateMutexW(attributes: *mut c_void, initial_owner: Bool, name: *const u16) -> Handle;
     pub fn LoadLibraryExW(name: *const u16, file: Handle, flags: u32) -> Handle;
     pub fn GetProcAddress(module: Handle, name: *const u8) -> *const c_void;
+    pub fn CreateDirectoryW(name: *const u16, attributes: *mut c_void) -> Bool;
+    pub fn GetFileSizeEx(file: Handle, size: *mut i64) -> Bool;
+    pub fn DeviceIoControl(device: Handle, code: u32, input: *mut c_void, input_size: u32, output: *mut c_void, output_size: u32, returned: *mut u32, overlapped: *mut c_void) -> Bool;
+    pub fn GetFileInformationByHandle(file: Handle, information: *mut FileInformation) -> Bool;
+    pub fn GetFileInformationByHandleEx(file: Handle, class: i32, information: *mut c_void, length: u32) -> Bool;
+    pub fn LockFileEx(file: Handle, flags: u32, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> Bool;
+    pub fn UnlockFileEx(file: Handle, reserved: u32, low: u32, high: u32, overlapped: *mut Overlapped) -> Bool;
+    pub fn GetFinalPathNameByHandleW(file: Handle, path: *mut u16, length: u32, flags: u32) -> u32;
+    pub fn FileTimeToSystemTime(file_time: *const u64, system_time: *mut SystemTime) -> Bool;
+    pub fn SystemTimeToTzSpecificLocalTime(zone: *const c_void, universal: *const SystemTime, local: *mut SystemTime) -> Bool;
 }
 
 #[link(name = "advapi32")]
@@ -300,9 +405,19 @@ pub const PIPE_READMODE_MESSAGE: u32 = 2;
 pub const PIPE_REJECT_REMOTE_CLIENTS: u32 = 8;
 pub const OPEN_EXISTING: u32 = 3;
 pub const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
+pub const TOKEN_ASSIGN_PRIMARY: u32 = 1;
+pub const TOKEN_DUPLICATE: u32 = 2;
 pub const TOKEN_QUERY: u32 = 8;
 pub const TOKEN_USER_CLASS: u32 = 1;
+/// The class of `GetTokenInformation` that says whether the token is elevated (a `u32`, non-zero when it is).
+pub const TOKEN_ELEVATION_CLASS: u32 = 20;
+/// The class of `GetTokenInformation` that lists the privileges of a token.
+pub const TOKEN_PRIVILEGES_CLASS: u32 = 3;
+/// The class that gives the other token of a split token (the one without the administrator rights, for an elevated one).
+pub const TOKEN_LINKED_TOKEN_CLASS: u32 = 19;
 pub const ERROR_FILE_NOT_FOUND: u32 = 2;
+pub const ERROR_PATH_NOT_FOUND: u32 = 3;
+pub const ERROR_FILE_EXISTS: u32 = 80;
 pub const ERROR_MORE_DATA: u32 = 234;
 pub const ERROR_PIPE_BUSY: u32 = 231;
 pub const ERROR_PIPE_CONNECTED: u32 = 535;
@@ -339,6 +454,53 @@ pub const LOGON32_LOGON_INTERACTIVE: u32 = 2;
 pub const LOGON32_PROVIDER_DEFAULT: u32 = 0;
 pub const GENERIC_WRITE: u32 = 0x4000_0000;
 pub const FILE_SHARE_READ_AND_WRITE: u32 = 3;
+/// Read, write and delete may be shared: the record is opened beside whatever else has it open.
+pub const FILE_SHARE_ALL: u32 = 7;
+pub const CREATE_NEW: u32 = 1;
+pub const FILE_READ_DATA: u32 = 1;
+pub const FILE_APPEND_DATA: u32 = 4;
+pub const FILE_READ_ATTRIBUTES: u32 = 0x80;
+pub const READ_CONTROL: u32 = 0x0002_0000;
+pub const WRITE_OWNER: u32 = 0x0008_0000;
+pub const FILE_FLAG_WRITE_THROUGH: u32 = 0x8000_0000;
+pub const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+pub const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// The volume keeps the file or folder compressed: a file in a compressed folder is made compressed, and a compressed record is
+/// allocated in units that leave no room for the next record (see `FileRecord::reserve`).
+pub const FILE_ATTRIBUTE_COMPRESSED: u32 = 0x800;
+/// `DeviceIoControl`: set the compression of a file or folder to the format (a `u16`) in the input; zero is none.
+pub const FSCTL_SET_COMPRESSION: u32 = 0x9_C040;
+pub const FILE_WRITE_DATA: u32 = 2;
+pub const OWNER_SECURITY_INFORMATION: u32 = 1;
+pub const GROUP_SECURITY_INFORMATION: u32 = 2;
+/// Makes the access list that is set protected: it takes nothing from the folder above.
+pub const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+/// The access a check asks for when it wants to know everything that would be granted.
+pub const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+pub const DISABLE_MAX_PRIVILEGE: u32 = 1;
+pub const LUA_TOKEN: u32 = 4;
+pub const SECURITY_IMPERSONATION: i32 = 2;
+pub const TOKEN_IMPERSONATION: i32 = 2;
+pub const LOCKFILE_FAIL_IMMEDIATELY: u32 = 1;
+pub const LOCKFILE_EXCLUSIVE_LOCK: u32 = 2;
+/// `GetFinalPathNameByHandleW`: the path as the object manager names it (`\Device\HarddiskVolume3\...`).
+pub const VOLUME_NAME_NT: u32 = 2;
+/// `NtCreateFile`: the name is looked up without regard to letter case; open what exists; do not follow a link at the end of the name;
+/// the handle is synchronous; the writes go through to the disk.
+pub const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+pub const FILE_OPEN: u32 = 1;
+pub const FILE_WRITE_THROUGH: u32 = 2;
+pub const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
+pub const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// `NtQueryVolumeInformationFile`: the class that gives the room on the volume that the quota of the caller leaves.
+pub const FILE_FS_FULL_SIZE_INFORMATION: u32 = 7;
+/// The class of `GetFileInformationByHandleEx` that fills a `FileStandard`.
+pub const FILE_STANDARD_INFO: i32 = 1;
+pub const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
+/// `RegGetValueW` flags: a string or an expandable string, returned without expanding the variables in it.
+pub const RRF_RT_STRINGS_NO_EXPAND: u32 = 0x2 | 0x4 | 0x1000_0000;
 /// Load a library from the system folder only, never from the folder of the program or the current folder.
 pub const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x800;
 
@@ -375,6 +537,45 @@ pub type LogonUserWFn = unsafe extern "system" fn(*const u16, *const u16, *const
 /// `LookupAccountNameW(system, name, sid, sid size, domain, domain chars, kind)`.
 pub type LookupAccountNameWFn =
     unsafe extern "system" fn(*const u16, *const u16, *mut c_void, *mut u32, *mut u16, *mut u32, *mut u32) -> Bool;
+
+/// `GetKernelObjectSecurity(object, information, descriptor, length, needed)`.
+pub type GetKernelObjectSecurityFn = unsafe extern "system" fn(Handle, u32, *mut c_void, u32, *mut u32) -> Bool;
+/// `AccessCheck(descriptor, token, access, mapping, privileges, privileges length, granted, status)`.
+pub type AccessCheckFn =
+    unsafe extern "system" fn(*mut c_void, Handle, u32, *mut GenericMapping, *mut c_void, *mut u32, *mut u32, *mut Bool) -> Bool;
+/// `CreateRestrictedToken(token, flags, groups to disable, those, privileges to delete, those, groups to restrict, those, new token)`.
+pub type CreateRestrictedTokenFn =
+    unsafe extern "system" fn(Handle, u32, u32, *mut SidAndAttributes, u32, *mut c_void, u32, *mut SidAndAttributes, *mut Handle) -> Bool;
+/// `DuplicateTokenEx(token, access, attributes, impersonation level, token type, new token)`.
+pub type DuplicateTokenExFn = unsafe extern "system" fn(Handle, u32, *mut c_void, i32, i32, *mut Handle) -> Bool;
+/// `LookupPrivilegeNameW(system, locally unique identifier, name, length)`: the name of a privilege.
+pub type LookupPrivilegeNameWFn = unsafe extern "system" fn(*const u16, *const u64, *mut u16, *mut u32) -> Bool;
+/// `RegGetValueW(key, sub key, value, flags, type, data, size)`; it returns an error code, not a boolean.
+pub type RegGetValueWFn = unsafe extern "system" fn(isize, *const u16, *const u16, u32, *mut u32, *mut c_void, *mut u32) -> i32;
+
+/// `NtCreateFile(handle, access, object attributes, status block, allocation size, attributes, share, disposition, options, extended attributes, their length)`;
+/// it returns a status, not a Windows error.
+pub type NtCreateFileFn = unsafe extern "system" fn(*mut Handle, u32, *mut ObjectAttributes, *mut IoStatusBlock, *mut i64, u32, u32, u32, u32, *mut c_void, u32) -> i32;
+/// `RtlNtStatusToDosError(status)`.
+pub type RtlNtStatusToDosErrorFn = unsafe extern "system" fn(i32) -> u32;
+/// `NtQueryVolumeInformationFile(file, status block, information, length, class)`.
+pub type NtQueryVolumeInformationFileFn = unsafe extern "system" fn(Handle, *mut IoStatusBlock, *mut c_void, u32, u32) -> i32;
+
+/// What the lockout record asks of `advapi32.dll` and `ntdll.dll`: the check of what a process without administrator rights could do
+/// with it, the folder of the machine's programs' data, and the opening of the objects it relies on by their names in the object
+/// manager (`nt_create`), which the device map of the logon session, where a process of the account can add drive letters, does not
+/// reach. Bound at run time like the rest, so that a program that never asks (and a run at or below the cap) has no import of them.
+pub struct RecordApi {
+    pub security: GetKernelObjectSecurityFn,
+    pub access_check: AccessCheckFn,
+    pub restricted: CreateRestrictedTokenFn,
+    pub duplicate: DuplicateTokenExFn,
+    pub registry: RegGetValueWFn,
+    pub privilege_name: LookupPrivilegeNameWFn,
+    pub nt_create: NtCreateFileFn,
+    pub nt_error: RtlNtStatusToDosErrorFn,
+    pub nt_volume: NtQueryVolumeInformationFileFn,
+}
 
 /// What the test for a person being present asks of `user32.dll`.
 pub struct WindowStationApi {
@@ -470,6 +671,24 @@ pub fn logon_api() -> Option<&'static LogonApi> {
         Some(LogonApi {
             logon: function(advapi32, b"LogonUserW\0")?,
             lookup: function(advapi32, b"LookupAccountNameW\0")?,
+        })
+    }).as_ref()
+}
+
+pub fn record_api() -> Option<&'static RecordApi> {
+    static API: std::sync::OnceLock<Option<RecordApi>> = std::sync::OnceLock::new();
+    API.get_or_init(|| unsafe {
+        let (advapi32, ntdll) = (library("advapi32.dll")?, library("ntdll.dll")?);
+        Some(RecordApi {
+            security: function(advapi32, b"GetKernelObjectSecurity\0")?,
+            access_check: function(advapi32, b"AccessCheck\0")?,
+            restricted: function(advapi32, b"CreateRestrictedToken\0")?,
+            duplicate: function(advapi32, b"DuplicateTokenEx\0")?,
+            registry: function(advapi32, b"RegGetValueW\0")?,
+            privilege_name: function(advapi32, b"LookupPrivilegeNameW\0")?,
+            nt_create: function(ntdll, b"NtCreateFile\0")?,
+            nt_error: function(ntdll, b"RtlNtStatusToDosError\0")?,
+            nt_volume: function(ntdll, b"NtQueryVolumeInformationFile\0")?,
         })
     }).as_ref()
 }

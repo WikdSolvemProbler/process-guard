@@ -3,17 +3,23 @@
 
 //! The command line forms: `--timeout SECONDS ...` and automatic mode.
 
-use crate::auth::{Exception, Method};
+use crate::auth::{own_account_name, Exception, Method};
 use crate::base64::{base64_encode, decode_command};
 use crate::engine::{list2cmdline, parent_image, run_job, run_job_with, run_library_job, which, RunMode};
 use crate::extend::{escape, image_of, iso8601, request_held, Settings, Target, DEFAULT_MAX_EXTENSION};
+use crate::lockout;
 use crate::{GuardError, Role, Shell, MAX_SECONDS};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 pub const USAGE: &str = "usage: process-tree-guard [--extendable [--max-extension SECONDS] [--extension-log PATH] [--authenticate {desktop,console}]] \
-    --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])\n       process-tree-guard extend SECONDS";
+    --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])\n       process-tree-guard extend SECONDS\
+    \n       process-tree-guard create-lockout-record [ACCOUNT]  (the full command only; run from an elevated terminal)";
+
+/// What `process-tree-guard create-lockout-record -h` prints.
+pub const SETUP_USAGE: &str = "usage: process-tree-guard create-lockout-record [ACCOUNT]  (run from an elevated terminal: makes the record of wrong passwords \
+    of ACCOUNT, by default the account of the elevated token, sets its permissions and checks them; safe to run again)";
 
 /// What `process-tree-guard-contain -h` prints.
 pub const CONTAIN_USAGE: &str = "usage: process-tree-guard-contain --timeout SECONDS (--shell {powershell,bash,cmd} --command-b64 BASE64 | [--] COMMAND [ARGS...])  (runs only inside an extendable run of process-tree-guard; the timeout is a request to that run)";
@@ -257,6 +263,28 @@ pub fn extend_command(args: Vec<String>) -> Result<u32, GuardError> {
     let until = grant.until.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
     say(&format!("PROCESS_TREE_GUARD_GRANTED: seconds={} deadline={} held={} image=\"{}\"",
         crate::engine::format_seconds(grant.seconds), iso8601(until), held, escape(&image_of(held))));
+    Ok(0)
+}
+
+/// `create-lockout-record [ACCOUNT]`: the one-time step, run from an elevated terminal, that makes the record of wrong
+/// passwords of an account (by default the account of the elevated token) and sets its permissions, so that a process of the
+/// account without administrator rights can read and append it and do nothing else. It prints one line for each thing it did,
+/// and is safe to run again: it sets right the list of the folder and of a record whose list is as it should be, and never
+/// touches what a record holds. A record whose list allowed the account more than reading and appending is not set right in
+/// place (a handle opened for writing meanwhile stays valid when the list changes): the step names the rights, leaves the record
+/// as it was, exits with 125 and says to remove the record and run it again. Without elevation it refuses, with 125.
+pub fn create_lockout_record_command(args: Vec<String>) -> Result<u32, GuardError> {
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
+        say(SETUP_USAGE);
+        return Ok(0);
+    }
+    if args.len() > 1 {
+        return Err(GuardError(SETUP_USAGE.into()));
+    }
+    if !lockout::elevated() {
+        return Err(GuardError("create-lockout-record needs administrator rights; run it from an elevated terminal".into()));
+    }
+    lockout::create(args.first().map(String::as_str), own_account_name(), &mut |line| say(&line)).map_err(GuardError)?;
     Ok(0)
 }
 

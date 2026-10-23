@@ -1520,9 +1520,13 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
             and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard."), "POLICY.md");
     let contributing = read("CONTRIBUTING.md");
     let steps = contributing.split("## Manual check of the prompts").nth(1).unwrap_or("");
-    checks.check("B148", "CONTRIBUTING.md has the manual check of the prompts as eleven numbered steps: step 9 for a scheduled task and a remote shell, \
-        step 10 for a domain machine away from its controller, step 11 for the test on a window station that is not visible, watched",
-        (1..=11).all(|n| steps.lines().any(|line| line.starts_with(&format!("{}. ", n)))) && !steps.lines().any(|line| line.starts_with("12. "))
+    checks.check("B148", "CONTRIBUTING.md has the manual check of the prompts as thirteen numbered steps: step 9 for a scheduled task and a remote shell, \
+        step 10 for a domain machine away from its controller, step 11 for the test on a window station that is not visible, watched, \
+        step 12 for the record of wrong passwords and its setup and step 13 for a lockout, on an account made for the check",
+        (1..=13).all(|n| steps.lines().any(|line| line.starts_with(&format!("{}. ", n)))) && !steps.lines().any(|line| line.starts_with("14. "))
+            && steps.lines().any(|line| line.starts_with("12. ") && line.contains("record of wrong passwords") && line.contains("setup"))
+            && steps.lines().any(|line| line.starts_with("13. ") && line.contains("lockout") && line.contains("never your own"))
+            && steps.contains("process-tree-guard create-lockout-record") && steps.contains("locked out after 3 wrong passwords")
             && steps.lines().any(|line| line.starts_with("9. ") && line.contains("scheduled task") && line.contains("Windows Remote Management (WinRM)"))
             && steps.lines().any(|line| line.starts_with("10. ") && line.contains("domain controller"))
             && steps.lines().any(|line| line.starts_with("11. ") && line.contains("G95") && line.contains("screen")), steps.chars().take(200).collect::<String>());
@@ -1547,10 +1551,17 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
         readme_text.contains("a pseudo console, which a process of the same user can create, also passes this test") && steps.contains("write down whether the dialog is gone"), "README.md / CONTRIBUTING.md");
     // What the three documents say about the wait, the figure of the hours, the accounts that cannot approve, the lock and the guessing of a password.
     for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
-        checks.check("B148", &format!("{} says that a run may wait up to 1095 seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, and the record of the approval), not 15", name),
-            body.contains("up to 1095 seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, \
-                5 seconds each for the name of the account and, with the console method, for the write of the message, \
-                and half a second for the record of the approval on standard error)")
+        // The older entry of the change log keeps the bound it gave then; the two documents that describe the guard now give the one that includes the lockout record.
+        let (seconds, itemised, notice) = if name == "CHANGELOG.md" {
+            ("1095", "", "5 seconds each for the name of the account and, with the console method, for the write of the message, ")
+        } else {
+            ("1126", "10 seconds in all for the reads of the lockout record, 2 seconds for each of the 3 locks of the record, ",
+                "5 seconds for the name of the account and, with the console method, 5 seconds each for the write of the message and for the notices of the wrong passwords on record \
+                that are written before an attempt (at most three), ")
+        };
+        checks.check("B148", &format!("{} says that a run may wait up to {} seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, {}and the record of the approval), not 15", name, seconds, itemised),
+            body.contains(&format!("up to {} seconds, a little over 18 minutes (3 prompts of 300 seconds, 3 checks of at most 60 seconds, 2 waits of 2 seconds, {}{}\
+                and half a second for the record of the approval on standard error)", seconds, itemised, notice))
                 && !body.contains("15 minutes") && !body.contains("up to 18 minutes"), name);
         checks.check("B148", &format!("{} says that a smart card cannot approve, and that the look up of a name in another form may contact a domain controller", name),
             body.contains("a smart card") && body.contains("domain controller") && body.contains("may contact a domain controller") && !body.contains("needs no network"), name);
@@ -1682,5 +1693,65 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
     }
     checks.check("B148", "the README lists --authenticate with --max-extension and --extension-log among the options that need --extendable",
         readme_text.contains("`--max-extension`, `--extension-log` and `--authenticate` without `--extendable` are refused with a message of their own"), "README.md");
+    // The lockout: the third wrong password within six hours, the record that only grows, the step that makes it, and what does not shorten it.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the third wrong password within six hours locks the prompt for the account for six hours, that the record is made by create-lockout-record and can only be added to by a \
+            program of the account without administrator rights, that the record is read whole within ten seconds, that an attempt while locked does not extend the lockout and that a correct password does not clear earlier failures", name),
+            body.contains("third wrong password") && body.contains("six hours") && body.contains("create-lockout-record") && body.contains("without administrator rights") && body.contains("ten seconds")
+                && body.contains("does not extend the lockout") && body.contains("correct password does not clear"), name);
+        checks.check("B148", &format!("{} says that the owner of the record, its folder, the folder of the programs' data and the folders above it must be the Administrators group, the system or the installer of the system, \
+            that a program of the account can make the record unreadable in time and so refuse every run over the cap until an administrator removes the record, and that someone who installs the guard must run the step", name),
+            body.contains("installer of the system") && body.contains("until an administrator removes the record") && body.contains("must run this step once for each account")
+                && !body.contains("deploy of the guard on a machine runs") && !body.contains("1 MiB"), name);
+        checks.check("B148", &format!("{} says that the record is found through the registry value of the machine and not through the known folder interface or an environment variable, and that an administrator \
+            can remove it, which resets the lockouts", name),
+            body.contains("registry value") && body.contains("known folder") && body.contains("environment variable") && body.contains("resets the lockouts"), name);
+        checks.check("B148", &format!("{} says that a run that starts while the account is locked never waits, that a run locked out after its prompt was shown is refused at once with no cool-down, which the other refusals after a prompt keep, \
+            and does not say that the lockout limits a program to three guesses in each six hours", name),
+            body.contains("never waits") && body.contains("refused at once, with no cool-down") && body.contains("cool-down of 10 seconds that follows every refusal after a prompt remains for the other refusals after a prompt")
+                && !body.contains("sees nothing for those 10 seconds") && !body.contains("at most three guesses"), name);
+        checks.check("B148", &format!("{} says that nothing is opened through a drive letter, that the record that is open is judged on the handle and its final name is the name it was asked for, that all the reads \
+            of the record in one run share ten seconds, and that a range of the record can be locked by a program of the account, which refuses the run before the logon", name),
+            body.contains("through a drive letter") && body.contains("final name") && body.contains("share ten seconds") && body.contains("a range of the record") && body.contains("before the logon"), name);
+        checks.check("B148", &format!("{} does not use the acronym SID, which is not spelled out, in the text of a refusal", name), !body.contains("owned by SID"), name);
+        checks.check("B148", &format!("{} says that the guard refuses an account that holds a privilege that lets a program act as the system (naming SeDebugPrivilege and SeImpersonatePrivilege), that the list may give something only             to the system, the Administrators group, the account and the owner rights, that the record can be made as large as the volume allows and is charged to its owner so that a quota of the account does not limit it,             and that one user who makes the folder first denies the exception to every account", name),
+            body.contains("SeDebugPrivilege") && body.contains("SeImpersonatePrivilege") && body.contains("SeLoadDriverPrivilege") && body.contains("SeTcbPrivilege") && body.contains("SeCreateTokenPrivilege")
+                && body.contains("SeAssignPrimaryTokenPrivilege") && body.contains("rewrite the lockout record") && body.contains("another account or group") && body.contains("owner rights entry")
+                && body.contains("as large as the volume allows") && body.contains("charged to its owner") && body.contains("does not limit it") && body.contains("every account on the machine")
+                && body.contains("create-lockout-record ACCOUNT") && !body.contains("or its quota") && !body.contains("(the quota counts)"), name);
+    }
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text)] {
+        checks.check("B148", &format!("{} says that the step does not take over a record whose owner is not trusted, and that the check of the folders above the record refuses the right to delete or rename them", name),
+            body.contains("does not take over a record whose owner is not") && body.contains("delete or rename"), name);
+    }
+    // What the lockout is and is not a limit on, what the step does with a record that allowed too much, and what makes room for a guess to be counted.
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the lockout of the guard counts only the passwords given to the guard, so it is not a rate limit on guessing the password of the account", name),
+            body.contains("The lockout of the guard counts only the passwords given to the guard"), name);
+        checks.check("B148", &format!("{} says that a check the system did not answer in 60 seconds counts as a wrong password", name),
+            body.contains("the system did not answer in 60 seconds"), name);
+        checks.check("B148", &format!("{} says that a record that allowed more than reading and appending is not set right in place, and does not say that the step sets such a record right or says what it allowed", name),
+            body.contains("right in place") && !body.contains("it sets right permissions that are too wide") && !body.contains("(it allowed: WRITE_DATA, ...)") && !body.contains("permissions set (it allowed"), name);
+        checks.check("B148", &format!("{} says that the room of the next record is allocated before the logon with newlines that the reading ignores, and does not call the failure of the append a case no check can close", name),
+            body.contains("allocated") && body.contains("newlines") && body.contains("ignores") && !body.contains("no check can close") && !body.contains("what remains is a failure of the disk between"), name);
+    }
+    for (name, body) in [("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that a program of the account does not need to tamper with the guard to guess the password: it can call LogonUserW, runas or net use itself, and the account lockout policy of the system counts those tries, not the lockout of the guard", name),
+            body.contains("does not need to tamper with the guard to guess the password") && body.contains("`LogonUserW`, `runas` or `net use`") && body.contains("not by the lockout of the guard"), name);
+    }
+    for (name, body) in [("README.md", &readme_text), ("SECURITY.md", &security_text), ("CHANGELOG.md", &changelog_text)] {
+        checks.check("B148", &format!("{} says that the clock is trusted only as far as the privilege to change the system time is withheld, and does not say that a change of the clock needs administrator rights alone", name),
+            body.contains("privilege to change the system time") && !body.contains("cannot be changed without administrator rights;") && !body.contains("A change of the clock needs administrator rights."), name);
+        checks.check("B148", &format!("{} says that a check cut short because the process that started the guard exited counts as a wrong password", name),
+            body.contains("cut short because the process that started the guard exited counts the same way"), name);
+    }
+    checks.check("B148", "the source of create-lockout-record does not say that the step sets right permissions that are too wide",
+        !include_str!("../src/cli.rs").contains("it sets right permissions that are too wide"), "src/cli.rs");
+    checks.check("B148", "the README says that a program of the account that tries the password itself is limited only by the account lockout policy of the system",
+        readme_text.contains("`LogonUserW`, `runas`, `net use`") && readme_text.contains("is limited only by the account lockout policy of the system"), "README.md");
+    checks.check("B148", "CONTRIBUTING.md: the manual check says that steps 2, 4 and 7 put wrong passwords on the record and are run after the others, that the lockout of the guard follows the third \
+        wrong password of step 2, and makes the account of step 13 without a password on a command line",
+        contributing.contains("Steps 2, 4 and 7 can put wrong passwords on the record; run them after the other steps.") && steps.contains("Do this last of steps 1 to 11")
+            && steps.contains("the third within six hours also starts the lockout of the guard for it") && steps.contains("net user ptgcheck * /add") && !steps.contains("net user ptgcheck PASSWORD"), "CONTRIBUTING.md");
     checks.finish();
 }

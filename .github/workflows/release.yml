@@ -21,6 +21,10 @@ jobs:
       PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST: '1'
       PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION: '1'
       PROCESS_TREE_GUARD_REQUIRE_PSEUDO_CONSOLE: '1'
+      # The checks that make, change and remove the lockout record of the machine (L3 to L11) run here, in an elevated process, and leave a fresh record.
+      PROCESS_TREE_GUARD_RUN_LOCKOUT_RECORD_TEST: '1'
+      # The unit test of the folders above the folder of the programs' data asserts here that the machine meets the requirements of the check; elsewhere it says what is not met.
+      PROCESS_TREE_GUARD_REQUIRE_PROGRAM_DATA_CHECK: '1'
     steps:
       - uses: actions/checkout@v5
       - name: Check that the tag names the version in Cargo.toml
@@ -31,6 +35,11 @@ jobs:
             echo "the tag $GITHUB_REF_NAME does not name the version $version in Cargo.toml"
             exit 1
           fi
+      - name: Build
+        run: cargo build --release --locked
+      - name: Make the lockout record of the account
+        # A run over the cap is refused without a record that only the account can add to; the tests that start one need it.
+        run: target/release/process-tree-guard.exe create-lockout-record
       - name: Test
         run: cargo test --release --locked --no-fail-fast
       - name: Package
@@ -93,7 +102,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # A version with a pre-release part (2.0.0-alpha.4) is published as a pre-release, which is never marked latest.
+          # A version with a pre-release part (2.0.0-alpha.5) is published as a pre-release, which is never marked latest.
           flags=()
           case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease --latest=false) ;; esac
           gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md --verify-tag "${flags[@]}"

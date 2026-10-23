@@ -29,6 +29,20 @@
 //! into it is lost to a run that is already refused (step 5 of the manual check records whether
 //! it does).
 //!
+//! A run does not ask when the account is locked out: the third wrong password for the account
+//! within six hours, across runs, starts a lockout of six hours (`lockout.rs`). The record of the
+//! wrong passwords is checked before anything is shown, and a run over the cap whose record is
+//! missing, cannot be used or allows more than reading and appending is refused. A wrong password
+//! is added to the record at once, before the next attempt; a password whose check was started
+//! and not answered, or cut short by the starter exiting, is added the same way, and so is, at the
+//! console, one answered with a code that the system gives only for a correct password; nothing
+//! else is (the lock adds newlines that the reading ignores, to have the room allocated). Nothing ever
+//! shortens a lockout. The lockout is read again before every prompt and before every logon, so
+//! that one that starts meanwhile (another session, a program of the account appending to the
+//! record) stops the run there. Between that last look and the end of the attempt the record is
+//! locked, so that nothing else can be appended to it, and a run that cannot lock it is refused
+//! before the logon.
+//!
 //! The password lives only in buffers that are zeroed with volatile writes when they are
 //! dropped, on every path, and is never put in a `String`, never logged and never echoed. The
 //! release profile aborts on a panic without running destructors, so a panic hook zeroes every
@@ -36,12 +50,13 @@
 //! accidents and agents that lack the password; it does not resist a process of the same user that
 //! can tamper with the guard itself (see `SECURITY.md`).
 //!
-//! The logic is behind two traits, `Prompt` and `Verifier`, so that the unit tests drive the
+//! The logic is behind three traits, `Prompt`, `Verifier` and the `Record` of wrong passwords, so that the unit tests drive the
 //! attempt loop with stubs. The stubs exist only under `cfg(test)`: no argument, environment
 //! variable or file selects one, so a release executable has no way to skip the prompt.
 
 use crate::engine::{format_seconds, image_path_of_handle, started_at};
 use crate::extend::{current_user_sid, exception_line, hours_figure, image_of, now_ms, sid_text, token_user_sid, ExceptionRecord, Log, Settings, RECORD_MS};
+use crate::lockout::{self, FileRecord, Held, Record};
 use crate::sys::*;
 use crate::GuardError;
 use std::ffi::c_void;
@@ -51,7 +66,8 @@ use std::time::{Duration, Instant};
 /// The caption of the prompt, and the name the console prompt gives as its target: the product name.
 pub(crate) const CAPTION: &str = "Process Tree Guard";
 
-/// Attempts a run gets. Each failed `LogonUserW` counts toward the lockout of the account.
+/// Attempts a run gets. Each failed `LogonUserW` counts toward the account lockout policy of the system; toward the guard's own
+/// lockout only what `Verified::BadPassword`, `Unresolved` and `OwnerGone` describe counts (and, at the console, the masked codes).
 pub(crate) const MAX_ATTEMPTS: u32 = 3;
 
 /// How long a prompt waits for an answer before the run is refused.
@@ -134,6 +150,10 @@ const OWNER_GONE: &str = "the process that started the run exited, so nobody is 
 /// name that is unknown, a password that is wrong and an account that is not the guard's own, so
 /// that the reason tells a typist nothing about which accounts exist.
 const NOT_ACCEPTED: &str = "the user name or password was not accepted";
+
+/// The reason a check that the system did not answer in time is given (`Verified::Unresolved`): the password reached the logon,
+/// whose outcome is not known, so it is counted as a wrong one.
+const UNANSWERED: &str = "the credentials could not be checked: the system did not answer within 60 seconds, so the password is counted as a wrong one";
 
 /// The reason an empty password is given. It is not a secret, so a reason of its own tells a typist
 /// nothing, and the record must not say that the system rejected a credential when none was sent.
@@ -518,13 +538,24 @@ pub(crate) enum Asked {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verified {
     Approved,
-    /// The system does not accept the name and password, or the name is another account's.
+    /// No password of this account was tried: an empty answer, an answer that could not be read, or a name that is no account or that
+    /// is another account's. Not counted toward the lockout.
     Wrong,
-    /// The system accepts them, for an account other than the one the guard runs as.
+    /// `LogonUserW` refused a password that was not empty for the account the guard runs as (`ERROR_LOGON_FAILURE`): the answer that
+    /// counts toward the lockout. At the console prompt a `Failed` code that Windows gives only for a correct password
+    /// (`AFTER_PASSWORD_CHECKED`) counts as well, so that counting does not undo the masking of those codes; it cannot approve.
+    BadPassword,
+    /// The check was started and the system did not answer within `LOGON_TIMEOUT_MS`: the password reached `LogonUserW`, whose
+    /// outcome is not known (it may still complete in the system after the guard gives up), so the guess was made and counts as a
+    /// wrong password. It cannot approve.
+    Unresolved,
+    /// The name is another account's: either the look up of the name said so and no logon was tried, or the system accepted the
+    /// password and the token is another account's. Not counted.
     OtherUser,
     /// The failure is of the system, not of what was typed: a Windows error, or `UNIDENTIFIED`.
     Failed(u32),
-    /// The process that started the guard exited while the check went on.
+    /// The process that started the guard exited while the check went on. The password had reached the logon, so it counts as a wrong
+    /// password, as `Unresolved` does.
     OwnerGone,
 }
 
@@ -544,11 +575,18 @@ pub(crate) trait Prompt {
     /// Check that the prompt can be shown at all, and take what it needs for the whole run (the
     /// right to have a prompt open, the console written to). `text` is what the prompt says. An
     /// error is the reason that nobody can be asked: nothing was shown, and no attempt was made.
-    fn begin(&self, text: &str) -> Result<Claim, String>;
+    fn begin(&self, text: &str, recorded: usize) -> Result<Claim, String>;
 
     /// Ask for credentials. `last_error` is the error of the attempt before (`ERROR_LOGON_FAILURE`
     /// after a refusal, 0 on the first).
     fn ask(&self, attempt: u32, last_error: u32, text: &str) -> Asked;
+
+    /// Tell the person, before attempt `attempt` is asked for, how many wrong passwords of the account are on record from the last
+    /// six hours (`recorded`), for a prompt that shows its text once and not at every attempt. The desktop prompt shows the text at
+    /// every attempt, so it has nothing to add. An error is the reason that the person cannot be told, so nobody is asked.
+    fn warn(&self, _attempt: u32, _recorded: usize) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 pub(crate) trait Verifier {
@@ -643,7 +681,7 @@ pub(crate) fn decide(settings: &Settings, held: bool, program: &str, parent: &st
     // that follows an approval is exercised. It exists under `cfg(test)` and nowhere else.
     #[cfg(test)]
     if let Some(approve) = seam::ANSWER.with(|answer| answer.get()) {
-        return authorize(settings, &subject, &seam::SeamPrompt(approve), &seam::SeamVerifier, owners, log);
+        return authorize(settings, &subject, &seam::SeamPrompt(approve), &seam::SeamVerifier, &seam::SeamRecord::new(), owners, log);
     }
     // Before any prompt, lock or logon: a run that another guard started is not asked. The job is
     // looked at as well as the names above, because a launcher can name its own parent or leave an
@@ -656,10 +694,17 @@ pub(crate) fn decide(settings: &Settings, held: bool, program: &str, parent: &st
         };
         return Err(refuse(settings, log, &subject, 0, &format!("{} ({})", WRAPPED, cause)));
     }
+    // Before any prompt, lock or logon: a run over the cap needs the record of wrong passwords of the account, with the access
+    // control that keeps a process of the account without administrator rights from changing it. A record that is missing, that
+    // cannot be opened or that allows more refuses the run, and says which step makes it.
+    let record = match FileRecord::open() {
+        Ok(record) => record,
+        Err(reason) => return Err(refuse(settings, log, &subject, 0, &reason)),
+    };
     let verifier = LogonVerifier { owners };
     match exception.method {
-        Method::Desktop => authorize(settings, &subject, &DesktopPrompt::new(owners), &verifier, owners, log),
-        Method::Console => authorize(settings, &subject, &ConsolePrompt::new(owners), &verifier, owners, log),
+        Method::Desktop => authorize(settings, &subject, &DesktopPrompt::new(owners), &verifier, &record, owners, log),
+        Method::Console => authorize(settings, &subject, &ConsolePrompt::new(owners), &verifier, &record, owners, log),
     }
 }
 
@@ -718,42 +763,134 @@ thread_local! {
 /// and the approval stands only if its line is recorded and the process that started the run is
 /// still there. A refusal after a prompt was shown keeps the right to a prompt for `COOL_DOWN_MS`
 /// more (the starter ending cuts it short), so guards started in that time are refused by the lock;
-/// a prompt left open at its limit is refused at once and the process ends, which closes it.
-pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners, log: &Log) -> Result<(), GuardError> {
+/// a prompt left open at its limit is refused at once and the process ends, which closes it. A refusal for a lockout is returned
+/// at once whenever it is made, the third wrong password of the run included: no prompt can be shown to a locked account, so there
+/// is nothing to keep the right for, and the person sees the message without a wait.
+///
+/// An account that is locked out (`lockout.rs`) is refused first, before the presence checks, the lock and any prompt, with
+/// the reason in the message every time, and nothing is added to the record or waited for. The record is read again before every
+/// prompt (after the wait that follows a wrong password too) and before every logon, because a lockout can start while a prompt is
+/// open or a wait goes on, from a run in another session or from a program of the account that appends to the record: the run is
+/// refused there, the credentials that were entered are dropped without a logon, and no guess is made while the account is locked.
+/// A password that the system refuses (`Verified::BadPassword`, and at the console prompt a code that the system gives only for a correct
+/// password, which is given the reason of a wrong one) is added to the record at once, before the wait. If it cannot be added, or it
+/// starts a lockout, the run ends there: a guess is never free, and the third wrong password of the account within six hours ends the
+/// attempts of every run. A check that was started and that the system did not answer in time (`Verified::Unresolved`) is added in the
+/// same way, and the run ends there whether or not it started a lockout, because the password reached the system and what became of it
+/// is not known. A check cut short because the process that started the guard exited (`Verified::OwnerGone`) is added too, for the same
+/// reason, and the run is refused.
+///
+/// The record is locked (`Record::lock`) once the credentials are entered, before the look at the record that comes before the
+/// logon, and the lock is kept until the attempt is over: through the check of the credentials, the approval and the line that
+/// records it, or the adding of a wrong password and the look at what it came to. A run that cannot take the lock (a program of the
+/// account holds a range of the record locked, another run is at the same place, or the volume has no room for a record) is refused
+/// before the logon, so a guess cannot be made and left uncounted. The lock is not kept while the prompt is open or while a wait
+/// goes on. Each look is one reading of the record (`lockout::look`), and the readings of one run share the time that the record is
+/// given to be read in.
+pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Prompt, verifier: &dyn Verifier, record: &dyn Record, owners: &Owners, log: &Log) -> Result<(), GuardError> {
     let Some(exception) = settings.exception.as_ref() else { return Ok(()) };
     if owners.gone() {
         return Err(refuse(settings, log, subject, 0, OWNER_GONE));
     }
-    let text = prompt_text(subject, exception, settings.max_seconds);
+    // One look at the record, from one reading of it: the reason when the account is locked out, and the reason that the record
+    // cannot be read when it cannot be (a record that cannot be read refuses the run, as a lockout does); and, to be told to the
+    // person in the text of the prompt, how many wrong passwords are on record from the last six hours.
+    let look = || match lockout::look(record) {
+        Ok((None, recorded)) => Ok(recorded),
+        Ok((Some(locked), _)) => Err(Looked::Locked(locked)),
+        Err(why) => Err(Looked::Unreadable(why)),
+    };
+    let recorded = match look() {
+        Ok(recorded) => recorded,
+        Err(looked) => return Err(refuse(settings, log, subject, 0, looked.reason())),
+    };
+    let text = prompt_text(subject, exception, settings.max_seconds, recorded);
     // A refusal after the prompt was shown: the line is written at once and the right to a prompt is
-    // kept for a while longer (it is dropped with `_claim` when this returns).
-    let refuse_shown = |attempt: u32, reason: &str| {
+    // kept for a while longer (it is dropped with `_claim` when this returns). The lock of the record, when the run holds it, is
+    // let go first, so that the wait does not keep another run of the account from looking at the record.
+    let refuse_shown = |attempt: u32, reason: &str, held: &mut Option<Held>| {
+        drop(held.take());
         let error = refuse(settings, log, subject, attempt, reason);
         pause(owners, cool_down_ms());
         error
     };
+    // A refusal for a lockout after a prompt was shown: the lock of the record is let go and the message is returned at once, with
+    // no cool-down. The cool-down keeps the right to a prompt so that prompts do not stack, and a locked account cannot be prompted
+    // for, so waiting would only keep the person from seeing the message (the person who typed the third wrong password sees it now).
+    let refuse_locked = |attempt: u32, reason: &str, held: &mut Option<Held>| {
+        drop(held.take());
+        refuse(settings, log, subject, attempt, reason)
+    };
+    // A password that counts as wrong (see `Verified::BadPassword`): added to the record at once, under the lock the run holds,
+    // before the line of the log and before the wait, so that a guess that the record could not take is not free; then the record
+    // is looked at again. Returns the reason to go on with, or the refusal that ends the run (a lockout, with "no attempts are
+    // left" before it on the last attempt).
+    let counted = |reason: String, attempt: u32, held: &mut Option<Held>| -> Result<String, GuardError> {
+        if let Err(why) = record.add(record.now()) {
+            return Err(refuse_shown(attempt, &format!("the wrong password could not be recorded: {}", why), held));
+        }
+        match lockout::look(record) {
+            Ok((None, _)) => Ok(reason),
+            Ok((Some(locked), _)) => {
+                let ended = if attempt == MAX_ATTEMPTS { format!("{}; no attempts are left; {}", reason, locked) } else { format!("{}; {}", reason, locked) };
+                Err(refuse_locked(attempt, &ended, held))
+            }
+            Err(why) => Err(refuse_shown(attempt, &format!("{}; the lockout record could not be read after it: {}", reason, why), held)),
+        }
+    };
     // Held until the attempts are over, so that no second prompt of the guard opens beside this one.
-    let _claim = match prompt.begin(&text) {
+    let _claim = match prompt.begin(&text, recorded) {
         Ok(claim) => claim,
         Err(reason) => return Err(refuse(settings, log, subject, 0, &reason)),
     };
     let mut last_error = 0;
     for attempt in 1..=MAX_ATTEMPTS {
+        // The lock of the record, which the run holds from the last look at the record before a logon until the attempt is over.
+        let mut held: Option<Held> = None;
+        // Before every prompt, the first included (the claim was taken after the check above, and a lockout can have started in
+        // another session meanwhile) and the ones that follow the wait after a wrong password: no prompt is shown to a locked account.
+        let recorded = match look() {
+            Ok(recorded) => recorded,
+            Err(looked) if attempt == 1 => return Err(refuse(settings, log, subject, 0, looked.reason())),
+            Err(Looked::Locked(locked)) => return Err(refuse_locked(attempt - 1, &locked, &mut held)),
+            Err(Looked::Unreadable(why)) => return Err(refuse_shown(attempt - 1, &why, &mut held)),
+        };
         // The credentials are dropped, and so wiped, as soon as they have been checked.
         let mut rejection: Option<String> = None;
+        let text = prompt_text(subject, exception, settings.max_seconds, recorded);
+        if let Err(reason) = prompt.warn(attempt, recorded) {
+            return Err(refuse(settings, log, subject, attempt - 1, &reason));
+        }
         let verdict = match prompt.ask(attempt, last_error, &text) {
             Asked::Entered(credentials) if credentials.password_is_empty() => {
                 rejection = Some(EMPTY_PASSWORD.to_string());
                 Verified::Wrong
             }
-            Asked::Entered(credentials) => verifier.verify(credentials),
+            Asked::Entered(credentials) => {
+                // The record is locked, and then looked at again, before the logon: a program of the account cannot keep a wrong
+                // password from being counted by holding a range of the record locked, because the run is refused when it cannot
+                // take the lock; nor can another run of the account (in another session) begin a guess between this look and the
+                // wrong password being added, because it cannot take the lock either. The lock is not held while the prompt is open.
+                held = match record.lock() {
+                    Ok(lock) => Some(lock),
+                    Err(why) => return Err(refuse_shown(attempt, &why, &mut held)),
+                };
+                // A lockout can have started while the prompt was open. The credentials are dropped, and so wiped, with no logon: a
+                // guess is not made while the account is locked, and a right password does not approve then.
+                match look() {
+                    Ok(_) => {}
+                    Err(Looked::Locked(locked)) => return Err(refuse_locked(attempt, &locked, &mut held)),
+                    Err(Looked::Unreadable(why)) => return Err(refuse_shown(attempt, &why, &mut held)),
+                }
+                verifier.verify(credentials)
+            }
             Asked::Rejected(reason) => {
                 rejection = Some(reason);
                 Verified::Wrong
             }
-            Asked::Cancelled => return Err(refuse_shown(attempt, "the prompt was cancelled")),
+            Asked::Cancelled => return Err(refuse_shown(attempt, "the prompt was cancelled", &mut held)),
             Asked::NotShown(reason) => return Err(refuse(settings, log, subject, attempt - 1, &reason)),
-            Asked::Unavailable(reason) => return Err(refuse_shown(attempt, &reason)),
+            Asked::Unavailable(reason) => return Err(refuse_shown(attempt, &reason, &mut held)),
             // The prompt is still open: nothing may keep the process alive, or the person could type into a prompt
             // whose answer is never read.
             Asked::Abandoned(reason) => return Err(refuse(settings, log, subject, attempt, &reason)),
@@ -764,22 +901,39 @@ pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Pro
                     return Err(refuse(settings, log, subject, attempt, OWNER_GONE));
                 }
                 if log.blocked() {
-                    return Err(refuse_shown(attempt, "the audit file (or standard error, when there is no audit file) cannot take lines, so the approval could not be recorded"));
+                    return Err(refuse_shown(attempt, "the audit file (or standard error, when there is no audit file) cannot take lines, so the approval could not be recorded", &mut held));
                 }
                 let reason = format!("a cap of {} was approved: the password of the account the guard runs as was given at the {} prompt", hours_phrase(settings.max_seconds), exception.method.name());
                 if !log.record_decision(&note(settings, subject, true, attempt, &reason), RECORD_MS) {
-                    return Err(refuse_shown(attempt, "the approval could not be recorded"));
+                    return Err(refuse_shown(attempt, "the approval could not be recorded", &mut held));
                 }
                 return Ok(());
             }
-            Verified::OwnerGone => return Err(refuse(settings, log, subject, attempt, OWNER_GONE)),
+            // The password reached the logon before the starter went, and what became of it is not known, so it counts as a check
+            // that was not answered does. It is added under the lock the run still holds.
+            Verified::OwnerGone => {
+                let _ = record.add(record.now());
+                return Err(refuse(settings, log, subject, attempt, OWNER_GONE));
+            }
             Verified::Wrong | Verified::OtherUser => rejection.unwrap_or_else(|| NOT_ACCEPTED.to_string()),
-            Verified::Failed(code) if exception.method == Method::Console && AFTER_PASSWORD_CHECKED.contains(&code) => NOT_ACCEPTED.to_string(),
-            Verified::Failed(UNIDENTIFIED) => return Err(refuse_shown(attempt, "the account of the credentials could not be identified")),
-            Verified::Failed(code) => return Err(refuse_shown(attempt, &format!("the credentials could not be checked: {}", error_for(code).message()))),
+            Verified::BadPassword => counted(rejection.unwrap_or_else(|| NOT_ACCEPTED.to_string()), attempt, &mut held)?,
+            // At the console prompt the codes that Windows gives only for a correct password are given the reason of a wrong one, so
+            // that a program that types cannot learn that its guess was right. They are counted as a wrong password too: if a
+            // right password with one of them were left out of the record, three wrong passwords would end the run with a lockout
+            // and a right one would not, and the difference would tell the program the same thing. They cannot approve.
+            Verified::Failed(code) if exception.method == Method::Console && AFTER_PASSWORD_CHECKED.contains(&code) => counted(NOT_ACCEPTED.to_string(), attempt, &mut held)?,
+            // The password reached the system and nothing is known of what became of it, so the guess counts. The run ends there
+            // as it did when a check that took too long was only a failure: a system that does not answer is not asked again.
+            Verified::Unresolved => {
+                let reason = counted(UNANSWERED.to_string(), attempt, &mut held)?;
+                return Err(refuse_shown(attempt, &reason, &mut held));
+            }
+            Verified::Failed(UNIDENTIFIED) => return Err(refuse_shown(attempt, "the account of the credentials could not be identified", &mut held)),
+            Verified::Failed(code) => return Err(refuse_shown(attempt, &format!("the credentials could not be checked: {}", error_for(code).message()), &mut held)),
         };
+        drop(held.take());
         if attempt == MAX_ATTEMPTS {
-            return Err(refuse_shown(attempt, &format!("{}; no attempts are left", reason)));
+            return Err(refuse_shown(attempt, &format!("{}; no attempts are left", reason), &mut held));
         }
         log.push(&note(settings, subject, false, attempt, &reason));
         if !pause(owners, retry_delay_ms()) {
@@ -788,6 +942,22 @@ pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Pro
         last_error = ERROR_LOGON_FAILURE;
     }
     Err(GuardError("exception refused: no attempt was made; the run did not start".into()))
+}
+
+/// What one look at the record found when it does not let the run go on: the account is locked out (the text of the refusal), or the
+/// record cannot be read (the reason). A refusal for a lockout is returned at once, and one for a record that cannot be read after
+/// a prompt was shown keeps the right to a prompt for the cool-down, as the other refusals after a prompt do.
+enum Looked {
+    Locked(String),
+    Unreadable(String),
+}
+
+impl Looked {
+    fn reason(&self) -> &str {
+        match self {
+            Looked::Locked(text) | Looked::Unreadable(text) => text,
+        }
+    }
 }
 
 /// What the prompt is told about the run: the account whose password it asks for (empty when it
@@ -863,6 +1033,17 @@ fn shown_command(command: &str) -> String {
     shown(command, COMMAND_LIMIT, Keep::Start)
 }
 
+/// The sentence that tells the person how many wrong passwords of the account are on record from the last six hours, with the
+/// space that joins it to the text before it; empty when there are none. The desktop prompt has it in its text at every attempt;
+/// the console prompt writes it once with its text and again before each later attempt (`Prompt::warn`).
+fn on_record_sentence(recorded: usize) -> String {
+    match recorded {
+        0 => String::new(),
+        1 => " 1 wrong password on record within six hours; the third stops this prompt for six hours.".to_string(),
+        count => format!(" {} wrong passwords on record within six hours; the third stops this prompt for six hours.", count),
+    }
+}
+
 /// What the prompt says, with what the person must check first: the command line as it was
 /// given, the program that will run as the search found it, the account whose password it asks
 /// for, and the parent process as the system reports it; then what the cap means, the deadline the run starts with and how to refuse. A dialog that
@@ -875,8 +1056,9 @@ fn shown_command(command: &str) -> String {
 /// parent keep their end, which holds the file name or the user. Each field is in square brackets, in which no bracket can appear, so that none can
 /// imitate the others. How to refuse depends on the method: the desktop prompt has a cancel; the
 /// console prompt is not known to have a cancel key, and is refused by not answering or by closing
-/// the console.
-pub(crate) fn prompt_text(subject: &Subject, exception: &Exception, seconds: f64) -> String {
+/// the console. When wrong passwords of the account are on record from the last six hours (`recorded`), it says how many and that the
+/// third starts a lockout, so that a person who is one typing error from it knows.
+pub(crate) fn prompt_text(subject: &Subject, exception: &Exception, seconds: f64, recorded: usize) -> String {
     let field = |text: &str, limit| if text.is_empty() { "(unknown)".to_string() } else { shown(text, limit, Keep::End) };
     let refusal = match exception.method {
         Method::Desktop => "cancel to refuse the run".to_string(),
@@ -886,11 +1068,12 @@ pub(crate) fn prompt_text(subject: &Subject, exception: &Exception, seconds: f64
     let written_out = [subject.account, subject.program, subject.parent, exception.command.as_str()].into_iter()
         .any(|text| !text.is_ascii() || text.contains("\\u{"));
     let note = if written_out { " Note: \\u{..} is a character written out; check each field letter by letter." } else { "" };
+    let on_record = on_record_sentence(recorded);
     format!("{} is asked to run: Command line: [{}] Program: [{}] Account: [{}] Parent process, as the system reports it: [{}] \
         The processes of the run may each ask to keep it alive for up to {} at a time, and may renew without a total limit. \
-        The run starts with a deadline of {} seconds. Enter the password of the account above to allow it, or {}.{}",
+        The run starts with a deadline of {} seconds. Enter the password of the account above to allow it, or {}.{}{}",
         CAPTION, shown_command(&exception.command), shown(subject.program, PROGRAM_LIMIT, Keep::End), field(subject.account, ACCOUNT_LIMIT),
-        field(subject.parent, PARENT_LIMIT), hours_phrase(seconds), format_seconds(exception.timeout), refusal, note)
+        field(subject.parent, PARENT_LIMIT), hours_phrase(seconds), format_seconds(exception.timeout), refusal, on_record, note)
 }
 
 // --------------------------------------------------------------------- names
@@ -924,7 +1107,7 @@ fn full_name(domain: Option<&str>, user: &str) -> String {
 /// The name of the account this process runs as, `DOMAIN\user`, as the system writes it for the
 /// account that is signed in (`GetUserNameExW`, not a look up of the security identifier, which
 /// can ask a domain controller); None when it cannot be read.
-fn own_account_name() -> Option<String> {
+pub(crate) fn own_account_name() -> Option<String> {
     let api = name_api()?;
     let mut name = vec![0u16; 1024];
     let mut chars = name.len() as u32;
@@ -1109,7 +1292,7 @@ impl<'a> DesktopPrompt<'a> {
 }
 
 impl Prompt for DesktopPrompt<'_> {
-    fn begin(&self, text: &str) -> Result<Claim, String> {
+    fn begin(&self, text: &str, _recorded: usize) -> Result<Claim, String> {
         if desktop_api().is_none() || window_station_api().is_none() {
             return Err(NOT_AVAILABLE.into());
         }
@@ -1203,11 +1386,14 @@ pub(crate) struct ConsolePrompt<'a> {
     owners: &'a Owners,
     /// The thread that makes every call of the prompt of this run, made when the first is asked.
     worker: std::cell::RefCell<Option<PromptWorker>>,
+    /// How many wrong passwords on record the text written by `begin` said, so that `warn` says them again at the first attempt when
+    /// a failure was added between the look that made that text and the look made just before the attempt.
+    begun_with: std::cell::Cell<usize>,
 }
 
 impl<'a> ConsolePrompt<'a> {
     pub(crate) fn new(owners: &'a Owners) -> ConsolePrompt<'a> {
-        ConsolePrompt { owners, worker: std::cell::RefCell::new(None) }
+        ConsolePrompt { owners, worker: std::cell::RefCell::new(None), begun_with: std::cell::Cell::new(0) }
     }
 }
 
@@ -1251,8 +1437,14 @@ impl PromptWorker {
     }
 }
 
+/// Whether the console prompt writes the count of the wrong passwords on record before attempt `attempt`: when there are any, at
+/// every attempt after the first, and at the first when the count differs from the one the text of `begin` said (`begun_with`).
+fn notice_due(attempt: u32, recorded: usize, begun_with: usize) -> bool {
+    recorded != 0 && (attempt >= 2 || recorded != begun_with)
+}
+
 impl Prompt for ConsolePrompt<'_> {
-    fn begin(&self, text: &str) -> Result<Claim, String> {
+    fn begin(&self, text: &str, recorded: usize) -> Result<Claim, String> {
         if !console_stdin() {
             return Err("standard input is not an interactive console; the console prompt is never read from a pipe, a file or the null device".into());
         }
@@ -1264,7 +1456,21 @@ impl Prompt for ConsolePrompt<'_> {
         // it) must not hold the guard, with the lock, for ever.
         let text = text.to_string();
         write_bounded(self.owners, Duration::from_millis(SYSTEM_TIMEOUT_MS), move || write_console(&text))?;
+        self.begun_with.set(recorded);
         Ok(Claim { _lock: Some(lock) })
+    }
+
+    /// The console prompt writes its text once, in `begin`, and shows nothing of it at the later attempts, so the count of the wrong
+    /// passwords on record is written on a line of its own before the second and the third, where a person may be one typing error
+    /// from the lockout. The first attempt has it in the text of `begin`, unless the count has changed since that text was made (a
+    /// failure added by another session between the look that made it and the look made just before the attempt), when it is
+    /// written then too.
+    fn warn(&self, attempt: u32, recorded: usize) -> Result<(), String> {
+        if !notice_due(attempt, recorded, self.begun_with.get()) {
+            return Ok(());
+        }
+        let notice = on_record_sentence(recorded).trim_start().to_string();
+        write_bounded(self.owners, Duration::from_millis(SYSTEM_TIMEOUT_MS), move || write_console(&notice))
     }
 
     fn ask(&self, _attempt: u32, last_error: u32, _text: &str) -> Asked {
@@ -1455,23 +1661,27 @@ impl Verifier for LogonVerifier<'_> {
     }
 }
 
-/// Run `work` on the credentials with a limit, and say what it came to.
+/// Run `work` on the credentials with a limit, and say what it came to. A check that was started and has not answered in time is
+/// `Unresolved`, which counts as a wrong password: the password reached the system, which may complete the logon after the guard
+/// has given up. A check that could not be started or that ended without an answer is not counted: no password was tested. A check
+/// that was cut short because the starter went counts as well (`Verified::OwnerGone`): the password had reached the logon.
 fn check_bounded(limit: Duration, owners: &Owners, credentials: Box<Credentials>, work: impl FnOnce(Box<Credentials>) -> Verified + Send + 'static) -> Verified {
     match bounded(limit, owners, move || work(credentials)) {
         Ok(verdict) => verdict,
         Err(Unanswered::NotStarted) => Verified::Failed(ERROR_NOT_ENOUGH_MEMORY),
-        Err(Unanswered::TimedOut) => Verified::Failed(WAIT_TIMEOUT),
+        Err(Unanswered::TimedOut) => Verified::Unresolved,
         Err(Unanswered::Ended) => Verified::Failed(UNIDENTIFIED),
         Err(Unanswered::OwnerGone) => Verified::OwnerGone,
     }
 }
 
 /// What a failed `LogonUserW` with the error `code` comes to: the error for a wrong name or
-/// password is a name or password that is not accepted; any other is a failure of the system (a
+/// password is a wrong password, the one answer that counts toward the lockout (the name is the guard's own account's, and the
+/// password is not empty, by the time the logon is tried); any other is a failure of the system (a
 /// locked or disabled account, an expired password, an account without the right to log on
 /// locally, a domain that cannot be reached), which another try cannot mend.
 fn classify_logon_error(code: u32) -> Verified {
-    if code == ERROR_LOGON_FAILURE { Verified::Wrong } else { Verified::Failed(code) }
+    if code == ERROR_LOGON_FAILURE { Verified::BadPassword } else { Verified::Failed(code) }
 }
 
 fn logon(credentials: Box<Credentials>) -> Verified {
@@ -1512,6 +1722,13 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
+    /// A test that cannot assert something here says so on the standard error handle itself, which the test harness does not capture,
+    /// so the notice is shown on an ordinary run in which the test passes.
+    fn not_asserted(text: impl std::fmt::Display) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "NOTICE NOT ASSERTED {}", text);
+    }
+
     /// What the stub prompt does on each call, in order.
     enum Answer {
         Password(&'static str),
@@ -1527,24 +1744,42 @@ mod tests {
         asked: Mutex<Vec<(u32, u32, String)>>,
         /// The reason `begin` gives for refusing, if it does.
         closed: Option<&'static str>,
+        /// How many times `begin` was called: the presence checks and the lock of a real prompt are made there.
+        begun: Mutex<u32>,
+        /// What `warn` was told before each attempt: the number of the attempt and the count of the wrong passwords on record.
+        warned: Mutex<Vec<(u32, usize)>>,
     }
 
     impl StubPrompt {
         fn new(answers: Vec<Answer>) -> StubPrompt {
-            StubPrompt { answers: Mutex::new(answers.into()), asked: Mutex::new(Vec::new()), closed: None }
+            StubPrompt { answers: Mutex::new(answers.into()), asked: Mutex::new(Vec::new()), closed: None, begun: Mutex::new(0), warned: Mutex::new(Vec::new()) }
         }
 
         fn asked(&self) -> Vec<(u32, u32, String)> {
             self.asked.lock().unwrap().clone()
         }
+
+        fn warned(&self) -> Vec<(u32, usize)> {
+            self.warned.lock().unwrap().clone()
+        }
+
+        fn begun(&self) -> u32 {
+            *self.begun.lock().unwrap()
+        }
     }
 
     impl Prompt for StubPrompt {
-        fn begin(&self, _text: &str) -> Result<Claim, String> {
+        fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
+            *self.begun.lock().unwrap() += 1;
             match self.closed {
                 Some(reason) => Err(reason.into()),
                 None => Ok(Claim::none()),
             }
+        }
+
+        fn warn(&self, attempt: u32, recorded: usize) -> Result<(), String> {
+            self.warned.lock().unwrap().push((attempt, recorded));
+            Ok(())
         }
 
         fn ask(&self, attempt: u32, last_error: u32, text: &str) -> Asked {
@@ -1572,7 +1807,7 @@ mod tests {
                 return Verified::Failed(code);
             }
             if credentials.password_units() != self.right.encode_utf16().collect::<Vec<u16>>() {
-                Verified::Wrong
+                Verified::BadPassword
             } else if self.same_user {
                 Verified::Approved
             } else {
@@ -1592,13 +1827,116 @@ mod tests {
     /// The parent the prompt is told in the tests.
     const STARTER: &str = "starter.exe";
 
-    /// `authorize` with no owner to watch and the same names every time.
+    /// `authorize` with no owner to watch, the same names every time and a record that holds nothing.
     fn authorize_with(settings: &Settings, prompt: &dyn Prompt, verifier: &dyn Verifier, log: &Log) -> Result<(), GuardError> {
         authorize_owned(settings, prompt, verifier, &Owners::empty(), log)
     }
 
     fn authorize_owned(settings: &Settings, prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners, log: &Log) -> Result<(), GuardError> {
-        authorize(settings, &Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" }, prompt, verifier, owners, log)
+        authorize_recorded(settings, prompt, verifier, &MemoryRecord::new(&[]), owners, log)
+    }
+
+    /// `authorize` against the record `record`.
+    fn authorize_recorded(settings: &Settings, prompt: &dyn Prompt, verifier: &dyn Verifier, record: &MemoryRecord, owners: &Owners, log: &Log) -> Result<(), GuardError> {
+        authorize(settings, &Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" }, prompt, verifier, record, owners, log)
+    }
+
+    /// A time of day on the first day of the clock of these tests, in universal time.
+    const DAY: u64 = 24 * 3600 * 10_000_000;
+    const HOUR: u64 = 3600 * 10_000_000;
+    const MINUTE: u64 = 60 * 10_000_000;
+    const DAY0: u64 = (134_000_000_000_000_000 / DAY) * DAY;
+
+    fn at(hour: u64, minute: u64) -> u64 {
+        DAY0 + hour * HOUR + minute * MINUTE
+    }
+
+    /// A record of wrong passwords that is held in memory, with a clock the test sets and a local time that is the universal time
+    /// less seven hours, whatever the date. It keeps, for each wrong password added, the time and how many of the waits between
+    /// attempts had been asked for by then, so that a test sees that the record is written before the wait.
+    struct MemoryRecord {
+        failures: std::cell::RefCell<Vec<u64>>,
+        now: std::cell::Cell<u64>,
+        unreadable: std::cell::Cell<Option<&'static str>>,
+        cannot_add: std::cell::Cell<bool>,
+        adds: std::cell::RefCell<Vec<(u64, u32)>>,
+        /// The reason the lock is refused for, when it is.
+        cannot_lock: std::cell::Cell<Option<&'static str>>,
+        /// Whether the run holds the lock now, how many times it was taken, and what the record was asked while it was held or not
+        /// (`read` and `add`, with whether the lock was held).
+        locked: std::cell::Cell<bool>,
+        locks: std::cell::Cell<u32>,
+        asked: std::cell::RefCell<Vec<(&'static str, bool)>>,
+        /// For each time the lock was let go, how many waits after a refusal had been asked for by then.
+        released: std::cell::RefCell<Vec<u32>>,
+    }
+
+    impl MemoryRecord {
+        /// A record that holds `failures`, read at 9:00 universal time, which is two in the morning on the clock of these tests.
+        fn new(failures: &[u64]) -> MemoryRecord {
+            MemoryRecord {
+                failures: std::cell::RefCell::new(failures.to_vec()), now: std::cell::Cell::new(at(9, 0)),
+                unreadable: std::cell::Cell::new(None), cannot_add: std::cell::Cell::new(false), adds: std::cell::RefCell::new(Vec::new()),
+                cannot_lock: std::cell::Cell::new(None), locked: std::cell::Cell::new(false), locks: std::cell::Cell::new(0),
+                asked: std::cell::RefCell::new(Vec::new()), released: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn failures(&self) -> Vec<u64> {
+            self.failures.borrow().clone()
+        }
+
+        /// What another program does: it adds a wrong password to the record, which it cannot while the run holds the lock (the
+        /// record takes it in order, as the file does for an append from another handle).
+        fn another_program_adds(&self, filetime: u64) -> Result<(), String> {
+            if self.locked.get() {
+                return Err("the lockout record is locked by another program".into());
+            }
+            self.failures.borrow_mut().push(filetime);
+            Ok(())
+        }
+    }
+
+    impl Record for MemoryRecord {
+        fn now(&self) -> u64 {
+            self.now.get()
+        }
+
+        fn failures(&self, _now: u64) -> Result<Vec<u64>, String> {
+            self.asked.borrow_mut().push(("read", self.locked.get()));
+            match self.unreadable.get() {
+                Some(reason) => Err(reason.into()),
+                None => Ok(self.failures.borrow().clone()),
+            }
+        }
+
+        fn add(&self, filetime: u64) -> Result<(), String> {
+            self.asked.borrow_mut().push(("add", self.locked.get()));
+            if self.cannot_add.get() {
+                return Err("the lockout record could not be appended to: access is denied".into());
+            }
+            self.adds.borrow_mut().push((filetime, RETRIES.with(|count| count.get())));
+            self.failures.borrow_mut().push(filetime);
+            Ok(())
+        }
+
+        fn lock(&self) -> Result<Held<'_>, String> {
+            if let Some(reason) = self.cannot_lock.get() {
+                return Err(reason.into());
+            }
+            assert!(!self.locked.get(), "the run takes the lock once at a time");
+            self.locked.set(true);
+            self.locks.set(self.locks.get() + 1);
+            Ok(Held::new(|| {
+                self.locked.set(false);
+                self.released.borrow_mut().push(COOL_DOWNS.with(|count| count.get()));
+            }))
+        }
+
+        fn local_clock(&self, filetime: u64) -> (u16, u16) {
+            let minutes = (filetime / MINUTE + 1440 - 7 * 60) % 1440;
+            ((minutes / 60) as u16, (minutes % 60) as u16)
+        }
     }
 
     fn lines_of(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
@@ -1725,7 +2063,7 @@ mod tests {
     struct HoldsALock(String);
 
     impl Prompt for HoldsALock {
-        fn begin(&self, _text: &str) -> Result<Claim, String> {
+        fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
             Ok(Claim { _lock: Some(PromptLock::take_named(&self.0)?) })
         }
 
@@ -1764,10 +2102,12 @@ mod tests {
         // The same for a prompt that fails after it was shown, a failure of the system, and three names or passwords that were not accepted.
         for answers in [vec![Answer::Unavailable("the prompt failed")], vec![Answer::Password("right")], vec![Answer::Password("a"), Answer::Password("b"), Answer::Password("c")]] {
             let failing = StubVerifier { right: "other", same_user: true, failure: if answers.len() == 1 && matches!(answers[0], Answer::Password(_)) { Some(1909) } else { None } };
+            let lockout = answers.len() == 3;
             let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
             assert!(authorize_with(&settings("x"), &StubPrompt::new(answers), &failing, &log).is_err());
             log.finish(1_000);
-            assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 1, "one cool-down for each refusal after a prompt");
+            // The third wrong password starts a lockout (the record is empty and every run adds to it), which is returned at once.
+            assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), if lockout { 0 } else { 1 }, "one cool-down for each refusal after a prompt, but not for a lockout");
         }
         // Not after an approval, a prompt that was never shown, a starter that has gone, or a prompt left open at its limit (the process
         // ends at once, which is expected to end the dialog or the read): nobody is shown a prompt that follows.
@@ -1878,6 +2218,89 @@ mod tests {
         assert!(authorize_with(&settings("x"), &prompt, &verifier, &log).is_err());
         log.finish(1_000);
         assert!(lines_of(&kept)[0].contains("[WinError 1909]"), "{:?}", lines_of(&kept));
+    }
+
+    #[test]
+    fn at_the_console_a_code_given_only_for_a_right_password_is_counted_as_a_wrong_one_and_at_the_desktop_it_is_not() {
+        RETRIES.with(|count| count.set(0));
+        let verifier = StubVerifier { right: "right", same_user: true, failure: Some(1385) };
+        // The console: each answer is a wrong password to the record, so that a program that types sees the lockout after three
+        // answers whether or not one of them was right, and the third run ends with the lockout message.
+        let record = MemoryRecord::new(&[]);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let prompt = StubPrompt::new(vec![Answer::Password("right"), Answer::Password("right"), Answer::Password("right")]);
+        let error = authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log).expect_err("the run is refused");
+        log.finish(1_000);
+        assert_eq!(error.message(), format!("exception refused: the user name or password was not accepted; no attempts are left; {}; the run did not start", LOCKED));
+        assert_eq!(record.failures().len(), 3, "three entries");
+        assert_eq!(*record.adds.borrow(), [(at(9, 0), 0), (at(9, 0), 1), (at(9, 0), 2)], "each added when it was found wrong, before the wait");
+        assert!(!lines_of(&kept).iter().any(|line| line.contains("WinError")), "{:?}", lines_of(&kept));
+        // With two on record already, the first such answer starts the lockout there and then, as a wrong password does.
+        let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+        let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let error = authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log).expect_err("the lockout");
+        assert!(error.message().contains("locked out after 3 wrong passwords") && !error.message().contains("no attempts are left"), "{}", error);
+        assert_eq!((prompt.asked().len(), record.failures().len()), (1, 3));
+        // A code that cannot be added to the record refuses the run, as a wrong password does: the guess is not free.
+        let record = MemoryRecord::new(&[]);
+        record.cannot_add.set(true);
+        let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+        let error = authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log).expect_err("not recorded");
+        assert!(error.message().contains("the wrong password could not be recorded"), "{}", error);
+        // The desktop shows the error to the person, so no program learns anything from it: nothing is added, and the run ends at once.
+        let mut desktop = settings("x");
+        if let Some(exception) = desktop.exception.as_mut() {
+            exception.method = Method::Desktop;
+        }
+        let record = MemoryRecord::new(&[]);
+        let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+        let error = authorize_recorded(&desktop, &prompt, &verifier, &record, &Owners::empty(), &log).expect_err("the run is refused");
+        assert!(error.message().contains("[WinError 1385]"), "{}", error);
+        assert_eq!((prompt.asked().len(), record.failures().len()), (1, 0));
+    }
+
+    #[test]
+    fn the_console_is_told_how_many_wrong_passwords_are_on_record_before_each_later_attempt_and_the_desktop_has_it_in_its_text() {
+        let record = MemoryRecord::new(&[at(8, 0)]);
+        let prompt = StubPrompt::new(vec![Answer::Password("a"), Answer::Password("right")]);
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        assert!(authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log).is_ok());
+        // Before each attempt the prompt is told the count it has then (one on record, then two after the wrong password).
+        assert_eq!(prompt.warned(), [(1, 1), (2, 2)]);
+        let asked = prompt.asked();
+        assert!(asked[0].2.contains(" 1 wrong password on record within six hours; the third stops this prompt for six hours."), "{}", asked[0].2);
+        assert!(asked[1].2.contains(" 2 wrong passwords on record within six hours; the third stops this prompt for six hours."), "{}", asked[1].2);
+        // With none on record there is nothing to tell.
+        assert_eq!(on_record_sentence(0), "");
+        let none = MemoryRecord::new(&[]);
+        let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+        assert!(authorize_recorded(&settings("x"), &prompt, &verifier, &none, &Owners::empty(), &log).is_ok());
+        assert_eq!(prompt.warned(), [(1, 0)]);
+    }
+
+    #[test]
+    fn a_prompt_that_cannot_tell_the_person_the_count_refuses_the_run_before_the_attempt() {
+        struct CannotWarn;
+        impl Prompt for CannotWarn {
+            fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
+                Ok(Claim::none())
+            }
+            fn warn(&self, _attempt: u32, _recorded: usize) -> Result<(), String> {
+                Err("the console cannot be written to".into())
+            }
+            fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
+                panic!("nobody is asked when the person cannot be told");
+            }
+        }
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        let error = authorize_with(&settings("x"), &CannotWarn, &verifier, &log).expect_err("refused");
+        log.finish(1_000);
+        assert!(error.message().contains("the console cannot be written to") && lines_of(&kept)[0].contains("attempt=0 "), "{} {:?}", error, lines_of(&kept));
     }
 
     #[test]
@@ -2054,7 +2477,7 @@ mod tests {
         let starter = event(false);
         struct ExitsWhileAsked(Handle);
         impl Prompt for ExitsWhileAsked {
-            fn begin(&self, _text: &str) -> Result<Claim, String> {
+            fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
                 Ok(Claim::none())
             }
             fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
@@ -2074,7 +2497,18 @@ mod tests {
     /// The text of the prompt of `method` for an account, a parent, the program and the command, for
     /// a run that starts with a deadline of 20 seconds.
     fn text_for(method: Method, account: &str, parent: &str, program: &str, command: &str, seconds: f64) -> String {
-        prompt_text(&Subject { account, parent, program }, &Exception { method, command: command.into(), timeout: 20.0 }, seconds)
+        prompt_text(&Subject { account, parent, program }, &Exception { method, command: command.into(), timeout: 20.0 }, seconds, 0)
+    }
+
+    #[test]
+    fn the_prompt_says_how_many_wrong_passwords_are_on_record_and_that_the_third_starts_a_lockout_and_says_nothing_when_there_are_none() {
+        let with = |recorded: usize| prompt_text(&Subject { account: "PC\\me", parent: "p", program: "p" }, &Exception { method: Method::Desktop, command: "x".into(), timeout: 20.0 }, 86_400.0, recorded);
+        assert!(!with(0).contains("wrong password"), "{}", with(0));
+        assert!(with(1).ends_with("or cancel to refuse the run. 1 wrong password on record within six hours; the third stops this prompt for six hours."), "{}", with(1));
+        assert!(with(2).ends_with("or cancel to refuse the run. 2 wrong passwords on record within six hours; the third stops this prompt for six hours."), "{}", with(2));
+        // The note on written-out characters stays the last thing the message says.
+        let odd = prompt_text(&Subject { account: "PC\\m\u{e9}", parent: "p", program: "p" }, &Exception { method: Method::Console, command: "x".into(), timeout: 20.0 }, 86_400.0, 2);
+        assert!(odd.contains("stops this prompt for six hours. Note: \\u{..} is a character written out"), "{}", odd);
     }
 
     /// The text of the desktop prompt for a parent, the program and the command, in the account `PC\me`.
@@ -2091,7 +2525,7 @@ mod tests {
             The run starts with a deadline of 20 seconds. Enter the password of the account above to allow it, or cancel to refuse the run."), "{}", text);
         assert!(!text.contains("for up to 24 hours.") && !text.contains("run a command for up to") && !text.contains("signed-in user") && !text.contains("Started by"), "the cap is not described as a bound on the run: {}", text);
         // The deadline the run starts with is shown as it is (a fraction too), apart from the cap.
-        let started = |timeout: f64| prompt_text(&Subject { account: "PC\\me", parent: "", program: "p" }, &Exception { method: Method::Desktop, command: "x".into(), timeout }, 86_400.0);
+        let started = |timeout: f64| prompt_text(&Subject { account: "PC\\me", parent: "", program: "p" }, &Exception { method: Method::Desktop, command: "x".into(), timeout }, 86_400.0, 0);
         assert!(started(86_400.0).contains("The run starts with a deadline of 86400 seconds."), "{}", started(86_400.0));
         assert!(started(0.5).contains("The run starts with a deadline of 0.5 seconds."), "{}", started(0.5));
         assert!(text_of("s", "p", "x", 3_600.0).contains("up to 1 hour at a time"), "one hour is not hours");
@@ -2192,9 +2626,17 @@ mod tests {
             let field = longest(escaped);
             let account = format!("{}\u{202e}", "\\u{".repeat(40_000));
             for method in [Method::Desktop, Method::Console] {
-                let text = prompt_text(&Subject { account: &account, parent: &field, program: &field },
-                    &Exception { method, command: field.clone(), timeout: 86_399.5 }, 21_601.5);
-                assert!(text.encode_utf16().count() < CREDUI_MAX_MESSAGE_LENGTH, "the message stays under the limit of the dialog: {}", text.len());
+                let text_with = |recorded: usize| prompt_text(&Subject { account: &account, parent: &field, program: &field },
+                    &Exception { method, command: field.clone(), timeout: 86_399.5 }, 21_601.5, recorded);
+                // With two wrong passwords on record, the most a prompt can say of them (a third locks, and no prompt is shown after it):
+                // the dialog of the desktop method takes no more than its limit. The console method writes its message to the console,
+                // which has no such limit, so what the sentence adds to it is the only thing that is checked for it.
+                let (text, without) = (text_with(2), text_with(0));
+                assert!(without.encode_utf16().count() < CREDUI_MAX_MESSAGE_LENGTH, "the message stays under the limit of the dialog: {}", without.len());
+                match method {
+                    Method::Desktop => assert!(text.encode_utf16().count() < CREDUI_MAX_MESSAGE_LENGTH, "the message with the wrong passwords on record stays under the limit of the dialog: {}", text.encode_utf16().count()),
+                    Method::Console => assert!(text.encode_utf16().count() - without.encode_utf16().count() < 100, "{}", text.len()),
+                }
             }
         }
         // The command line is the field the user most needs and it is first, so that a dialog that clips text keeps it.
@@ -2326,7 +2768,7 @@ mod tests {
         if said.starts_with("no window station could be made") {
             // Some hosts refuse a process that is not a service a window station of its own; the manual check and G95 cover the path there.
             assert!(std::env::var_os("PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION").map_or(true, |value| value.is_empty()), "{}", said);
-            eprintln!("NOT ASSERTED: {}", said);
+            not_asserted(&said);
             return;
         }
         assert!(output.status.success() && said.contains("flags=Some(0) Err ")
@@ -2342,7 +2784,7 @@ mod tests {
             // The copy: its standard input is the null device. With it `begin` returns at the first check, before the lock is taken
             // or anything is written, so nothing can be shown.
             let owners = Owners::empty();
-            match ConsolePrompt::new(&owners).begin("text") {
+            match ConsolePrompt::new(&owners).begin("text", 0) {
                 Err(reason) => println!("BEGIN refused: {}", reason),
                 Ok(_) => println!("BEGIN accepted"),
             }
@@ -2384,7 +2826,7 @@ mod tests {
             let said = stdout.lines().find_map(|line| line.find("JOBBED ").map(|at| line[at + "JOBBED ".len()..].to_string())).unwrap_or_default();
             if said.starts_with("assigned=false") {
                 // A host whose job does not take a nested job: the integration tests (G100) cover the path there.
-                eprintln!("NOT ASSERTED: the copy ({}) could not be put in a job of its own", mode);
+                not_asserted(format!("the copy ({}) could not be put in a job of its own", mode));
                 continue;
             }
             assert!(output.status.success() && said.trim() == format!("assigned=true in_guard_job={}", expected), "{}: {} / {}", mode, said, stdout);
@@ -2491,7 +2933,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1_500));
             Verified::Approved
         });
-        assert_eq!(slow, Verified::Failed(WAIT_TIMEOUT), "a system that does not answer refuses the run and does not approve it");
+        assert_eq!(slow, Verified::Unresolved, "a system that does not answer in time does not approve, and the password counts as a wrong one: it reached the logon");
+        assert!(UNANSWERED.contains(&format!("{} seconds", LOGON_TIMEOUT_MS / 1000)));
         assert_eq!(check_bounded(Duration::from_secs(10), &owners, Box::new(Credentials::with("me", "", "x")), |_| Verified::Approved), Verified::Approved);
         let gone = Owners::of(vec![event(true)]);
         let waiting = check_bounded(Duration::from_secs(60), &gone, Box::new(Credentials::with("me", "", "x")), |_| {
@@ -2579,7 +3022,7 @@ mod tests {
     #[test]
     fn what_the_system_says_to_a_logon_and_to_a_look_up_is_sorted_into_wrong_and_failed() {
         // The mapping alone: the system is not called, so no failed logon is written to the audit log of the machine.
-        assert_eq!(classify_logon_error(ERROR_LOGON_FAILURE), Verified::Wrong);
+        assert_eq!(classify_logon_error(ERROR_LOGON_FAILURE), Verified::BadPassword, "the one answer that counts toward the lockout");
         for code in [1909, 1385, 1327, ERROR_INSUFFICIENT_BUFFER, 1328, 1331] {
             assert_eq!(classify_logon_error(code), Verified::Failed(code), "{}", code);
         }
@@ -2671,7 +3114,7 @@ mod tests {
     struct RejectsEvery(Mutex<Vec<(u32, u32)>>);
 
     impl Prompt for RejectsEvery {
-        fn begin(&self, _text: &str) -> Result<Claim, String> {
+        fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
             Ok(Claim::none())
         }
         fn ask(&self, attempt: u32, last_error: u32, _text: &str) -> Asked {
@@ -2697,7 +3140,7 @@ mod tests {
         let log = Log::capture(kept.clone(), None);
         struct RejectsThenAnswers(Mutex<u32>);
         impl Prompt for RejectsThenAnswers {
-            fn begin(&self, _text: &str) -> Result<Claim, String> {
+            fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
                 Ok(Claim::none())
             }
             fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
@@ -2710,6 +3153,626 @@ mod tests {
         assert!(authorize_with(&settings("x"), &RejectsThenAnswers(Mutex::new(0)), &verifier, &log).is_ok());
         log.finish(1_000);
         assert_eq!(decisions(&lines_of(&kept)), ["refused", "approved"], "{:?}", lines_of(&kept));
+    }
+
+    /// Run the attempts against `record` with the answers `answers` (the right password is "right"): the result, the prompt that was
+    /// driven and the lines of the log.
+    fn attempt(record: &MemoryRecord, answers: Vec<Answer>) -> (Result<(), GuardError>, StubPrompt, Vec<String>) {
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let prompt = StubPrompt::new(answers);
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        let result = authorize_recorded(&settings("x"), &prompt, &verifier, record, &Owners::empty(), &log);
+        log.finish(1_000);
+        let lines = lines_of(&kept);
+        (result, prompt, lines)
+    }
+
+    /// The reason of a lockout of three wrong passwords at 9:00 universal time, as the tests' record says it at that time: two in
+    /// the morning on its clock, seven hours behind, and the end at eight.
+    const LOCKED: &str = "locked out after 3 wrong passwords, the last at 2:00am; the password can be asked again in 6h 0m, at 8:00am";
+
+    #[test]
+    fn three_wrong_passwords_across_runs_lock_the_account_and_every_attempt_after_that_is_refused_before_any_prompt_with_the_message() {
+        RETRIES.with(|count| count.set(0));
+        let record = MemoryRecord::new(&[]);
+        // A run with two wrong passwords and a cancel: two are recorded, and that is no lockout.
+        let (result, prompt, _) = attempt(&record, vec![Answer::Password("a"), Answer::Password("b"), Answer::Cancel]);
+        assert!(result.is_err() && prompt.asked().len() == 3 && record.failures().len() == 2, "{:?}", record.failures());
+        // The next run: its first wrong password is the third within six hours. It is the end of the run, there and then, with the
+        // lockout in the message after the reason of the wrong password, and the prompt is not asked again.
+        let (result, prompt, lines) = attempt(&record, vec![Answer::Password("c"), Answer::Password("right")]);
+        let error = result.expect_err("the third wrong password locks the account");
+        assert_eq!(error.message(), format!("exception refused: the user name or password was not accepted; {}; the run did not start", LOCKED));
+        assert_eq!(prompt.asked().len(), 1, "no second prompt");
+        assert_eq!(decisions(&lines), ["refused"], "{:?}", lines);
+        assert!(lines[0].contains("attempt=1 ") && lines[0].contains(&format!("reason=\"the user name or password was not accepted; {}\"", LOCKED)), "{}", lines[0]);
+        assert_eq!(record.failures().len(), 3);
+        // Every run after that is refused before any prompt, lock or logon, with the message each time, and adds nothing.
+        for round in 0..3 {
+            let (result, prompt, lines) = attempt(&record, vec![]);
+            let error = result.expect_err("a locked account is refused");
+            assert_eq!(error.message(), format!("exception refused: {}; the run did not start", LOCKED), "round {}", round);
+            assert_eq!((prompt.begun(), prompt.asked().len()), (0, 0), "round {}: the presence checks and the lock of the prompt are not made", round);
+            assert_eq!(decisions(&lines), ["refused"], "{:?}", lines);
+            assert!(lines[0].contains("attempt=0 ") && lines[0].contains(&format!("reason=\"{}\"", LOCKED)), "{}", lines[0]);
+            assert_eq!(record.failures().len(), 3, "an attempt while locked does not extend the lockout");
+        }
+        // A correct password cannot be given at all, so nothing clears the lockout; and the lockout ends where the rule puts it.
+        record.now.set(at(9, 0) + WINDOW - 1);
+        assert!(attempt(&record, vec![]).0.is_err());
+        record.now.set(at(9, 0) + WINDOW);
+        let (result, prompt, _) = attempt(&record, vec![Answer::Password("right")]);
+        assert!(result.is_ok() && prompt.begun() == 1, "six hours after the third wrong password the account is asked again");
+        assert_eq!(record.failures().len(), 3, "and an approval writes nothing");
+    }
+
+    /// Hours, as the rule counts them.
+    const WINDOW: u64 = lockout::WINDOW;
+
+    #[test]
+    fn the_third_wrong_password_of_a_run_says_no_attempts_are_left_and_then_the_lockout_and_each_is_recorded_before_the_wait() {
+        RETRIES.with(|count| count.set(0));
+        COOL_DOWNS.with(|count| count.set(0));
+        let record = MemoryRecord::new(&[]);
+        let (result, prompt, lines) = attempt(&record, vec![Answer::Password("a"), Answer::Password("b"), Answer::Password("c"), Answer::Password("right")]);
+        let error = result.expect_err("three wrong passwords end the run");
+        assert_eq!(error.message(), format!("exception refused: the user name or password was not accepted; no attempts are left; {}; the run did not start", LOCKED));
+        assert_eq!(prompt.asked().len(), 3);
+        assert_eq!(decisions(&lines), ["refused", "refused", "refused"], "{:?}", lines);
+        assert!(!lines[0].contains("locked out") && !lines[1].contains("locked out") && lines[2].contains(&format!("no attempts are left; {}", LOCKED)), "{:?}", lines);
+        // Each wrong password is added when it is found wrong, before the wait that comes after it: the first before any wait, the
+        // second after one, the third after two.
+        assert_eq!(*record.adds.borrow(), [(at(9, 0), 0), (at(9, 0), 1), (at(9, 0), 2)]);
+        assert_eq!(RETRIES.with(|count| count.get()), 2, "and the waits were made, two of them");
+        assert_eq!(COOL_DOWNS.with(|count| count.get()), 0, "the lockout is returned at once, with no cool-down after the third wrong password");
+    }
+
+    #[test]
+    fn a_wrong_password_after_two_in_an_earlier_run_ends_the_run_without_saying_that_no_attempts_are_left() {
+        COOL_DOWNS.with(|count| count.set(0));
+        // A wait of 600 milliseconds is what a cool-down would cost here: the message of the lockout is returned without it.
+        RETRY_DELAY.with(|delay| delay.set(600));
+        let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+        let started = Instant::now();
+        let (result, prompt, _) = attempt(&record, vec![Answer::Password("c")]);
+        let waited = started.elapsed();
+        RETRY_DELAY.with(|delay| delay.set(0));
+        assert!(waited < Duration::from_millis(500) && COOL_DOWNS.with(|count| count.replace(0)) == 0, "no cool-down before the message of a lockout: {:?}", waited);
+        let message = result.expect_err("the third wrong password within six hours").message().to_string();
+        assert!(message.contains("locked out after 3 wrong passwords") && !message.contains("no attempts are left"), "{}", message);
+        assert_eq!((prompt.asked().len(), record.failures().len()), (1, 3));
+        // Four, from a record that already held three: the account was locked, so it is refused before a prompt, with the count it has.
+        let four = MemoryRecord::new(&[at(5, 0), at(6, 0), at(7, 0), at(8, 0)]);
+        let (result, prompt, _) = attempt(&four, vec![]);
+        assert!(result.expect_err("locked").message().starts_with("exception refused: locked out after 4 wrong passwords, the last at 1:00am;"), "four wrong passwords say four");
+        assert_eq!(prompt.begun(), 0);
+    }
+
+    #[test]
+    fn the_window_is_six_hours_and_a_failure_older_than_that_does_not_count() {
+        let now = at(9, 0);
+        // Three in a row that were a lockout until a moment ago: it ended one unit ago, and the account is asked.
+        let ended = MemoryRecord::new(&[now - WINDOW - 2 * MINUTE - 1, now - WINDOW - MINUTE - 1, now - WINDOW - 1]);
+        let (result, prompt, _) = attempt(&ended, vec![Answer::Password("right")]);
+        assert!(result.is_ok() && prompt.begun() == 1);
+        // One unit before the end it is not.
+        let locked = MemoryRecord::new(&[now - WINDOW - 2 * MINUTE + 1, now - WINDOW - MINUTE + 1, now - WINDOW + 1]);
+        let (result, prompt, _) = attempt(&locked, vec![]);
+        let error = result.expect_err("one unit before the end");
+        assert!(error.message().contains("in 1m, at 2:01am"), "the end is shown rounded up to the minute: {}", error);
+        assert_eq!(prompt.begun(), 0);
+        // Two that are older than six hours, then a wrong password now: the first of a new count, so the run goes on and asks again.
+        let old = MemoryRecord::new(&[now - 8 * HOUR, now - 7 * HOUR]);
+        let (result, prompt, _) = attempt(&old, vec![Answer::Password("a"), Answer::Password("right")]);
+        assert!(result.is_ok() && prompt.asked().len() == 2, "{:?}", result);
+        assert_eq!(old.failures().len(), 3, "the wrong password is recorded, and it is the third in the record and the first of the window");
+    }
+
+    #[test]
+    fn a_record_dated_ahead_ends_no_lockout_and_makes_none_for_longer_than_six_hours_from_now() {
+        let now = at(9, 0);
+        let skew = lockout::SKEW;
+        // Far ahead: ignored. Three of them are no lockout, and a lockout that is there is not ended by them.
+        let ahead = MemoryRecord::new(&[now + skew + 1, now + HOUR, now + 1000 * HOUR]);
+        let (result, prompt, _) = attempt(&ahead, vec![Answer::Password("right")]);
+        assert!(result.is_ok() && prompt.begun() == 1);
+        // A little ahead: read as now, so the lockout is six hours from now.
+        let near = MemoryRecord::new(&[now + skew, now + skew, now + 1]);
+        let (result, _, _) = attempt(&near, vec![]);
+        assert_eq!(result.expect_err("locked").message(), format!("exception refused: {}; the run did not start", LOCKED));
+        let mixed = MemoryRecord::new(&[now - MINUTE, now - 2 * MINUTE, now - 3 * MINUTE, now + 5000 * HOUR, 0, u64::MAX]);
+        assert!(attempt(&mixed, vec![]).0.expect_err("locked").message().contains("locked out after 3 wrong passwords"));
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_or_not_in_time_refuses_the_run_before_any_prompt_and_says_why() {
+        for reason in ["the lockout record could not be read: [WinError 5] Access is denied.", "the lockout record could not be read in time; an administrator must remove it as described in the README and then run: process-tree-guard create-lockout-record"] {
+            let record = MemoryRecord::new(&[]);
+            record.unreadable.set(Some(reason));
+            let (result, prompt, lines) = attempt(&record, vec![]);
+            assert_eq!(result.expect_err("refused").message(), format!("exception refused: {}; the run did not start", reason));
+            assert_eq!((prompt.begun(), prompt.asked().len()), (0, 0));
+            assert!(lines.len() == 1 && lines[0].contains("attempt=0 ") && lines[0].contains(reason), "{:?}", lines);
+        }
+        // A record that cannot be read after a wrong password refuses the run there, naming it.
+        struct ReadsOnce(MemoryRecord, std::cell::Cell<u32>);
+        impl Record for ReadsOnce {
+            fn now(&self) -> u64 {
+                self.0.now()
+            }
+            fn failures(&self, now: u64) -> Result<Vec<u64>, String> {
+                self.1.set(self.1.get() + 1);
+                // The reads of a run are the look before anything is shown (which gives the count for the prompt too), the look before
+                // the prompt, the look before the logon and the look at what a wrong password came to: it is the fourth that cannot be read.
+                if self.1.get() > 3 { Err("the lockout record could not be read: gone".into()) } else { Record::failures(&self.0, now) }
+            }
+            fn add(&self, filetime: u64) -> Result<(), String> {
+                self.0.add(filetime)
+            }
+            fn lock(&self) -> Result<Held<'_>, String> {
+                self.0.lock()
+            }
+            fn local_clock(&self, filetime: u64) -> (u16, u16) {
+                self.0.local_clock(filetime)
+            }
+        }
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let prompt = StubPrompt::new(vec![Answer::Password("wrong"), Answer::Password("right")]);
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        COOL_DOWNS.with(|count| count.set(0));
+        let reads_once = ReadsOnce(MemoryRecord::new(&[]), std::cell::Cell::new(0));
+        let result = authorize(&settings("x"), &Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" }, &prompt, &verifier, &reads_once, &Owners::empty(), &log);
+        log.finish(1_000);
+        let message = result.expect_err("a record that cannot be read after the wrong password").message().to_string();
+        assert!(message.contains("the user name or password was not accepted; the lockout record could not be read after it: the lockout record could not be read: gone"), "{}", message);
+        assert_eq!(prompt.asked().len(), 1);
+        assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 1, "a record that cannot be read is not a lockout, so the cool-down after a prompt is kept");
+    }
+
+    #[test]
+    fn a_wrong_password_that_the_record_cannot_take_ends_the_run_there_so_that_a_guess_is_never_free() {
+        let record = MemoryRecord::new(&[]);
+        record.cannot_add.set(true);
+        let (result, prompt, lines) = attempt(&record, vec![Answer::Password("wrong"), Answer::Password("right")]);
+        let message = result.expect_err("refused").message().to_string();
+        assert!(message.starts_with("exception refused: the wrong password could not be recorded: the lockout record could not be appended to"), "{}", message);
+        assert_eq!(prompt.asked().len(), 1, "the next attempt is not made");
+        assert!(lines.len() == 1 && lines[0].contains("attempt=1 "), "{:?}", lines);
+        // The right password is not affected by it: nothing is added for it.
+        let (result, _, _) = attempt(&record, vec![Answer::Password("right")]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_locked_refuses_the_run_before_the_logon_so_a_guess_is_never_made_uncounted() {
+        // Another program holds a range of the record locked, another run is at the same place, or the volume has no room for a
+        // record: whichever, the password that was entered is dropped with no logon, the run is refused after its prompt (attempt 1)
+        // with the reason, and nothing is added to the record.
+        for reason in ["the lockout record is locked by another program or another run; try again",
+            "the volume of the lockout record has no room for a record, so a wrong password could not be counted"] {
+            let record = MemoryRecord::new(&[at(8, 0)]);
+            record.cannot_lock.set(Some(reason));
+            let logons = CountsLogons(std::cell::Cell::new(0));
+            let (result, prompt, lines) = run_against(&record, vec![Answer::Password("right"), Answer::Password("right")], &logons);
+            assert_eq!(result.expect_err("refused").message(), format!("exception refused: {}; the run did not start", reason));
+            assert_eq!((prompt.begun(), prompt.asked().len(), logons.0.get()), (1, 1, 0), "the prompt was shown once and the password was not tried");
+            assert!(lines.len() == 1 && lines[0].contains("attempt=1 ") && lines[0].contains(&format!("reason=\"{}\"", reason)), "{:?}", lines);
+            assert_eq!(record.failures(), [at(8, 0)], "nothing is added");
+            assert!(!record.locked.get() && record.adds.borrow().is_empty());
+        }
+        // Not asked for when no password is entered: a cancel, an empty answer and a prompt that failed use no logon, so no lock.
+        let record = MemoryRecord::new(&[]);
+        record.cannot_lock.set(Some("the lockout record is locked by another program or another run; try again"));
+        let (result, _, _) = attempt(&record, vec![Answer::Cancel]);
+        assert_eq!(result.expect_err("a cancel").message(), "exception refused: the prompt was cancelled; the run did not start");
+    }
+
+    /// A prompt that tells whether the run holds the lock of the record when it is asked to show itself, and answers with a password.
+    struct WatchesTheLock<'a> {
+        record: &'a MemoryRecord,
+        held: std::cell::RefCell<Vec<bool>>,
+        passwords: std::sync::Mutex<std::collections::VecDeque<&'static str>>,
+    }
+
+    impl Prompt for WatchesTheLock<'_> {
+        fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
+            Ok(Claim::none())
+        }
+
+        fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
+            self.held.borrow_mut().push(self.record.locked.get());
+            let password = self.passwords.lock().unwrap().pop_front().expect("asked more often than the test allows");
+            Asked::Entered(Box::new(Credentials::with("me", "", password)))
+        }
+    }
+
+    /// A prompt that, as it begins, is another session adding a wrong password to the record, and then cancels when asked.
+    struct AddsWhenBegun<'a> {
+        record: &'a MemoryRecord,
+        inner: StubPrompt,
+    }
+
+    impl Prompt for AddsWhenBegun<'_> {
+        fn begin(&self, text: &str, recorded: usize) -> Result<Claim, String> {
+            self.record.failures.borrow_mut().push(at(8, 30));
+            self.inner.begin(text, recorded)
+        }
+
+        fn warn(&self, attempt: u32, recorded: usize) -> Result<(), String> {
+            self.inner.warn(attempt, recorded)
+        }
+
+        fn ask(&self, attempt: u32, last_error: u32, text: &str) -> Asked {
+            self.inner.ask(attempt, last_error, text)
+        }
+    }
+
+    #[test]
+    fn the_first_prompt_says_the_count_of_the_look_made_just_before_it_and_not_the_one_made_before_the_claim() {
+        let record = MemoryRecord::new(&[at(8, 0)]);
+        let prompt = AddsWhenBegun { record: &record, inner: StubPrompt::new(vec![Answer::Cancel]) };
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        assert!(authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log).is_err());
+        log.finish(1_000);
+        let asked = prompt.inner.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(asked[0].2.contains(" 2 wrong passwords on record within six hours") && !asked[0].2.contains(" 1 wrong password on record"), "{}", asked[0].2);
+        // The console prompt wrote the text of `begin` with the count of the look made before it (1), so it is told the new count (2).
+        assert_eq!(prompt.inner.warned(), [(1, 2)]);
+    }
+
+    #[test]
+    fn the_console_prompt_writes_the_count_at_the_first_attempt_when_it_has_changed_since_its_text_was_made() {
+        // The text of `begin` said 1; another session added a failure before the look made just before the first attempt.
+        assert!(notice_due(1, 2, 1));
+        // Nothing has changed since the text: it said so already. No failure on record: nothing to say.
+        assert!(!notice_due(1, 1, 1) && !notice_due(1, 0, 0) && !notice_due(1, 0, 2));
+        // The count dropped but there are still some: say it. The text said 2 and one has aged out.
+        assert!(notice_due(1, 1, 2));
+        // From the second attempt on the text is no longer on the screen: say it whenever there is a failure on record.
+        assert!(notice_due(2, 1, 1) && notice_due(3, 2, 2) && !notice_due(2, 0, 0) && !notice_due(3, 0, 1));
+    }
+
+    /// A verifier that, at the logon, is another program of the account trying to add a wrong password to the record (as three of
+    /// them would start a lockout in the middle of the logon, which lasts up to a minute), and says what came of it.
+    struct AppendsDuringTheLogon<'a> {
+        record: &'a MemoryRecord,
+        tried: std::cell::RefCell<Vec<Result<(), String>>>,
+        right: &'static str,
+    }
+
+    impl Verifier for AppendsDuringTheLogon<'_> {
+        fn verify(&self, credentials: Box<Credentials>) -> Verified {
+            for _ in 0..3 {
+                self.tried.borrow_mut().push(self.record.another_program_adds(at(9, 0)));
+            }
+            if credentials.password_units() == self.right.encode_utf16().collect::<Vec<u16>>() { Verified::Approved } else { Verified::BadPassword }
+        }
+    }
+
+    #[test]
+    fn the_record_is_locked_from_the_last_look_before_the_logon_to_the_end_of_the_attempt_and_not_while_a_prompt_is_open() {
+        RETRIES.with(|count| count.set(0));
+        let record = MemoryRecord::new(&[at(8, 0)]);
+        let prompt = WatchesTheLock { record: &record, held: std::cell::RefCell::new(Vec::new()), passwords: std::sync::Mutex::new(["wrong", "right"].into_iter().collect()) };
+        let verifier = AppendsDuringTheLogon { record: &record, tried: std::cell::RefCell::new(Vec::new()), right: "right" };
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let result = authorize_recorded(&settings("x"), &prompt, &verifier, &record, &Owners::empty(), &log);
+        log.finish(1_000);
+        assert!(result.is_ok(), "{:?}", result);
+        // The lock is not held while a prompt is open, so other runs and sessions are not kept waiting for a person who is typing.
+        assert_eq!(*prompt.held.borrow(), [false, false]);
+        // Three appends by another program during each of the two logons, and none of them lands: nothing begins a lockout between the
+        // last look and the approval, or between the logon and the wrong password being added.
+        let tried = verifier.tried.borrow();
+        assert_eq!(tried.len(), 6);
+        assert!(tried.iter().all(|attempt| attempt == &Err("the lockout record is locked by another program".to_string())), "{:?}", tried);
+        assert_eq!(record.failures(), [at(8, 0), at(9, 0)], "the one wrong password of the run is the only addition");
+        // What the record was asked, and whether the run held the lock: the look at the start and the looks before each prompt are
+        // not under the lock; the look before the logon, the adding of the wrong password and the look at what it came to are.
+        assert_eq!(*record.asked.borrow(), [("read", false), ("read", false), ("read", true), ("add", true), ("read", true), ("read", false), ("read", true)]);
+        assert_eq!(record.locks.get(), 2, "once for each logon");
+        assert!(!record.locked.get(), "and the lock is let go when the run ends");
+        // Another program can add once the run is over.
+        assert!(record.another_program_adds(at(9, 1)).is_ok());
+    }
+
+    #[test]
+    fn the_lock_is_let_go_before_the_wait_that_follows_a_refusal_and_after_every_way_a_run_can_end() {
+        let ends: Vec<(&str, Box<dyn Fn() -> (Result<(), GuardError>, bool)>)> = vec![
+            ("the third wrong password", Box::new(|| {
+                let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+                let (result, _, _) = attempt(&record, vec![Answer::Password("c")]);
+                (result, record.locked.get())
+            })),
+            ("an approval", Box::new(|| {
+                let record = MemoryRecord::new(&[]);
+                let (result, _, _) = attempt(&record, vec![Answer::Password("right")]);
+                (result, record.locked.get())
+            })),
+            ("a record that takes no wrong password", Box::new(|| {
+                let record = MemoryRecord::new(&[]);
+                record.cannot_add.set(true);
+                let (result, _, _) = attempt(&record, vec![Answer::Password("wrong")]);
+                (result, record.locked.get())
+            })),
+            ("no attempts left", Box::new(|| {
+                let record = MemoryRecord::new(&[]);
+                let (result, _, _) = attempt(&record, vec![Answer::Password("a"), Answer::Password("b"), Answer::Password("c")]);
+                (result, record.locked.get())
+            })),
+        ];
+        for (name, run) in ends {
+            let (_, still_held) = run();
+            assert!(!still_held, "{}: the lock is let go", name);
+        }
+        // Let go before the wait that follows the refusal, not after: the wait is the ten seconds a refusal after a prompt keeps the
+        // right to a prompt, and another run of the account must be able to look at the record in the meantime. The record notes how
+        // many waits had been asked for when the lock was let go.
+        let record = MemoryRecord::new(&[]);
+        let failing = StubVerifier { right: "right", same_user: true, failure: Some(1909) };
+        COOL_DOWNS.with(|count| count.set(0));
+        let (result, _, _) = run_against(&record, vec![Answer::Password("a")], &failing);
+        assert!(result.is_err() && COOL_DOWNS.with(|count| count.get()) == 1);
+        assert_eq!(*record.released.borrow(), [0], "the lock was let go before the wait was asked for");
+    }
+
+    /// A verifier that answers `Wrong` for everything, as it does for a name that is not mapped or an empty password.
+    struct NotMapped;
+
+    impl Verifier for NotMapped {
+        fn verify(&self, _credentials: Box<Credentials>) -> Verified {
+            Verified::Wrong
+        }
+    }
+
+    /// A verifier for a starter that exits while the logon is checked: the password reached the logon and its outcome is not known.
+    struct StarterLeaves;
+
+    impl Verifier for StarterLeaves {
+        fn verify(&self, _credentials: Box<Credentials>) -> Verified {
+            Verified::OwnerGone
+        }
+    }
+
+    #[test]
+    fn a_starter_that_goes_during_the_logon_still_counts_the_guess() {
+        let record = MemoryRecord::new(&[at(8, 0)]);
+        let (result, prompt, lines) = run_against(&record, vec![Answer::Password("a"), Answer::Password("b")], &StarterLeaves);
+        assert_eq!(result.expect_err("refused").message(), format!("exception refused: {}; the run did not start", OWNER_GONE));
+        // One addition, made under the lock the run held, and the record holds the new time.
+        assert_eq!(record.adds.borrow().len(), 1);
+        assert_eq!(record.failures(), [at(8, 0), at(9, 0)]);
+        assert!(record.asked.borrow().contains(&("add", true)), "the addition is made under the lock");
+        assert_eq!(prompt.asked().len(), 1, "the run ends there");
+        assert_eq!(decisions(&lines), ["refused"], "{:?}", lines);
+        assert!(!record.locked.get(), "the lock is let go");
+        // With two failures on record it is the third, and the next run is locked out.
+        let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+        let _ = run_against(&record, vec![Answer::Password("a")], &StarterLeaves);
+        assert!(attempt(&record, vec![Answer::Password("right")]).0.expect_err("locked").message().contains("locked out after 3 wrong passwords"));
+    }
+
+    /// A verifier for a system that does not answer in time: the password reached the logon and its outcome is not known.
+    struct Unanswering;
+
+    impl Verifier for Unanswering {
+        fn verify(&self, _credentials: Box<Credentials>) -> Verified {
+            Verified::Unresolved
+        }
+    }
+
+    #[test]
+    fn a_check_that_the_system_did_not_answer_in_time_counts_as_a_wrong_password_and_ends_the_run_without_approving() {
+        // Two earlier failures and one that nobody knows the outcome of: the third within the window, so the account is locked out,
+        // and the run ends at once, at the first prompt (a system that does not answer is not asked again).
+        let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+        let (result, prompt, lines) = run_against(&record, vec![Answer::Password("right"), Answer::Password("right")], &Unanswering);
+        let message = result.expect_err("a check that was not answered approves nothing").message().to_string();
+        assert!(message.starts_with(&format!("exception refused: {}; locked out after 3 wrong passwords", UNANSWERED)) && message.ends_with("the run did not start"), "{}", message);
+        assert_eq!(record.failures(), [at(7, 0), at(8, 0), at(9, 0)], "the record grew by one and the rule sees it");
+        assert_eq!(prompt.asked().len(), 1);
+        assert_eq!(decisions(&lines), ["refused"], "{:?}", lines);
+        assert!(!record.locked.get(), "the lock is let go");
+        // With nothing else on record it is one failure and no lockout; the run still ends there, with the count told to the next one.
+        let record = MemoryRecord::new(&[]);
+        let (result, prompt, _) = run_against(&record, vec![Answer::Password("right"), Answer::Password("right")], &Unanswering);
+        assert_eq!(result.expect_err("refused").message(), format!("exception refused: {}; the run did not start", UNANSWERED));
+        assert_eq!((record.failures(), prompt.asked().len()), ([at(9, 0)].to_vec(), 1));
+        // A record that cannot take it refuses the run for that, so a guess is never free for this reason either.
+        let record = MemoryRecord::new(&[]);
+        record.cannot_add.set(true);
+        let (result, _, _) = run_against(&record, vec![Answer::Password("right")], &Unanswering);
+        assert!(result.expect_err("refused").message().contains("the wrong password could not be recorded"));
+    }
+
+    #[test]
+    fn only_a_wrong_password_is_recorded_and_every_other_end_of_an_attempt_leaves_the_record_as_it_was() {
+        let kept = || Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let run = |prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners| {
+            let record = MemoryRecord::new(&[at(8, 0)]);
+            let log = kept();
+            let result = authorize_recorded(&settings("x"), prompt, verifier, &record, owners, &log);
+            log.finish(1_000);
+            let adds = record.adds.borrow().len();
+            (result, record.failures(), adds)
+        };
+        let right = StubVerifier { right: "right", same_user: true, failure: None };
+        let other = StubVerifier { right: "theirs", same_user: false, failure: None };
+        let failing = StubVerifier { right: "right", same_user: true, failure: Some(1909) };
+        let unmapped = |answers: Vec<Answer>| run(&StubPrompt::new(answers), &NotMapped, &Owners::empty());
+        // A password that is wrong counts; the same three outcomes without the system's refusal do not.
+        let (result, failures, adds) = run(&StubPrompt::new(vec![Answer::Password("a"), Answer::Cancel]), &right, &Owners::empty());
+        assert!(result.is_err() && failures == [at(8, 0), at(9, 0)] && adds == 1);
+        for (name, (result, failures, adds)) in [
+            ("an empty password", unmapped(vec![Answer::Password(""), Answer::Password(""), Answer::Password("")])),
+            ("a name that is not mapped", unmapped(vec![Answer::Password("x"), Answer::Password("x"), Answer::Password("x")])),
+            ("the password of another account", run(&StubPrompt::new(vec![Answer::Password("theirs"), Answer::Password("theirs"), Answer::Password("theirs")]), &other, &Owners::empty())),
+            ("a failure of the system", run(&StubPrompt::new(vec![Answer::Password("right")]), &failing, &Owners::empty())),
+            ("a cancel", run(&StubPrompt::new(vec![Answer::Cancel]), &right, &Owners::empty())),
+            ("a prompt that failed", run(&StubPrompt::new(vec![Answer::Unavailable("the prompt failed")]), &right, &Owners::empty())),
+            ("a prompt left open", run(&StubPrompt::new(vec![Answer::Abandoned("no answer within 300 seconds")]), &right, &Owners::empty())),
+            ("a prompt that could not be shown", run(&StubPrompt::new(vec![Answer::NotShown("the prompt could not be started")]), &right, &Owners::empty())),
+            ("an answer that is not a name and a password", run(&RejectsEvery(Mutex::new(Vec::new())), &NoLogon, &Owners::empty())),
+            ("a starter that has gone", run(&StubPrompt::new(vec![Answer::Password("a")]), &right, &Owners::of(vec![event(true)]))),
+            ("the right password", run(&StubPrompt::new(vec![Answer::Password("right")]), &right, &Owners::empty())),
+        ] {
+            assert!(failures == [at(8, 0)] && adds == 0, "{}: {:?}", name, failures);
+            let _ = result;
+        }
+        // The right password after two wrong ones in an earlier run approves and leaves the two as they were.
+        let record = MemoryRecord::new(&[at(7, 0), at(8, 0)]);
+        let (result, _, _) = attempt(&record, vec![Answer::Password("right")]);
+        assert!(result.is_ok() && record.failures() == [at(7, 0), at(8, 0)] && record.adds.borrow().is_empty());
+        // Then one wrong password is the third within the window, so the account is locked: a correct password cleared nothing.
+        assert!(attempt(&record, vec![Answer::Password("wrong")]).0.expect_err("the third").message().contains("locked out after 3 wrong passwords"));
+    }
+
+    #[test]
+    fn a_locked_account_is_refused_by_either_method_and_the_starter_going_comes_first() {
+        let record = MemoryRecord::new(&[at(8, 0), at(8, 1), at(8, 2)]);
+        for method in [Method::Desktop, Method::Console] {
+            let mut locked = settings("x");
+            if let Some(exception) = locked.exception.as_mut() {
+                exception.method = method;
+            }
+            let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+            let prompt = StubPrompt::new(vec![]);
+            let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+            let error = authorize_recorded(&locked, &prompt, &verifier, &record, &Owners::empty(), &log).expect_err("locked");
+            log.finish(1_000);
+            assert!(error.message().starts_with("exception refused: locked out after 3 wrong passwords") && prompt.begun() == 0, "{:?}: {}", method, error);
+        }
+        // A starter that has gone is refused for that, before the record is looked at.
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let verifier = StubVerifier { right: "right", same_user: true, failure: None };
+        let error = authorize_recorded(&settings("x"), &StubPrompt::new(vec![]), &verifier, &record, &Owners::of(vec![event(true)]), &log).expect_err("gone");
+        log.finish(1_000);
+        assert!(error.message().contains("nobody is waiting for it"), "{}", error);
+    }
+
+    /// A record that holds what `inner` holds for its first `quiet` reads and three wrong passwords from the next on, as one does
+    /// when a run of the same account in another session, or a program of the account that appends to the record, starts a lockout
+    /// while this run is at work. The reads of a run, in order: the first look before anything is shown (1, which gives the count for
+    /// the text of the prompt too), and for each attempt the look before the prompt (2), the look under the lock before the logon (3)
+    /// and, after a wrong password, the look at what it came to (4); the next attempt then begins with its own look before the
+    /// prompt (5), which gives the count for its text.
+    struct Locks {
+        inner: MemoryRecord,
+        reads: std::cell::Cell<u32>,
+        quiet: u32,
+    }
+
+    impl Locks {
+        fn after(quiet: u32) -> Locks {
+            Locks { inner: MemoryRecord::new(&[]), reads: std::cell::Cell::new(0), quiet }
+        }
+    }
+
+    impl Record for Locks {
+        fn now(&self) -> u64 {
+            self.inner.now()
+        }
+
+        fn failures(&self, now: u64) -> Result<Vec<u64>, String> {
+            self.reads.set(self.reads.get() + 1);
+            if self.reads.get() > self.quiet { Ok(vec![at(9, 0); 3]) } else { Record::failures(&self.inner, now) }
+        }
+
+        fn add(&self, filetime: u64) -> Result<(), String> {
+            self.inner.add(filetime)
+        }
+
+        fn lock(&self) -> Result<Held<'_>, String> {
+            self.inner.lock()
+        }
+
+        fn local_clock(&self, filetime: u64) -> (u16, u16) {
+            self.inner.local_clock(filetime)
+        }
+    }
+
+    /// A verifier that counts how often it is asked to check a password, and says wrong password each time.
+    struct CountsLogons(std::cell::Cell<u32>);
+
+    impl Verifier for CountsLogons {
+        fn verify(&self, _credentials: Box<Credentials>) -> Verified {
+            self.0.set(self.0.get() + 1);
+            Verified::BadPassword
+        }
+    }
+
+    fn run_against(record: &dyn Record, answers: Vec<Answer>, verifier: &dyn Verifier) -> (Result<(), GuardError>, StubPrompt, Vec<String>) {
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let prompt = StubPrompt::new(answers);
+        let result = authorize(&settings("x"), &Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" }, &prompt, verifier, record, &Owners::empty(), &log);
+        log.finish(1_000);
+        let lines = lines_of(&kept);
+        (result, prompt, lines)
+    }
+
+    #[test]
+    fn a_lockout_that_starts_during_the_wait_after_a_wrong_password_stops_the_next_prompt() {
+        // The first wrong password is recorded and the look at what it came to finds no lockout; during the wait of the run a lockout
+        // starts, and the look before the next prompt (the fifth read) finds it: the prompt is not asked a second time.
+        RETRIES.with(|count| count.set(0));
+        COOL_DOWNS.with(|count| count.set(0));
+        let record = Locks::after(4);
+        let logons = CountsLogons(std::cell::Cell::new(0));
+        let (result, prompt, lines) = run_against(&record, vec![Answer::Password("a"), Answer::Password("right")], &logons);
+        let error = result.expect_err("a lockout that began in the wait ends the run").message().to_string();
+        assert_eq!(error, format!("exception refused: {}; the run did not start", LOCKED));
+        assert_eq!((prompt.asked().len(), logons.0.get()), (1, 1), "the second prompt is not shown and no second password is tried");
+        assert_eq!(RETRIES.with(|count| count.get()), 1, "the wait was made");
+        assert_eq!(COOL_DOWNS.with(|count| count.get()), 0, "and the refusal for the lockout has no cool-down");
+        assert_eq!(decisions(&lines), ["refused", "refused"], "{:?}", lines);
+        assert!(lines[0].contains("attempt=1 ") && !lines[0].contains("locked out") && lines[1].contains("attempt=1 ") && lines[1].contains(&format!("reason=\"{}\"", LOCKED)), "{:?}", lines);
+    }
+
+    #[test]
+    fn a_lockout_that_starts_while_a_prompt_is_open_stops_the_run_before_the_logon_and_a_right_password_approves_nothing() {
+        // The prompt is open when the lockout starts (the third read is the one before the logon, under the lock): what was typed is
+        // dropped, with no logon, even though it is the right password.
+        COOL_DOWNS.with(|count| count.set(0));
+        for (quiet, asked) in [(2, 1), (1, 0)] {
+            let record = Locks::after(quiet);
+            let right = StubVerifier { right: "right", same_user: true, failure: None };
+            let (result, prompt, lines) = run_against(&record, vec![Answer::Password("right")], &right);
+            let error = result.expect_err("a run for a locked account is refused, and a right password does not approve it").message().to_string();
+            assert_eq!(error, format!("exception refused: {}; the run did not start", LOCKED), "quiet {}", quiet);
+            assert_eq!((prompt.begun(), prompt.asked().len()), (1, asked), "quiet {}", quiet);
+            assert_eq!(decisions(&lines), ["refused"], "{:?}", lines);
+            assert!(!lines[0].contains("approved") && lines[0].contains(&format!("reason=\"{}\"", LOCKED)), "{:?}", lines);
+            assert!(record.inner.adds.borrow().is_empty(), "nothing is added to the record by a run that is refused for a lockout");
+            assert_eq!(COOL_DOWNS.with(|count| count.get()), 0, "and there is no cool-down before the message, whether or not the prompt was shown (quiet {})", quiet);
+        }
+        // The password typed while the lockout started is not tried: the verifier is not asked.
+        let record = Locks::after(2);
+        let logons = CountsLogons(std::cell::Cell::new(0));
+        let (result, _, lines) = run_against(&record, vec![Answer::Password("anything")], &logons);
+        assert!(result.is_err());
+        assert_eq!(logons.0.get(), 0, "no logon is tried for a password given while the account is locked");
+        assert!(lines[0].contains("attempt=1 "), "the prompt was shown for the first attempt: {:?}", lines);
+        // And when the lockout starts after the claim is taken and before the first prompt, nothing is shown: attempt 0.
+        let early = Locks::after(1);
+        let (result, prompt, lines) = run_against(&early, vec![], &logons);
+        assert_eq!(result.expect_err("refused").message(), format!("exception refused: {}; the run did not start", LOCKED));
+        assert_eq!((prompt.begun(), prompt.asked().len()), (1, 0));
+        assert!(lines.len() == 1 && lines[0].contains("attempt=0 "), "{:?}", lines);
+    }
+
+    #[test]
+    fn a_wait_and_a_lockout_that_are_both_over_by_the_next_prompt_let_it_be_shown() {
+        // The control: a record that stays quiet is read before each prompt and each logon, and the run goes on as it did.
+        let record = Locks::after(1000);
+        let right = StubVerifier { right: "right", same_user: true, failure: None };
+        let (result, prompt, _) = run_against(&record, vec![Answer::Password("wrong"), Answer::Password("right")], &right);
+        assert!(result.is_ok() && prompt.asked().len() == 2, "{:?}", result);
+        assert_eq!(record.reads.get(), 6, "1 first look, then 2 3 4 for the first attempt (look, logon, what the wrong password came to) and 5 6 for the second (look, logon)");
     }
 
     #[test]
@@ -2739,7 +3802,7 @@ mod tests {
         let starter = event(false);
         struct ExitsDuringTheWait(Handle, Mutex<u32>);
         impl Prompt for ExitsDuringTheWait {
-            fn begin(&self, _text: &str) -> Result<Claim, String> {
+            fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
                 Ok(Claim::none())
             }
             fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
@@ -2874,7 +3937,7 @@ pub(crate) mod seam {
     pub(super) struct SeamPrompt(pub bool);
 
     impl Prompt for SeamPrompt {
-        fn begin(&self, _text: &str) -> Result<Claim, String> {
+        fn begin(&self, _text: &str, _recorded: usize) -> Result<Claim, String> {
             Ok(Claim { _lock: None })
         }
 
@@ -2887,7 +3950,39 @@ pub(crate) mod seam {
 
     impl Verifier for SeamVerifier {
         fn verify(&self, credentials: Box<Credentials>) -> Verified {
-            if credentials.password_units() == "right".encode_utf16().collect::<Vec<u16>>() { Verified::Approved } else { Verified::Wrong }
+            if credentials.password_units() == "right".encode_utf16().collect::<Vec<u16>>() { Verified::Approved } else { Verified::BadPassword }
+        }
+    }
+
+    /// A record of wrong passwords that holds nothing and keeps what it is given in memory: the record of a run of the engine tests.
+    pub(super) struct SeamRecord(std::cell::RefCell<Vec<u64>>);
+
+    impl SeamRecord {
+        pub(super) fn new() -> SeamRecord {
+            SeamRecord(std::cell::RefCell::new(Vec::new()))
+        }
+    }
+
+    impl Record for SeamRecord {
+        fn now(&self) -> u64 {
+            134_000_000_000_000_000
+        }
+
+        fn failures(&self, _now: u64) -> Result<Vec<u64>, String> {
+            Ok(self.0.borrow().clone())
+        }
+
+        fn add(&self, filetime: u64) -> Result<(), String> {
+            self.0.borrow_mut().push(filetime);
+            Ok(())
+        }
+
+        fn lock(&self) -> Result<Held<'_>, String> {
+            Ok(Held::new(|| {}))
+        }
+
+        fn local_clock(&self, _filetime: u64) -> (u16, u16) {
+            (0, 0)
         }
     }
 }
