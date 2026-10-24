@@ -405,10 +405,10 @@ pub fn run_job_with(argv: &[String], seconds: f64, raw_tail: Option<&str>, watch
     // a cap that nobody approved.
     if let Some(settings) = mode.extendable.as_ref() {
         if settings.max_seconds > DEFAULT_MAX_EXTENSION && settings.exception.is_none() {
-            return Err(GuardError("a cap over the default needs the password of the account the guard runs as; the run did not start".into()));
+            return Err(GuardError("a cap over the default needs the approval of the signed-in user; the run did not start".into()));
         }
     }
-    // A cap over the default needs the password of the account the guard runs as. It is asked for now, once the
+    // A cap over the default needs the approval of the signed-in user. It is asked for now, once the
     // command is known to be runnable and before the job exists or the command starts, and the
     // log it is recorded in is passed on to the extension. A run inside another run is refused.
     // The process that started the guard is opened first and watched while a prompt is open, so
@@ -930,7 +930,7 @@ mod tests {
         for max_seconds in [DEFAULT_MAX_EXTENSION + 1.0, 86_400.0] {
             let mode = RunMode { extendable: Some(Settings { max_seconds, log_path: None, exception: None }), ..RunMode::default() };
             let error = run_job_with(&argv, 5.0, None, false, &mode).expect_err("a cap that nobody approved");
-            assert!(error.message().contains("needs the password of the account the guard runs as") && error.message().contains("did not start"), "{}", error);
+            assert!(error.message().contains("needs the approval of the signed-in user") && error.message().contains("did not start"), "{}", error);
         }
     }
 

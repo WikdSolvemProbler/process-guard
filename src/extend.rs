@@ -411,7 +411,7 @@ fn notice_line(unix_ms: u64, text: &str) -> String {
 /// The hours of a number of seconds as a figure, rounded up to two decimals, with the zeros at
 /// the end left off (`24`, `6.5`, `6.95`), so that a cap such as 25000 seconds is not shown as
 /// `6.944444444444445`. Rounded up from the whole seconds, so that the figure is never smaller
-/// than the cap: a cap just over six hours is never shown as the default cap that needs no password.
+/// than the cap: a cap just over six hours is never shown as the default cap that needs no approval.
 pub(crate) fn hours_figure(seconds: f64) -> String {
     let hundredths = (seconds / 36.0).ceil() as u64;
     let fraction = format!("{:02}", hundredths % 100);
@@ -424,7 +424,7 @@ pub(crate) fn hours_figure(seconds: f64) -> String {
 /// What the line for a decision on an exception above the cap is about. `account` is the account
 /// the guard runs as and `command` the command line the decision is about (as the prompt shows it),
 /// so that the record says what was approved and for whom; `method` is how the user was asked
-/// (`desktop` or `console`), `timeout` the deadline the run starts with, in seconds, and
+/// (`hello`, `desktop` or `console`), `timeout` the deadline the run starts with, in seconds, and
 /// `started_by` the nearest process that started the guard, as the prompt shows it (empty when it
 /// is not known). `requested` is the cap asked for, in seconds. `attempt` is the number of the
 /// attempt (the attempts made before it when the run was refused before one was shown: 0 for a
@@ -445,9 +445,9 @@ pub(crate) struct ExceptionRecord<'a> {
 }
 
 /// The line for the decision on an exception above the cap, taken at the start of the run:
-/// `exception-approved` once the user has given the password, `exception-refused` for an
-/// attempt that failed or a run that cannot be asked. `hours` is the cap in hours (rounded up).
-/// Nothing the user typed is in it: not the password, and not a name.
+/// `exception-approved` once the user has approved the run (by Windows Hello or by the password),
+/// `exception-refused` for an attempt that failed or a run that cannot be asked. `hours` is the
+/// cap in hours (rounded up). Nothing the user typed is in it: not the password, and not a name.
 pub(crate) fn exception_line(record: &ExceptionRecord) -> String {
     format!("PROCESS_TREE_GUARD_EXTENSION: time={} pid={} image=\"{}\" account=\"{}\" command=\"{}\" method=\"{}\" timeout={} started_by=\"{}\" requested={} hours={} granted=0 decision={} attempt={} reason=\"{}\"",
         iso8601(record.unix_ms), record.pid, escape(record.image), escape(record.account), escape(record.command), escape(record.method), log_seconds(record.timeout),
@@ -1502,7 +1502,7 @@ impl Shared {
 }
 
 /// What the run asks of its channel: the cap and the audit file. `exception` is set when the
-/// cap is over the default, and the run then needs the password of the account the guard runs as to start.
+/// cap is over the default, and the run then needs the approval of the signed-in user to start.
 pub struct Settings {
     pub max_seconds: f64,
     pub log_path: Option<PathBuf>,

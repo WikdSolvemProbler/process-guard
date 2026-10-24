@@ -167,10 +167,11 @@ fn extension_settings(options: &Options, timeout: f64) -> Result<Option<Settings
         Some(path) => Some(PathBuf::from(path)),
         None => None,
     };
-    // A cap over the default is an exception that needs the password of the account the guard runs as. This
-    // function only says so: the prompt is made later, when the command is known to be runnable,
-    // and never from a launch argument alone. `--authenticate` is read and ignored at or below
-    // the default cap, which never prompts. The command line is filled in by the caller.
+    // A cap over the default is an exception that needs the approval of the signed-in user (Windows
+    // Hello, or the password of the account the guard runs as). This function only says so: the
+    // prompt is made later, when the command is known to be runnable, and never from a launch
+    // argument alone. `--authenticate` is read and ignored at or below the default cap, which
+    // never prompts. The command line is filled in by the caller.
     let exception = (max_seconds > DEFAULT_MAX_EXTENSION).then(|| Exception {
         method: options.authenticate.as_deref().and_then(Method::from_name).unwrap_or(Method::Desktop),
         command: String::new(),

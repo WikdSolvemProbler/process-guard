@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Edge case and efficiency battery for the process guard (inventory B1 to B148):
+//! Edge case and efficiency battery for the process guard (inventory B1 to B149):
 //! exit codes across the 32 bit range, timeout precision, wide and deep process
 //! trees, escape attempts, nested guards, missing standard handles, bulk output,
 //! argument and shell quoting, concurrency, launch overhead, hook mode attacks,
@@ -1491,17 +1491,18 @@ fn b147_the_documents_say_standard_error_is_the_only_record_without_an_audit_fil
 #[test]
 fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resists() {
     let mut checks = Checks::new("the exception above the cap");
-    // A cap over six hours needs the signed-in user's password at the start of the run. The documents must say how it is asked
-    // for, when a run is refused, how many attempts there are and how long a prompt waits, that a PIN cannot approve, and (in
-    // SECURITY.md) that it resists accidents and agents without the password and not a process of the same user that can
-    // tamper with the guard; the policy gets its one sentence, and the manual check of the prompts is written as steps.
+    // A cap over six hours needs the signed-in user's approval at the start of the run: Windows Hello, which B149 checks, or the
+    // password. The documents must say how the password is asked for, when a run is refused, how many attempts there are and how
+    // long a prompt waits, that a PIN is spelled out, and (in SECURITY.md) that it resists accidents and
+    // agents without the password and not a process of the same user that can tamper with the guard; the policy gets its one
+    // sentence, and the manual check of the prompts is written as steps.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap_or_default();
     for name in ["README.md", "SECURITY.md", "CHANGELOG.md"] {
         let body = read(name);
         checks.check("B148", &format!("{} says that a cap over the default needs the signed-in user's password, with --authenticate, and what the log records", name),
             body.contains("signed-in user's password") && body.contains("--authenticate") && body.contains("exception-approved"), name);
-        checks.check("B148", &format!("{} says that there are 3 attempts, that a prompt waits 300 seconds, that session 0 is refused and that a PIN cannot approve (spelled out)", name),
+        checks.check("B148", &format!("{} says that there are 3 attempts, that a prompt waits 300 seconds, that session 0 is refused, and spell out the Personal Identification Number (PIN)", name),
             body.contains("3 attempts") && body.contains("300 seconds") && body.contains("session 0") && body.contains("Personal Identification Number (PIN)"), name);
     }
     for name in ["README.md", "CHANGELOG.md"] {
@@ -1514,18 +1515,19 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
         security.contains("resists accidents and agents that do not have the password") && security.contains("tamper with the guard process")
             && security.contains("800-63B") && security.contains("verifier impersonation resistance") && security.contains("The prompt itself is in scope"), "SECURITY.md");
     let policy = read("POLICY.md");
-    checks.check("B148", "POLICY.md has the sentence: a `--max-extension` above six hours needs the signed-in user's password at the start of the run, \
+    checks.check("B148", "POLICY.md has the sentence: a `--max-extension` above six hours needs the signed-in user's approval at the start of the run, by Windows Hello or by password, \
         and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard",
-        policy.contains("A `--max-extension` above six hours needs the signed-in user's password at the start of the run, \
+        policy.contains("A `--max-extension` above six hours needs the signed-in user's approval at the start of the run, by Windows Hello or by password, \
             and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard."), "POLICY.md");
     let contributing = read("CONTRIBUTING.md");
     let steps = contributing.split("## Manual check of the prompts").nth(1).unwrap_or("");
-    checks.check("B148", "CONTRIBUTING.md has the manual check of the prompts as eleven numbered steps: step 9 for a scheduled task and a remote shell, \
-        step 10 for a domain machine away from its controller, step 11 for the test on a window station that is not visible, watched",
-        (1..=11).all(|n| steps.lines().any(|line| line.starts_with(&format!("{}. ", n)))) && !steps.lines().any(|line| line.starts_with("12. "))
+    checks.check("B148", "CONTRIBUTING.md has the manual check of the prompts as twelve numbered steps: step 9 for a scheduled task and a remote shell, \
+        step 10 for a domain machine away from its controller, step 11 for the tests on a window station that is not visible, watched, step 12 for Windows Hello",
+        (1..=12).all(|n| steps.lines().any(|line| line.starts_with(&format!("{}. ", n)))) && !steps.lines().any(|line| line.starts_with("13. "))
             && steps.lines().any(|line| line.starts_with("9. ") && line.contains("scheduled task") && line.contains("Windows Remote Management (WinRM)"))
             && steps.lines().any(|line| line.starts_with("10. ") && line.contains("domain controller"))
-            && steps.lines().any(|line| line.starts_with("11. ") && line.contains("G95") && line.contains("screen")), steps.chars().take(200).collect::<String>());
+            && steps.lines().any(|line| line.starts_with("11. ") && line.contains("G95") && line.contains("G103") && line.contains("screen"))
+            && steps.lines().any(|line| line.starts_with("12. ") && line.contains("Windows Hello")), steps.chars().take(200).collect::<String>());
     // What the documents must say about the wait, the empty password, the hours in the log and the pseudo console, and what they must not claim.
     let (readme_text, changelog_text) = (read("README.md"), read("CHANGELOG.md"));
     for (name, body) in [("README.md", &readme_text), ("CHANGELOG.md", &changelog_text)] {
@@ -1615,7 +1617,7 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
             which a parent that has exited ends) and by job (every job of a guard kills on close), that an agent outside a guard job, one that puts itself in a job of its own, or \
             one that sets its own parent can still summon a prompt, and does not say that no agent can", name),
             body.contains("any file name ending in `-auto`") && body.contains("a parent that has already exited ends it") && body.contains("for at most 32 levels")
-                && body.contains("kills its processes when it closes") && body.contains("can still summon a prompt; the password is still required")
+                && body.contains("kills its processes when it closes") && (body.contains("can still summon a prompt; the password is still required") || body.contains("can still summon a prompt; the approval is still required"))
                 && body.contains("job of its own") && body.contains("at its system path (`explorer.exe` in the Windows folder, the other five in `System32`")
                 && !body.contains("no way to summon a prompt") && !body.contains("looks at every live process above the guard") && !body.contains("Every live process above the guard is looked at")
                 && !body.contains("a copy of the guard under another file name is not recognised, which only"), name);
@@ -1659,8 +1661,12 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
             Security Technical Implementation Guide (STIG), and what to set instead", name),
             body.contains("Three attempts per run can equal the lockout threshold") && body.contains("Defense Information Systems Agency (DISA) Windows Security Technical Implementation Guide (STIG)")
                 && body.contains("at least 5"), name);
-        checks.check("B148", &format!("{} says that a PIN, a fingerprint, a face or a smart card is not expected to unpack to a password and does not say that it does not, and that an unpacked PIN is sent to the logon", name),
-            body.contains("is not expected to unpack to a password") && !body.contains("does not unpack to a password") && body.contains("If a PIN does unpack under the account's own name"), name);
+        checks.check("B148", &format!("{} says that a smart card (and, in the entry for 2.0.0-alpha.4, a PIN) is not expected to unpack to a password and does not say that it does not, and that what unpacks under the account's own name is sent to the logon", name),
+            body.contains("is not expected to unpack to a password") && !body.contains("does not unpack to a password") && body.contains("under the account's own name"), name);
+        if name != "CHANGELOG.md" {
+            checks.check("B148", &format!("{} does not say that a PIN is not expected to unpack to a password, and says that a PIN may be answered with the password in a protected form", name),
+                !body.contains("A PIN, a fingerprint, a face or a smart card is not expected") && body.contains("A PIN may be answered by the dialog with the password of the account in a protected form"), name);
+        }
         checks.check("B148", &format!("{} says that a refusal line is queued and given 500 milliseconds, and that the refusal is also the error and the exit code", name),
             body.contains("A refusal line is queued and the guard gives the file 500 milliseconds to take it before it returns") && body.contains("the refusal itself is also the error on standard error and the exit code 125"), name);
         checks.check("B148", &format!("{} says that the line names the method, the deadline the run starts with and the process that started the guard", name),
@@ -1682,5 +1688,58 @@ fn b148_the_documents_say_what_the_exception_above_the_cap_asks_refuses_and_resi
     }
     checks.check("B148", "the README lists --authenticate with --max-extension and --extension-log among the options that need --extendable",
         readme_text.contains("`--max-extension`, `--extension-log` and `--authenticate` without `--extendable` are refused with a message of their own"), "README.md");
+    checks.finish();
+}
+
+#[test]
+fn b149_the_documents_say_what_windows_hello_verifies_whose_it_is_how_long_it_waits_and_what_happens_when_it_is_not_available() {
+    let mut checks = Checks::new("Windows Hello in the documents");
+    // The desktop method asks Windows Hello first. The documents must say what it verifies and what it does not, that the guard must run as
+    // the user signed in to the session, how the wait ends, what the record says, and when the credential dialog asks instead; they must
+    // spell out the acronyms they use, and must not still say that there is no consent path of Windows Hello or that a protected form is refused.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let read = |name: &str| std::fs::read_to_string(root.join(name)).unwrap_or_default().replace("\r\n", "\n");
+    let (readme, security, changelog, contributing, policy) = (read("README.md"), read("SECURITY.md"), read("CHANGELOG.md"), read("CONTRIBUTING.md"), read("POLICY.md"));
+    // The entry of the changelog for 2.0.0-alpha.5 is found by its heading, as B145 finds its own, so that a later entry
+    // does not make this check read the wrong one.
+    let entry = changelog.split("\n## ").find(|section| section.starts_with("2.0.0-alpha.5")).unwrap_or("").to_string();
+    for (name, body, whole) in [("README.md", &readme, &readme), ("SECURITY.md", &security, &security), ("CHANGELOG.md", &entry, &changelog)] {
+        checks.check("B149", &format!("{} says that the default method asks Windows Hello first, that only `Verified` approves, and that a consent that was asked for and not given is not answered by the password", name),
+            body.contains("Windows Hello") && body.contains("`Verified`") && body.contains("RetriesExhausted")
+                && (body.contains("never answered by the password dialog") || body.contains("no password is asked for instead")), name);
+        checks.check("B149", &format!("{} says that Windows Hello verifies the user signed in to the session and that a guard started as another account (runas) is refused, by security identifier", name),
+            body.contains("signed in to the session") && body.contains("runas") && body.contains("security identifier"), name);
+        checks.check("B149", &format!("{} says that the request is cancelled (IAsyncInfo::Cancel), that the guard exits at once, and that what the system does with a prompt that is open is recorded by the manual check", name),
+            body.contains("IAsyncInfo::Cancel") && body.contains("300 seconds") && body.contains("exits at once") && body.contains("steps 5 and 12"), name);
+        checks.check("B149", &format!("{} says that the request is made only on the desktop that receives the input of the user (OpenInputDesktop), so that a locked screen or another desktop is refused before any request", name),
+            body.contains("OpenInputDesktop") && body.contains("desktop that receives the input of the user") && body.contains("locked"), name);
+        checks.check("B149", &format!("{} says that the credential dialog asks where Windows Hello is not available, with the reason in every line of the record, and that the clear password is held in memory for a short time", name),
+            body.contains("Windows Hello was not available") && body.contains("CredUnprotectW") && body.contains("clear password"), name);
+        checks.check("B149", &format!("{} spells out the Trusted Platform Module (TPM) and the Personal Identification Number (PIN) at their first use", name),
+            whole.find("TPM").map_or(false, |at| whole[..at].ends_with("Trusted Platform Module ("))
+                && whole.find("PIN").map_or(false, |at| whole[..at].ends_with("Personal Identification Number (")), name);
+        checks.check("B149", &format!("{} no longer says that there is no consent path of Windows Hello or that a protected form of the password is refused, and names the word hello of the log", name),
+            !body.contains("no consent path of Windows Hello") && !body.contains("which the guard does not unprotect") && (body.contains("`hello`") || body.contains("method=\"hello\"")), name);
+    }
+    checks.check("B149", "SECURITY.md says that the TPM limits the guessing of a PIN, that the prompt is not known to be on the secure desktop, that a program of the same user that can tamper with the guard is out of scope, \
+        and that the console method keeps 3 attempts per run and relies on the account lockout policy across runs",
+        security.contains("the TPM limits the guessing of a PIN") && security.contains("not known to be on the secure desktop") && security.contains("tamper with the guard")
+            && security.contains("The console method keeps 3 attempts per run") && security.contains("account lockout policy"), "SECURITY.md");
+    checks.check("B149", "the README gives the limits of the message of Windows Hello and says that the clipping by the system is not established",
+        readme.contains("512 16-bit units") && readme.contains("(100 characters once written out)") && readme.contains("is not established; step 12"), "README.md");
+    checks.check("B149", "the changelog has an entry for 2.0.0-alpha.5, and it does not use dashes in prose",
+        !entry.is_empty() && !entry.contains(" - ") && !entry.contains('\u{2014}') && !entry.contains('\u{2013}'), "CHANGELOG.md");
+    checks.check("B149", "the policy says that the approval is by Windows Hello or by password", policy.contains("approval at the start of the run, by Windows Hello or by password"), "POLICY.md");
+    let steps = contributing.split("## Manual check of the prompts").nth(1).unwrap_or("");
+    let twelve = steps.split("\n12. ").nth(1).unwrap_or("").split("\n## ").next().unwrap_or("");
+    for (what, words) in [("approve", "Approve:"), ("the whole message", "Read the whole message"), ("a long command", "A long command"), ("placement", "Placement:"), ("cancel", "Cancel:"),
+        ("a wrong PIN until RetriesExhausted", "RetriesExhausted"), ("no answer for 300 seconds", "300 seconds"), ("the guard ended from outside", "The guard ended from outside"),
+        ("Windows Hello not set up", "Windows Hello not set up"), ("not the desktop in front", "Not the desktop in front"), ("a PIN-only account in the fallback", "A PIN-only account in the fallback"), ("another account", "runas /user:OTHER"),
+        ("a Remote Desktop session", "A Remote Desktop session")] {
+        checks.check("B149", &format!("CONTRIBUTING.md step 12 has the case: {}", what), twelve.contains(words), what);
+    }
+    // The marker of a list item is not a dash in prose.
+    let prose: String = twelve.lines().map(|line| line.trim_start().strip_prefix("- ").unwrap_or(line.trim_start())).collect::<Vec<&str>>().join("\n");
+    checks.check("B149", "CONTRIBUTING.md step 12 does not use dashes in prose", !prose.contains(" - ") && !prose.contains('\u{2014}') && !prose.contains('\u{2013}'), "CONTRIBUTING.md");
     checks.finish();
 }

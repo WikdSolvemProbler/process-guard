@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! Behaviour tests for the process guard binary (inventory G1 to G101).
+//! Behaviour tests for the process guard binary (inventory G1 to G103).
 //!
 //! They run the built guard, or the one named by PROCESS_TREE_GUARD_EXE (the 1.x
 //! name PROCESS_GUARD_EXE also works), through timeouts, descendant cleanup,
@@ -1158,7 +1158,7 @@ fn g59_extension_arguments_are_checked_before_anything_runs() {
         let result = run_guard(args);
         checks.check("G59", &format!("{}: exit 125 and the command never runs", name), result.code == 125 && !result.out().contains("SHOULD_NOT_RUN"), shown(&result));
     }
-    // A cap over the default is an exception that needs the signed-in user's password (G87 to G93), so the largest cap is not run here
+    // A cap over the default is an exception that needs the signed-in user's approval (G87 to G93), so the largest cap is not run here
     // with no one to ask. The cap itself, with the run's own deadline at it, is allowed.
     let high = extendable(&["--max-extension", "21600", "--authenticate", "console"], "21600", &[testkit(), "print", "ran"]);
     checks.check("G59", "--timeout 21600 is allowed when --max-extension is 21600, the default cap", high.code == 0 && high.out().contains("ran"), shown(&high));
@@ -2216,7 +2216,7 @@ fn g86_without_an_audit_file_a_grant_that_no_record_can_hold_is_not_made() {
 
 // ------------------------------- the exception above the cap, which never shows a prompt here (G87 to G94 and G99)
 //
-// A run whose --max-extension is over the default cap needs the signed-in user's password at its start, and the live prompts
+// A run whose --max-extension is over the default cap needs the signed-in user's approval at its start, and the live prompts
 // are a manual check (CONTRIBUTING.md, "Manual check of the prompts"). Every run below that is over the cap says `--authenticate
 // console` and is given a standard input that is null, a pipe or a file, never a console, so that it is refused and no prompt
 // is shown on the desktop of whoever runs the tests. G93 scans the test sources for a run over the cap that does not say so.
@@ -2437,8 +2437,25 @@ fn guard_part(line: &str) -> &str {
     [line.find("\"--\""), line.find(" -- ")].into_iter().flatten().min().map_or(line, |at| &line[..at])
 }
 
+/// True when `part` names `--authenticate` and every one it names is followed by `console` (past quotes, commas, spaces and an
+/// equals sign). The console method never shows a window; the desktop method does (Windows Hello, or the credential dialog), so a
+/// line that names any other method, or a method that is a variable, is not covered (Common Weakness Enumeration, CWE-1188,
+/// insecure default; a test must not be able to show a prompt on the desktop of whoever runs it).
+fn authenticates_by_console(part: &str) -> bool {
+    let option = "--authenticate";
+    let (mut rest, mut named) = (part, false);
+    while let Some(at) = rest.find(option) {
+        rest = &rest[at + option.len()..];
+        if !rest.trim_start_matches(|c: char| matches!(c, '"' | ',' | ' ' | '=')).starts_with("console") {
+            return false;
+        }
+        named = true;
+    }
+    named
+}
+
 /// The lines of `source` that write a `--max-extension` over the default cap as a number (after the option, past quotes,
-/// commas, spaces and an equals sign) without `--authenticate` on the same line, both in the options of the guard: an option that
+/// commas, spaces and an equals sign) without `--authenticate console` on the same line, both in the options of the guard: an option that
 /// follows a `--` belongs to the command. A value that is a variable is not a number.
 fn over_cap_without_authenticate(source: &str) -> Vec<String> {
     let option = "--max-extension";
@@ -2449,7 +2466,7 @@ fn over_cap_without_authenticate(source: &str) -> Vec<String> {
         while let Some(at) = rest.find(option) {
             rest = &rest[at + option.len()..];
             let value: String = rest.trim_start_matches(|c: char| matches!(c, '"' | ',' | ' ' | '=')).chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
-            if value.parse::<f64>().map_or(false, |seconds| seconds > 21600.0) && !part.contains("--authenticate") {
+            if value.parse::<f64>().map_or(false, |seconds| seconds > 21600.0) && !authenticates_by_console(part) {
                 found.push(line.trim().to_string());
             }
         }
@@ -2469,7 +2486,17 @@ fn g93_no_test_runs_over_the_cap_without_the_console_method_and_a_release_has_no
     let variable = over_cap_without_authenticate("[\"--max-extension\", bad, \"--timeout\"]");
     checks.check("G93", "the scan flags a number over the cap written without --authenticate, in a list and in a string, and the form with an equals sign",
         flagged.len() == 2 && equals.len() == 1, format!("{:?} {:?}", flagged, equals));
-    checks.check("G93", "and passes the same text with --authenticate, a value at the cap, and a value that is a variable", covered.is_empty() && at_cap.is_empty() && variable.is_empty(), format!("{:?} {:?} {:?}", covered, at_cap, variable));
+    checks.check("G93", "and passes the same text with --authenticate console, a value at the cap, and a value that is a variable", covered.is_empty() && at_cap.is_empty() && variable.is_empty(), format!("{:?} {:?} {:?}", covered, at_cap, variable));
+    // The desktop method shows a window (Windows Hello, or the credential dialog), so it does not cover a cap, whether it is named, set
+    // by an equals sign, named after the console on the same line, or left to a variable.
+    let desktop = over_cap_without_authenticate(&sample("86400", ", \"--authenticate\", \"desktop\""));
+    let equals_desktop = over_cap_without_authenticate(&format!("x --max-extension {} --authenticate=desktop y", "86400"));
+    let last_desktop = over_cap_without_authenticate(&format!("x --max-extension {} --authenticate console --authenticate desktop y", "86400"));
+    let by_variable = over_cap_without_authenticate("[\"--max-extension\", \"86400\", \"--authenticate\", method]");
+    let equals_console = over_cap_without_authenticate(&format!("x --max-extension {} --authenticate=console y", "86400"));
+    checks.check("G93", "the scan flags a cap beside --authenticate desktop, beside --authenticate=desktop, beside a method that is a variable and beside a second --authenticate that is not the console, and passes --authenticate=console",
+        desktop.len() == 2 && equals_desktop.len() == 1 && last_desktop.len() == 1 && by_variable.len() == 1 && equals_console.is_empty(),
+        format!("{:?} {:?} {:?} {:?} {:?}", desktop, equals_desktop, last_desktop, by_variable, equals_console));
     // Only the options of the guard count: a cap that follows a `--` is an argument of the command, and an `--authenticate console`
     // that follows it is not the guard's.
     let option = "--max-extension";
@@ -2645,12 +2672,12 @@ fn g94_a_guard_that_another_guard_started_is_not_asked_even_when_that_guard_is_n
 
 /// The cap that the hidden station test asks for: a variable and not a number written after the option, because this is the one
 /// run over the cap that does not say `--authenticate console`. It asks by the default method, on a window station that is not
-/// visible, which the helper makes and checks before it starts anything. This is the one test whose failure mode is a real
-/// prompt: if the guard's test for a window station that is not visible were defective, the secure prompt could appear on the
-/// desktop of whoever runs the suite, and where it would appear is not established. The test therefore runs only where
-/// PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set (the continuous integration workflow sets it; CI alone does not, since
-/// it is set on machines where a person sits), the helper waits only ten seconds for the refusal, which is immediate,
-/// and the manual check (CONTRIBUTING.md, step 11) runs this test once with the screen watched.
+/// visible, which the helper makes and checks before it starts anything. G95 and G103 are the tests whose failure mode is a real
+/// prompt: if the guard's test for a window station that is not visible were defective, the secure prompt, or the prompt of
+/// Windows Hello, could appear on the desktop of whoever runs the suite, and where it would appear is not established. They
+/// therefore run only where PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set (the continuous integration workflow sets it; CI
+/// alone does not, since it is set on machines where a person sits), the helper waits only ten seconds for the refusal, which
+/// is immediate, and the manual check (CONTRIBUTING.md, step 11) runs each of them once with the screen watched.
 const HIDDEN_STATION_CAP: &str = "86400";
 
 /// True, after reporting it, when a guard is above the tests: a guard that a test starts is then a run that another guard started
@@ -2671,20 +2698,19 @@ fn desktop_prompt_test_wanted() -> bool {
     variable_set("PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST")
 }
 
-#[test]
-fn g95_the_desktop_prompt_is_refused_without_being_shown_on_a_window_station_that_is_not_visible() {
-    let mut checks = Checks::new("exception on a hidden window station");
+/// Run the guard over the cap with the default method on a window station that is not visible, which the helper makes and checks
+/// first, and give the result with whether its command ran. None, after the report, where the test is not wanted or cannot be
+/// made here; the caller then finishes. This is the run whose failure mode is a real prompt (see `HIDDEN_STATION_CAP`).
+fn run_on_a_hidden_station(checks: &mut Checks, id: &str) -> Option<(Out, bool)> {
     if !desktop_prompt_test_wanted() {
-        checks.notice("G95 NOT ASSERTED: the test on a window station that is not visible runs only when PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set, \
-            because a defect it exists to find would show a real prompt");
-        checks.finish();
-        return;
+        checks.notice(format!("{} NOT ASSERTED: the test on a window station that is not visible runs only when PROCESS_TREE_GUARD_RUN_DESKTOP_PROMPT_TEST is set, \
+            because a defect it exists to find would show a real prompt", id));
+        return None;
     }
-    if under_a_guard(&mut checks, "G95", "PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION", "the window station") {
-        checks.finish();
-        return;
+    if under_a_guard(checks, id, "PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION", "the window station") {
+        return None;
     }
-    let dir = TempDir::new("g95-");
+    let dir = TempDir::new(&format!("{}-", id.to_ascii_lowercase()));
     let marker = dir.join("ran.txt");
     let marker_text = text(&marker);
     let mut command = Command::new(testkit());
@@ -2693,15 +2719,24 @@ fn g95_the_desktop_prompt_is_refused_without_being_shown_on_a_window_station_tha
     if result.code == 96 {
         // The helper could not make a window station (some hosts refuse a process that is not a service). Nothing was started.
         let required = variable_set("PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION");
-        checks.check("G95", "the helper makes a window station that is not visible (not asserted where the host refuses it, unless PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION is set)",
+        checks.check(id, "the helper makes a window station that is not visible (not asserted where the host refuses it, unless PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION is set)",
             !required, shown(&result));
-        checks.notice(format!("NOT ASSERTED G95: no window station could be made here: {}", shown(&result)));
+        checks.notice(format!("NOT ASSERTED {}: no window station could be made here: {}", id, shown(&result)));
+        return None;
+    }
+    Some((result, marker.exists()))
+}
+
+#[test]
+fn g95_the_desktop_prompt_is_refused_without_being_shown_on_a_window_station_that_is_not_visible() {
+    let mut checks = Checks::new("exception on a hidden window station");
+    let Some((result, ran)) = run_on_a_hidden_station(&mut checks, "G95") else {
         checks.finish();
         return;
-    }
+    };
     let line = exception_refusal(&result.err()).unwrap_or_default();
     checks.check("G95", "the guard on a window station that is not visible, with the default method: exit 125, nothing shown, and its command never runs",
-        result.code == 125 && !marker.exists() && result.out().is_empty() && result.err().contains("exception refused"), shown(&result));
+        result.code == 125 && !ran && result.out().is_empty() && result.err().contains("exception refused"), shown(&result));
     checks.check("G95", "one exception-refused line, attempt 0, with the reason that the process has no interactive window station (or, on a host that runs in session 0, that it runs in session 0)",
         line.contains("decision=exception-refused attempt=0") && (line.contains("no interactive window station") || line.contains("session 0")) && log_field(&line, "image").as_deref() == Some("process-tree-guard.exe"), line.clone());
     checks.timing("G95", "the refusal is at once: nobody is waited for", result.elapsed.as_secs_f64() < 5.0 * UNIT + GRACE, shown(&result));
@@ -2780,24 +2815,38 @@ fn imported_functions(path: &str) -> Option<Vec<String>> {
 #[test]
 fn g96_no_program_imports_the_libraries_of_the_prompt_so_a_run_under_the_cap_does_not_load_them() {
     let mut checks = Checks::new("imports");
-    // The sign-in prompt needs credui.dll, user32.dll and ole32.dll, and the name of the account secur32.dll. They are loaded from the system folder when a prompt is first
+    // The sign-in prompt needs credui.dll, user32.dll and ole32.dll, and the name of the account secur32.dll. The consent of Windows Hello needs combase.dll (the
+    // Windows Runtime) and, to compare the user of the session with the account of the guard, wtsapi32.dll. They are loaded from the system folder when a prompt is first
     // wanted, so that every other command pays nothing for them and a host where one cannot be loaded still runs its commands.
+    let prompt_libraries = ["credui.dll", "user32.dll", "ole32.dll", "secur32.dll", "combase.dll", "wtsapi32.dll"];
+    // LogonUserW, LookupAccountNameW and CredUnprotectW are in advapi32.dll, which every program imports for other functions, so it is the names that are checked.
+    let prompt_functions = ["LogonUserW", "LookupAccountNameW", "CredUnprotectW", "WTSQuerySessionInformationW", "RoInitialize", "RoGetActivationFactory", "WindowsCreateString",
+        "RegisterClassExW", "CreateWindowExW", "OpenInputDesktop", "GetThreadDesktop"];
     for name in ROLES {
         let libraries: Vec<String> = imported_libraries(role(name)).unwrap_or_default().iter().map(|library| library.to_ascii_lowercase()).collect();
         checks.check("G96", &format!("{}: the import table is read (it names kernel32.dll)", name), libraries.iter().any(|library| library == "kernel32.dll"), format!("{:?}", libraries));
-        checks.check("G96", &format!("{}: credui.dll, user32.dll, ole32.dll and secur32.dll are not imported", name),
-            !libraries.iter().any(|library| ["credui.dll", "user32.dll", "ole32.dll", "secur32.dll"].contains(&library.as_str())), format!("{:?}", libraries));
-        // LogonUserW and LookupAccountNameW are in advapi32.dll, which every program imports for other functions, so it is the names that are checked.
+        checks.check("G96", &format!("{}: credui.dll, user32.dll, ole32.dll, secur32.dll, combase.dll and wtsapi32.dll are not imported", name),
+            !libraries.iter().any(|library| prompt_libraries.contains(&library.as_str())), format!("{:?}", libraries));
         let functions = imported_functions(role(name)).unwrap_or_default();
-        checks.check("G96", &format!("{}: the function names are read (GetLastError is among them) and LogonUserW and LookupAccountNameW are not imported", name),
-            functions.iter().any(|function| function == "GetLastError") && !functions.iter().any(|function| function == "LogonUserW" || function == "LookupAccountNameW"),
+        checks.check("G96", &format!("{}: the function names are read (GetLastError is among them) and LogonUserW, LookupAccountNameW, CredUnprotectW, WTSQuerySessionInformationW, OpenInputDesktop and the calls of the Windows Runtime are not imported", name),
+            functions.iter().any(|function| function == "GetLastError") && !functions.iter().any(|function| prompt_functions.contains(&function.as_str())),
             format!("{} functions", functions.len()));
     }
     // The declarations that would import them are not in the source.
     let sys = include_str!("../src/sys.rs").replace("\r\n", "\n");
-    checks.check("G96", "src/sys.rs links none of the four libraries and loads them from the system folder, and declares no static import of LogonUserW or LookupAccountNameW",
-        !sys.contains("link(name = \"credui\")") && !sys.contains("link(name = \"user32\")") && !sys.contains("link(name = \"ole32\")") && !sys.contains("link(name = \"secur32\")") && sys.contains("LOAD_LIBRARY_SEARCH_SYSTEM32")
-            && !sys.contains("pub fn LogonUserW") && !sys.contains("pub fn LookupAccountNameW"), "");
+    checks.check("G96", "src/sys.rs links none of the six libraries and loads them from the system folder, and declares no static import of LogonUserW, LookupAccountNameW, CredUnprotectW or WTSQuerySessionInformationW",
+        ["credui", "user32", "ole32", "secur32", "combase", "wtsapi32"].iter().all(|library| !sys.contains(&format!("link(name = \"{}\")", library))) && sys.contains("LOAD_LIBRARY_SEARCH_SYSTEM32")
+            && ["LogonUserW", "LookupAccountNameW", "CredUnprotectW", "WTSQuerySessionInformationW", "OpenInputDesktop"].iter().all(|function| !sys.contains(&format!("pub fn {}", function)))
+            && ["combase.dll", "wtsapi32.dll"].iter().all(|library| sys.contains(&format!("library(\"{}\")", library))), "");
+    // The constant being defined proves nothing: the call must pass it, or a library of the prompts could come from the folder of the program or the current
+    // folder (Common Weakness Enumeration, CWE-427, uncontrolled search path element). One function loads every library, with one call, and the library crate names no other loader.
+    let loader = function_text(&sys, "fn library(");
+    let sources = [include_str!("../src/auth.rs"), include_str!("../src/base64.rs"), include_str!("../src/cli.rs"), include_str!("../src/engine.rs"),
+        include_str!("../src/extend.rs"), include_str!("../src/hook.rs"), include_str!("../src/lib.rs"), include_str!("../src/main.rs"), include_str!("../src/sys.rs")];
+    checks.check("G96", "src/sys.rs: the one function `library` loads every library of the prompts, with the one call of LoadLibraryExW (its declaration is the other mention), which passes LOAD_LIBRARY_SEARCH_SYSTEM32; \
+        no other loader is named in the library crate",
+        loader.contains("LoadLibraryExW(name.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32)") && sources.iter().map(|source| source.matches("LoadLibraryExW").count()).sum::<usize>() == 2
+            && sources.iter().all(|source| ["LoadLibraryW", "LoadLibraryA", "LoadLibraryExA", "LoadPackagedLibrary"].iter().all(|name| !source.contains(name))), "");
     checks.finish();
 }
 
@@ -3120,4 +3169,84 @@ fn guard_cmd_of(exe: &str, args: &[&str]) -> Command {
     let mut command = Command::new(exe);
     command.args(args);
     command
+}
+
+// ------- the request for Windows Hello is made in one place, after presence, the lock, the availability and the user (G102)
+
+/// The text of the function that starts at `signature` in `source`: up to the line that closes it at the start of a line.
+fn function_text<'a>(source: &'a str, signature: &str) -> &'a str {
+    let Some(at) = source.find(signature) else { return "" };
+    let rest = &source[at..];
+    &rest[..rest.find("\n}\n").map_or(rest.len(), |end| end + 3)]
+}
+
+#[test]
+fn g102_the_request_for_windows_hello_is_made_in_one_place_and_only_after_presence_the_lock_the_availability_and_the_user() {
+    let mut checks = Checks::new("Windows Hello order");
+    let auth = include_str!("../src/auth.rs").replace("\r\n", "\n");
+    let (production, _) = auth.split_once("#[cfg(test)]\nmod tests {").unwrap_or((auth.as_str(), ""));
+    let count = |needle: &str| production.matches(needle).count();
+    let at = |text: &str, needle: &str| text.find(needle).unwrap_or(usize::MAX);
+    let inner = function_text(production, "fn consent_inner(");
+    checks.check("G102", "src/auth.rs: the request of the interface that takes the window (`RequestVerificationForWindowAsyncFn`) is called in one place, `consent_inner`, and the request that takes no window is never called",
+        count("slot::<RequestVerificationForWindowAsyncFn>") == 1 && inner.contains("slot::<RequestVerificationForWindowAsyncFn>") && !production.contains("RequestVerificationAsync"), "");
+    checks.check("G102", "src/auth.rs: `consent_inner` is reached only from `consent_request`, which only the real consent's `request` gives to the worker",
+        count("consent_inner(") == 2 && count("consent_request(") == 2 && function_text(production, "fn request(&self, message: &str, owners: &Owners) -> Outcome {").contains("consent_request(&message, stop)"), "");
+    let decision = function_text(production, "pub(crate) fn authorize_desktop(");
+    checks.check("G102", "src/auth.rs: `authorize_desktop` checks the starter, takes the seat (presence and the lock), asks whether Windows Hello is available, and only then goes on to the consent",
+        !decision.is_empty() && at(decision, "owners.gone()") < at(decision, "prompt.seat(") && at(decision, "prompt.seat(") < at(decision, "consenter.availability(")
+            && at(decision, "consenter.availability(") < at(decision, "Ok(Availability::Available) => hello("), "");
+    checks.check("G102", "src/auth.rs: the question about Windows Hello and the call of the consent are each made once in the production code",
+        count("consenter.availability(") == 1 && count("consenter.request(") == 1 && count("consenter.session_user(") == 1 && count("=> hello(") == 1, "");
+    let consent = function_text(production, "fn hello(");
+    checks.check("G102", "src/auth.rs: `hello` checks the user signed in to the session before the text is made and the request is called, and the request comes after the check of the length and one more look at the starter",
+        !consent.is_empty() && at(consent, "consenter.session_user(") < at(consent, "hello_text(") && at(consent, "hello_text(") < at(consent, "message.encode_utf16().count() > limit")
+            && at(consent, "message.encode_utf16().count() > limit") < at(consent, "owners.gone()") && at(consent, "owners.gone()") < at(consent, "consenter.request("), "");
+    checks.check("G102", "src/auth.rs: a consent that was asked for and not given never reaches the dialog: `hello` neither asks the prompt nor checks a password, and only `Verified` is approved",
+        !consent.contains("prompt.") && !consent.contains("verifier.") && !consent.contains("attempts(") && consent.contains("Consent::Verified =>") && consent.matches("record_approval(").count() == 1, "");
+    checks.check("G102", "src/auth.rs: the dialog is reached only through `attempts`, after the availability, with the words that say why Windows Hello was not used, and without a second seat",
+        decision.contains("attempts(settings, subject, prompt, verifier, owners, log, &text, &why)") && decision.matches("prompt.seat(").count() == 1 && !decision.contains("prompt.begin(")
+            && decision.contains("(Windows Hello was not available: {})"), "");
+    checks.check("G102", "src/auth.rs: the method word `hello` is given only by the consent path (the record reads it once more, to cut the line as the message is cut), the desktop method decides through `authorize_desktop` and the console method through `authorize`",
+        count("HELLO_METHOD") == 4 && consent.matches("HELLO_METHOD").count() == 2 && production.contains("Method::Desktop => authorize_desktop(settings, &subject, &HelloConsenter, &DesktopPrompt::new(owners), &verifier, owners, log),")
+            && production.contains("Method::Console => authorize(settings, &subject, &ConsolePrompt::new(owners), &verifier, owners, log),"), "");
+    checks.check("G102", "src/auth.rs: nothing in the production code reads the answer of Windows Hello from anything but the operation (no environment variable, no file, no argument)",
+        !production.contains("env::") && !production.contains("std::fs") && !production.contains("File::"), "");
+    let looks = function_text(production, "fn session_user_and_desktop(");
+    checks.check("G102", "src/auth.rs: the user signed in to the session and the desktop are looked at in one place, `session_user_and_desktop`, the user first and with `?` so that a refusal ends it; the real consent gives it the real session, names, \
+        account, look up and desktops, and nothing else calls `session_user_matches` or `on_input_desktop`",
+        !looks.is_empty() && at(looks, "session_user_matches(") < at(looks, "desktops()") && at(looks, "desktops()") < at(looks, "on_input_desktop(") && looks.contains("lookup)?;")
+            && count("session_user_and_desktop(") == 2 && count("session_user_matches(") == 2 && count("on_input_desktop(") == 2
+            && production.contains("session_user_and_desktop(own_session(), signed_in_names, own_account_name(), account_check, desktop_names)"), "");
+    checks.check("G102", "src/auth.rs: every wait of the Windows Hello path has an end: the request is waited for 300 seconds and a cancel 3 seconds, the loop that reads it stops on the flag that the wait sets, \
+        and the question whether Windows Hello is available and the look at the user are bounded",
+        production.contains("const PROMPT_TIMEOUT_MS: u64 = 300_000;") && production.contains("const CANCEL_GRACE_MS: u64 = 3_000;") && production.contains("const SYSTEM_TIMEOUT_MS: u64 = 5_000;")
+            && production.contains("request_with(owners, Duration::from_millis(PROMPT_TIMEOUT_MS), Duration::from_millis(CANCEL_GRACE_MS), move |stop| consent_request(&message, stop))")
+            && inner.contains("drive(&operation, stop, None, Duration::from_millis(CANCEL_GRACE_MS), &|| owner.serve())")
+            && function_text(production, "fn read_availability(").contains("drive(&operation, &AtomicBool::new(false), Some(until), Duration::from_millis(CANCEL_GRACE_MS), &wait)")
+            && count("bounded(Duration::from_millis(SYSTEM_TIMEOUT_MS), owners, read_availability)") == 1 && count("bounded(Duration::from_millis(SYSTEM_TIMEOUT_MS), owners, || {\n            session_user_and_desktop(") == 1, "");
+    checks.finish();
+}
+
+// ------- the desktop method asks Windows Hello nothing where nobody is present (G103)
+
+#[test]
+fn g103_a_guard_on_a_window_station_that_is_not_visible_logs_the_desktop_method_and_is_refused_before_windows_hello_is_asked() {
+    let mut checks = Checks::new("exception on a hidden window station, before Windows Hello");
+    let Some((result, ran)) = run_on_a_hidden_station(&mut checks, "G103") else {
+        checks.finish();
+        return;
+    };
+    let line = exception_refusal(&result.err()).unwrap_or_default();
+    // Presence is looked at first. Windows Hello is asked whether it is available only after somebody is known to be present and the
+    // right to a prompt is held, so on a station that is not visible neither the question nor a request is made, and the record
+    // names the word of the method as the launch arguments give it and never the word for Windows Hello.
+    checks.check("G103", "the line names the method desktop, with attempt 0 and the reason that nobody is present, and never the method hello",
+        log_field(&line, "method").as_deref() == Some("desktop") && line.contains("decision=exception-refused attempt=0") && !line.contains("method=\"hello\"")
+            && (line.contains("no interactive window station") || line.contains("session 0")), line.clone());
+    checks.check("G103", "nothing says that Windows Hello was asked or was not available, and the credential dialog was not reached: neither the output nor the line has the words",
+        !line.contains("Windows Hello") && !result.err().contains("Windows Hello") && !result.err().contains("the prompt was cancelled") && result.out().is_empty(), shown(&result));
+    checks.check("G103", "exit 125 and the command never runs", result.code == 125 && !ran, shown(&result));
+    checks.timing("G103", "the refusal is at once", result.elapsed.as_secs_f64() < 5.0 * UNIT + GRACE, shown(&result));
+    checks.finish();
 }

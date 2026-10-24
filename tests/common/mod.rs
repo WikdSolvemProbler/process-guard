@@ -395,9 +395,10 @@ fn nested_guard<'a, 'b>(args: &'b [&'a str]) -> Option<&'b [&'a str]> {
 }
 
 /// True when `args` hold a `--max-extension` (or `--max-extension=`) that is over the default cap and within the largest cap,
-/// which a guard would go on to ask a person about. A larger value or one that is not a number is refused by the guard
-/// as an argument error before anything is asked. Only the options of the guard count, not the arguments of its command.
-pub fn asks_for_a_password(args: &[&str]) -> bool {
+/// which a guard would go on to ask a person about (for the approval of the signed-in user, by Windows Hello or by password). A
+/// larger value or one that is not a number is refused by the guard as an argument error before anything is asked. Only the
+/// options of the guard count, not the arguments of its command.
+pub fn asks_for_an_approval(args: &[&str]) -> bool {
     let args = guard_options(args);
     args.iter().enumerate().any(|(i, arg)| {
         let value = if *arg == "--max-extension" { args.get(i + 1).copied() } else { arg.strip_prefix("--max-extension=") };
@@ -429,7 +430,7 @@ fn refuse_prompt_of(args: &[&str], whole: &[&str]) {
     let mut current = args;
     loop {
         let options = guard_options(current);
-        if asks_for_a_password(options) && !asks_by_console(options) {
+        if asks_for_an_approval(options) && !asks_by_console(options) {
             panic!("a test would run a cap over the default without --authenticate console, which would show a prompt \
                 on the desktop of whoever runs it: {:?}", whole);
         }

@@ -3,7 +3,7 @@
 This policy is installed at {{POLICY}}. The programs it names are in {{BIN}}, the folder that holds `process-tree-guard.exe` and `process-tree-guard-auto.exe`.
 
 Every command or process launched by a person or an automated agent must end within a finite wall-clock deadline that ends its whole process tree. A deadline is finite when, at every moment, it is a fixed time no more than `--max-extension` ahead, set or moved only by an explicit, logged request from a verified process in the guard's job. A server or process is unlimited when it runs past its deadline, or when its deadline moves by any other means.
-A `--max-extension` above six hours needs the signed-in user's password at the start of the run, and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard.
+A `--max-extension` above six hours needs the signed-in user's approval at the start of the run, by Windows Hello or by password, and a run where nobody can give it is refused, and so is a run that another guard started, so the person starts such a run from a terminal that is not under a guard.
 No unlimited servers and no detached work. Do not bypass, disable, weaken, or route around this requirement through another shell, language, tool, remote session, scheduled task, service, or executable path.
 
 ## How commands are bounded

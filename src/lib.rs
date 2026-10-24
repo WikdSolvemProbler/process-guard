@@ -119,10 +119,13 @@
 //! `extend` and the extension options. See the README.
 //!
 //! A `--max-extension` over 21,600 is a per-run exception: before the job is made and before
-//! the command starts, the top-level guard asks for the password of the account the guard runs
-//! as (the signed-in user in the usual case), by the secure desktop prompt or, with
-//! `--authenticate console`, on a console that is really there,
-//! checks it with `LogonUserW` against the guard's own user, and allows at most 3 attempts.
+//! the command starts, the top-level guard asks for the approval of the signed-in user: with
+//! the default method, for the consent of Windows Hello (only when the guard runs as the user who is
+//! signed in to its session, and a consent that is asked for and not given is not answered by a
+//! password) and, only where Windows Hello is not available, by the credential dialog of Windows on
+//! the secure desktop; with `--authenticate console`, on a console that is really there. A password
+//! is checked with `LogonUserW` against the guard's own user, and at most 3 attempts are allowed;
+//! Windows Hello is asked once.
 //! A run that nobody can be asked about, or that is cancelled or not answered within 300
 //! seconds, exits with 125 and never starts its command. A guard inside an extendable run (a
 //! nested guard) is refused before anyone is asked, and the contain role and automatic mode do
@@ -150,7 +153,7 @@
 //! runs as the same user outside a guard job, that puts its own process in a job of its own (a
 //! nested job replaces the innermost job that the job test reads) and starts the guard from a
 //! process whose parent has exited, or that can set its own parent, can still summon a prompt; the
-//! password is still required.
+//! approval is still required.
 //! Each attempt and the outcome is a line of the log. None of the calls `run`, `run_shell`,
 //! `run_auto`, `run_hook` and `extend` asks; the entry points `main_full` and `main_deadline`
 //! do, from the command line of the process, as the programs do.

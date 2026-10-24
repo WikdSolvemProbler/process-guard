@@ -1,19 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Shiller
 
-//! The exception above the cap: the password of the account the guard runs as, at the start of a run.
+//! The exception above the cap: the approval of the signed-in user, at the start of a run.
 //!
 //! A run started with `--extendable` and a `--max-extension` over the default cap (six hours)
 //! is a per-run exception. Before the job is created and before the command starts, the guard
-//! asks the account the guard runs as (the signed-in user in the usual case) for the password,
-//! by the secure desktop prompt (the default) or, with `--authenticate console`, by a prompt on
-//! a console that is really there. The credentials are
-//! checked with `LogonUserW`, and the user of the logon token must be the user the guard runs as.
+//! asks the signed-in user for approval. The default method (`--authenticate desktop`) asks for
+//! the consent of Windows Hello (`UserConsentVerifier`: the Personal Identification Number
+//! (PIN), fingerprint or face of the user, whose PIN guessing the Trusted Platform Module
+//! limits), provided that the guard runs as the user who is signed in to its session. When
+//! Windows Hello is not available (it is not set up, a policy disables it, or there is no
+//! device) the same method shows the credential dialog of Windows instead and asks for the
+//! password of the account the guard runs as. With `--authenticate console` the password is
+//! asked for by a prompt on a console that is really there. A password is checked with
+//! `LogonUserW`, and the user of the logon token must be the user the guard runs as.
 //! A run that nobody is present to approve, or that is refused, exits with 125 and never starts
-//! its command. At most three attempts are made, each failed one counting toward account
-//! lockout, and every attempt is a line of the log. A run that another guard started (the
-//! automatic wrapper, or a hook that wraps a line whole) is refused before anything is shown: a
-//! command that an agent runs is such a run, and the agent must not be able to summon the prompt.
+//! its command. At most three attempts at the password are made (Windows Hello is asked once),
+//! each failed one counting toward account lockout, and every attempt is a line of the log. A
+//! run that another guard started (the automatic wrapper, or a hook that wraps a line whole) is
+//! refused before anything is shown: a command that an agent runs is such a run, and the agent
+//! must not be able to summon the prompt.
 //! Two tests make that refusal. The first looks at the file names of the live processes above the
 //! guard, by the rule that `lib.rs` uses to select automatic mode; the search follows the parent
 //! chain only while each parent is alive, so a parent that has exited, or one that a launcher
@@ -27,25 +33,40 @@
 //! one prompt after another on the screen. A prompt left open at its limit is the exception: the
 //! process ends at once, which is expected to end the dialog or the read, so that nothing typed
 //! into it is lost to a run that is already refused (step 5 of the manual check records whether
-//! it does).
+//! it does). A request for Windows Hello that is left open is cancelled
+//! (`IAsyncInfo::Cancel`) before the process ends; steps 5 and 12 of the manual check record what
+//! the system does with the prompt.
+//!
+//! Windows Hello verifies the user who is signed in to the session, not the account that the
+//! guard runs as, so the consent is used only when the two are the same user (see
+//! `session_user_matches`); a guard started as another account (`runas`) is refused, and does not
+//! borrow the Windows Hello of the user at the screen. The request is made only on the desktop that
+//! receives the input of that user (see `on_input_desktop`): a face can be matched with no act by the
+//! user, so a request that is placed where nobody is looking is not made. One request is made for a
+//! run, and Windows Hello keeps its own count of tries and its own lockout.
 //!
 //! The password lives only in buffers that are zeroed with volatile writes when they are
 //! dropped, on every path, and is never put in a `String`, never logged and never echoed. The
 //! release profile aborts on a panic without running destructors, so a panic hook zeroes every
 //! buffer that is alive before the abort (see `install_panic_hook`). The exception resists
-//! accidents and agents that lack the password; it does not resist a process of the same user that
+//! accidents and agents that lack the password (or the PIN, fingerprint or face of the user, though a
+//! face can be matched with no act by the user); it does not resist a process of the same user that
 //! can tamper with the guard itself (see `SECURITY.md`).
 //!
-//! The logic is behind two traits, `Prompt` and `Verifier`, so that the unit tests drive the
-//! attempt loop with stubs. The stubs exist only under `cfg(test)`: no argument, environment
-//! variable or file selects one, so a release executable has no way to skip the prompt.
+//! The logic is behind three traits, `Prompt`, `Verifier` and `Consenter`, so that the unit tests
+//! drive the attempt loop and the request for consent with stubs. The stubs exist only under
+//! `cfg(test)`: no argument, environment variable or file selects one, so a release executable
+//! has no way to skip the prompt. The Windows Runtime and the window that owns the request of
+//! Windows Hello are reached through system calls bound at run time (`sys.rs`), so the programs
+//! that can never ask import none of them.
 
 use crate::engine::{format_seconds, image_path_of_handle, started_at};
 use crate::extend::{current_user_sid, exception_line, hours_figure, image_of, now_ms, sid_text, token_user_sid, ExceptionRecord, Log, Settings, RECORD_MS};
 use crate::sys::*;
 use crate::GuardError;
 use std::ffi::c_void;
-use std::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The caption of the prompt, and the name the console prompt gives as its target: the product name.
@@ -85,6 +106,41 @@ const COMMAND_LIMIT: usize = 140;
 const PROGRAM_LIMIT: usize = 80;
 const ACCOUNT_LIMIT: usize = 40;
 const PARENT_LIMIT: usize = 80;
+
+/// The message of the request for Windows Hello is shorter than that of the credential dialog: the most UTF-16 units it may have
+/// (checked before the request is made; a longer text refuses the run and never reaches the system), and the limits of its
+/// fields, in characters once written out, which are the largest the text starts with. A text that is longer than the
+/// message limit with them is made again with smaller ones (`hello_text`). The limits are defaults; step 12 of the manual
+/// check reads the whole text in the dialog, and they are adjusted if it is clipped.
+const HELLO_MESSAGE_LIMIT: usize = 512;
+const HELLO_COMMAND_LIMIT: usize = 100;
+const HELLO_PROGRAM_LIMIT: usize = 40;
+const HELLO_ACCOUNT_LIMIT: usize = 30;
+const HELLO_PARENT_LIMIT: usize = 40;
+
+/// How long the guard waits, after it asked a request for Windows Hello to cancel, for the system to say that it did.
+const CANCEL_GRACE_MS: u64 = 3_000;
+
+/// How often the state of an operation of the Windows Runtime is read, and the window that owns the request is served.
+const POLL_MS: u32 = 100;
+
+/// The most posted messages of the owner window that are dispatched between two looks at the state of the request. A message that
+/// another process sends to the window is handled by the system when the queue is read and is not counted by this limit.
+const PUMP_LIMIT: usize = 256;
+
+/// What the result of an operation is set to before the system is asked for it: a value that is none of the results or
+/// availabilities of Windows Hello, so that a call that succeeds and leaves it alone cannot read as `Verified` or `Available`,
+/// which are 0 (Common Weakness Enumeration, CWE-636, not failing securely; Saltzer and Schroeder, fail-safe defaults).
+const NO_RESULT: i32 = -1;
+
+/// The most characters a password in a protected form may have (the form is longer than the password it holds).
+const PROTECTED_LIMIT: usize = 4096;
+
+/// The class of the Windows Runtime that asks for the consent of Windows Hello.
+const CONSENT_CLASS: &str = "Windows.Security.Credentials.UI.UserConsentVerifier";
+
+/// The class of the window that owns the request.
+const OWNER_CLASS: &str = "ProcessTreeGuardConsentOwner";
 
 /// The flags of the console prompt: the prompt is shown even when credentials for the target are
 /// stored (without `CREDUI_FLAGS_ALWAYS_SHOW_UI` a generic credential kept under the name of the
@@ -149,10 +205,10 @@ const EMPTY_PASSWORD: &str = "no password was entered, so no logon was tried";
 /// there the error is shown.
 const AFTER_PASSWORD_CHECKED: [u32; 9] = [1327, 1328, 1329, 1330, 1331, 1380, 1385, 1793, 1907];
 
-/// How the password of the account the guard runs as is asked for.
+/// How the approval of the signed-in user is asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
-    /// The secure desktop prompt of Windows.
+    /// The consent of Windows Hello where it is available, and otherwise the credential dialog of Windows on the secure desktop.
     Desktop,
     /// A prompt on the console, accepted only when standard input is a real console.
     Console,
@@ -216,6 +272,10 @@ fn live() -> std::sync::MutexGuard<'static, Vec<Placed>> {
 }
 
 fn register(pointer: *const u8, bytes: usize) {
+    // A buffer is listed only once the hook that zeroes the list on a panic is in place, so that no path can hold a secret that
+    // the abort of a release build leaves in the dump of the process (Common Weakness Enumeration, CWE-316, cleartext storage of
+    // sensitive information in memory); the hook is installed once.
+    install_panic_hook();
     live().push((pointer as usize, bytes, std::thread::current().id()));
 }
 
@@ -257,7 +317,8 @@ fn wipe_live(only: Option<std::thread::ThreadId>) {
 
 /// Make a panic zero the secrets before anything else happens. The release profile aborts on a
 /// panic and runs no destructor, so without this the password would stay in the dump that the
-/// system writes for the process. The hook runs before the abort, then the previous hook.
+/// system writes for the process. The hook runs before the abort, then the previous hook. It is
+/// installed by `register`, which every buffer that holds a secret passes through, and also by `decide`.
 fn install_panic_hook() {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
@@ -546,6 +607,19 @@ pub(crate) trait Prompt {
     /// error is the reason that nobody can be asked: nothing was shown, and no attempt was made.
     fn begin(&self, text: &str) -> Result<Claim, String>;
 
+    /// The right to be asked at all, apart from what the dialog needs: that somebody is present and no other prompt of the
+    /// guard is open. The desktop method takes it once, before it asks for Windows Hello, and keeps it if the dialog is shown
+    /// after it. For a prompt that has nothing apart it is `begin`.
+    fn seat(&self, text: &str) -> Result<Claim, String> {
+        self.begin(text)
+    }
+
+    /// What the dialog itself needs, checked once the right is held and the dialog is to be shown. An error is the reason
+    /// that nobody can be asked, as for `begin`.
+    fn ready(&self, _text: &str) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Ask for credentials. `last_error` is the error of the attempt before (`ERROR_LOGON_FAILURE`
     /// after a refusal, 0 on the first).
     fn ask(&self, attempt: u32, last_error: u32, text: &str) -> Asked;
@@ -563,19 +637,45 @@ pub(crate) trait Verifier {
 /// number of the attempt, or the attempts made before the refusal when nothing was shown for it
 /// (0 for a run that was refused before any was made).
 fn refuse(settings: &Settings, log: &Log, subject: &Subject, attempt: u32, reason: &str) -> GuardError {
-    log.push(&note(settings, subject, false, attempt, reason));
+    refuse_by(settings, log, subject, method_of(settings), attempt, reason)
+}
+
+/// `refuse` for a run that was asked by `method` (the word the log gives, which for the desktop method is `hello` once
+/// the consent of Windows Hello has been chosen).
+fn refuse_by(settings: &Settings, log: &Log, subject: &Subject, method: &str, attempt: u32, reason: &str) -> GuardError {
+    log.push(&note(settings, subject, method, false, attempt, reason));
     GuardError(format!("exception refused: {}; the run did not start", reason))
+}
+
+/// The word the log gives for the method of the exception, as the launch arguments name it.
+fn method_of(settings: &Settings) -> &'static str {
+    settings.exception.as_ref().map_or("", |exception| exception.method.name())
 }
 
 /// The line of the log for a decision. It names what the decision is about: the account of the
 /// guard (as the system writes it, not anything that was typed), the command line that was shown,
-/// cut and written out as the prompt shows it, how the user was asked, the deadline the run starts
-/// with, and the nearest process that started the guard, as the prompt shows it.
-fn note(settings: &Settings, subject: &Subject, approved: bool, attempt: u32, reason: &str) -> String {
+/// cut and written out as the prompt shows it, how the user was asked (`method`: `desktop` for the
+/// credential dialog and for everything before Windows Hello was chosen, `hello`, or `console`),
+/// the deadline the run starts with, and the nearest process that started the guard, as the prompt shows it. The message for
+/// Windows Hello shows less of both than the credential dialog, so for that method they are cut as that message cuts them.
+fn note(settings: &Settings, subject: &Subject, method: &str, approved: bool, attempt: u32, reason: &str) -> String {
     let pid = unsafe { GetCurrentProcessId() };
-    let (command, method, timeout) = settings.exception.as_ref()
-        .map_or_else(|| (String::new(), "", 0.0), |exception| (shown_command(&exception.command), exception.method.name(), exception.timeout));
-    let started_by = if subject.parent.is_empty() { String::new() } else { shown(subject.parent, PARENT_LIMIT, Keep::End) };
+    let share = match settings.exception.as_ref() {
+        Some(exception) if method == HELLO_METHOD => Some(hello_share(subject, exception, settings.max_seconds)),
+        _ => None,
+    };
+    let (command, timeout) = settings.exception.as_ref().map_or_else(|| (String::new(), 0.0), |exception| {
+        let command = match share {
+            Some(percent) => shown(&exception.command, HELLO_COMMAND_LIMIT * percent / 100, Keep::Start),
+            None => shown_command(&exception.command),
+        };
+        (command, exception.timeout)
+    });
+    let started_by = match share {
+        _ if subject.parent.is_empty() => String::new(),
+        Some(percent) => shown(subject.parent, HELLO_PARENT_LIMIT * percent / 100, Keep::End),
+        None => shown(subject.parent, PARENT_LIMIT, Keep::End),
+    };
     exception_line(&ExceptionRecord {
         unix_ms: now_ms(), pid, image: &image_of(pid), account: subject.account, command: &command, method, timeout, started_by: &started_by,
         requested: settings.max_seconds, approved, attempt, reason,
@@ -658,7 +758,7 @@ pub(crate) fn decide(settings: &Settings, held: bool, program: &str, parent: &st
     }
     let verifier = LogonVerifier { owners };
     match exception.method {
-        Method::Desktop => authorize(settings, &subject, &DesktopPrompt::new(owners), &verifier, owners, log),
+        Method::Desktop => authorize_desktop(settings, &subject, &HelloConsenter, &DesktopPrompt::new(owners), &verifier, owners, log),
         Method::Console => authorize(settings, &subject, &ConsolePrompt::new(owners), &verifier, owners, log),
     }
 }
@@ -725,23 +825,69 @@ pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Pro
         return Err(refuse(settings, log, subject, 0, OWNER_GONE));
     }
     let text = prompt_text(subject, exception, settings.max_seconds);
-    // A refusal after the prompt was shown: the line is written at once and the right to a prompt is
-    // kept for a while longer (it is dropped with `_claim` when this returns).
-    let refuse_shown = |attempt: u32, reason: &str| {
-        let error = refuse(settings, log, subject, attempt, reason);
-        pause(owners, cool_down_ms());
-        error
-    };
     // Held until the attempts are over, so that no second prompt of the guard opens beside this one.
     let _claim = match prompt.begin(&text) {
         Ok(claim) => claim,
         Err(reason) => return Err(refuse(settings, log, subject, 0, &reason)),
     };
+    attempts(settings, subject, prompt, verifier, owners, log, &text, "")
+}
+
+/// What stops an approval from standing once the user has given it.
+enum NotRecorded {
+    /// The process that started the run has exited, so nobody is waiting for it.
+    OwnerGone,
+    /// The audit file, or standard error when there is none, cannot take lines.
+    Blocked,
+    /// The line could not be written.
+    Unwritten,
+}
+
+impl NotRecorded {
+    /// The reason of the refusal.
+    fn reason(&self) -> &'static str {
+        match self {
+            NotRecorded::OwnerGone => OWNER_GONE,
+            NotRecorded::Blocked => "the audit file (or standard error, when there is no audit file) cannot take lines, so the approval could not be recorded",
+            NotRecorded::Unwritten => "the approval could not be recorded",
+        }
+    }
+}
+
+/// Record the approval of `method` at `attempt`: it stands only if the starter is still there and its line is written.
+fn record_approval(settings: &Settings, subject: &Subject, method: &str, attempt: u32, reason: &str, owners: &Owners, log: &Log) -> Result<(), NotRecorded> {
+    if owners.gone() {
+        return Err(NotRecorded::OwnerGone);
+    }
+    if log.blocked() {
+        return Err(NotRecorded::Blocked);
+    }
+    if !log.record_decision(&note(settings, subject, method, true, attempt, reason), RECORD_MS) {
+        return Err(NotRecorded::Unwritten);
+    }
+    Ok(())
+}
+
+/// The attempts at the password, with the right to a prompt already held by the caller and the checks that
+/// `prompt` makes done. `why` ends the reason of every line of the record and of every refusal: empty, or the
+/// words that say why the password is asked for where Windows Hello would have been (it was not available).
+fn attempts(settings: &Settings, subject: &Subject, prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners, log: &Log, text: &str, why: &str) -> Result<(), GuardError> {
+    let Some(exception) = settings.exception.as_ref() else { return Ok(()) };
+    let method = method_of(settings);
+    let said = |reason: &str| format!("{}{}", reason, why);
+    let stop = |attempt: u32, reason: &str| refuse(settings, log, subject, attempt, &said(reason));
+    // A refusal after the prompt was shown: the line is written at once and the right to a prompt is
+    // kept for a while longer (it is dropped with the claim when the caller returns).
+    let refuse_shown = |attempt: u32, reason: &str| {
+        let error = stop(attempt, reason);
+        pause(owners, cool_down_ms());
+        error
+    };
     let mut last_error = 0;
     for attempt in 1..=MAX_ATTEMPTS {
         // The credentials are dropped, and so wiped, as soon as they have been checked.
         let mut rejection: Option<String> = None;
-        let verdict = match prompt.ask(attempt, last_error, &text) {
+        let verdict = match prompt.ask(attempt, last_error, text) {
             Asked::Entered(credentials) if credentials.password_is_empty() => {
                 rejection = Some(EMPTY_PASSWORD.to_string());
                 Verified::Wrong
@@ -752,27 +898,22 @@ pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Pro
                 Verified::Wrong
             }
             Asked::Cancelled => return Err(refuse_shown(attempt, "the prompt was cancelled")),
-            Asked::NotShown(reason) => return Err(refuse(settings, log, subject, attempt - 1, &reason)),
+            Asked::NotShown(reason) => return Err(stop(attempt - 1, &reason)),
             Asked::Unavailable(reason) => return Err(refuse_shown(attempt, &reason)),
             // The prompt is still open: nothing may keep the process alive, or the person could type into a prompt
             // whose answer is never read.
-            Asked::Abandoned(reason) => return Err(refuse(settings, log, subject, attempt, &reason)),
+            Asked::Abandoned(reason) => return Err(stop(attempt, &reason)),
         };
         let reason = match verdict {
             Verified::Approved => {
-                if owners.gone() {
-                    return Err(refuse(settings, log, subject, attempt, OWNER_GONE));
-                }
-                if log.blocked() {
-                    return Err(refuse_shown(attempt, "the audit file (or standard error, when there is no audit file) cannot take lines, so the approval could not be recorded"));
-                }
                 let reason = format!("a cap of {} was approved: the password of the account the guard runs as was given at the {} prompt", hours_phrase(settings.max_seconds), exception.method.name());
-                if !log.record_decision(&note(settings, subject, true, attempt, &reason), RECORD_MS) {
-                    return Err(refuse_shown(attempt, "the approval could not be recorded"));
-                }
-                return Ok(());
+                return match record_approval(settings, subject, method, attempt, &said(&reason), owners, log) {
+                    Ok(()) => Ok(()),
+                    Err(NotRecorded::OwnerGone) => Err(stop(attempt, OWNER_GONE)),
+                    Err(unrecorded) => Err(refuse_shown(attempt, unrecorded.reason())),
+                };
             }
-            Verified::OwnerGone => return Err(refuse(settings, log, subject, attempt, OWNER_GONE)),
+            Verified::OwnerGone => return Err(stop(attempt, OWNER_GONE)),
             Verified::Wrong | Verified::OtherUser => rejection.unwrap_or_else(|| NOT_ACCEPTED.to_string()),
             Verified::Failed(code) if exception.method == Method::Console && AFTER_PASSWORD_CHECKED.contains(&code) => NOT_ACCEPTED.to_string(),
             Verified::Failed(UNIDENTIFIED) => return Err(refuse_shown(attempt, "the account of the credentials could not be identified")),
@@ -781,9 +922,9 @@ pub(crate) fn authorize(settings: &Settings, subject: &Subject, prompt: &dyn Pro
         if attempt == MAX_ATTEMPTS {
             return Err(refuse_shown(attempt, &format!("{}; no attempts are left", reason)));
         }
-        log.push(&note(settings, subject, false, attempt, &reason));
+        log.push(&note(settings, subject, method, false, attempt, &said(&reason)));
         if !pause(owners, retry_delay_ms()) {
-            return Err(refuse(settings, log, subject, attempt, OWNER_GONE));
+            return Err(stop(attempt, OWNER_GONE));
         }
         last_error = ERROR_LOGON_FAILURE;
     }
@@ -797,6 +938,668 @@ pub(crate) struct Subject<'a> {
     pub account: &'a str,
     pub parent: &'a str,
     pub program: &'a str,
+}
+
+// --------------------------------------------------------------- Windows Hello
+
+/// The word the log gives for a run that was approved or refused by the consent of Windows Hello.
+const HELLO_METHOD: &str = "hello";
+
+/// Why the consent of Windows Hello is not asked for where its libraries are missing.
+const HELLO_MISSING: &str = "the Windows Runtime is not available on this system";
+
+/// Whether Windows Hello can verify the user (`UserConsentVerifierAvailability`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Availability {
+    Available,
+    DeviceNotPresent,
+    NotConfiguredForUser,
+    DisabledByPolicy,
+    DeviceBusy,
+    Unknown(i32),
+}
+
+impl Availability {
+    pub(crate) fn from_code(code: i32) -> Availability {
+        match code {
+            0 => Availability::Available,
+            1 => Availability::DeviceNotPresent,
+            2 => Availability::NotConfiguredForUser,
+            3 => Availability::DisabledByPolicy,
+            4 => Availability::DeviceBusy,
+            other => Availability::Unknown(other),
+        }
+    }
+
+    /// The name the record gives it.
+    pub(crate) fn name(self) -> String {
+        match self {
+            Availability::Available => "Available".into(),
+            Availability::DeviceNotPresent => "DeviceNotPresent".into(),
+            Availability::NotConfiguredForUser => "NotConfiguredForUser".into(),
+            Availability::DisabledByPolicy => "DisabledByPolicy".into(),
+            Availability::DeviceBusy => "DeviceBusy".into(),
+            Availability::Unknown(code) => format!("Unknown({})", code),
+        }
+    }
+}
+
+/// What a request for the consent of Windows Hello was answered with (`UserConsentVerificationResult`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Consent {
+    Verified,
+    DeviceNotPresent,
+    NotConfiguredForUser,
+    DisabledByPolicy,
+    DeviceBusy,
+    RetriesExhausted,
+    Canceled,
+    Unknown(i32),
+}
+
+impl Consent {
+    pub(crate) fn from_code(code: i32) -> Consent {
+        match code {
+            0 => Consent::Verified,
+            1 => Consent::DeviceNotPresent,
+            2 => Consent::NotConfiguredForUser,
+            3 => Consent::DisabledByPolicy,
+            4 => Consent::DeviceBusy,
+            5 => Consent::RetriesExhausted,
+            6 => Consent::Canceled,
+            other => Consent::Unknown(other),
+        }
+    }
+
+    /// The name the record gives it.
+    pub(crate) fn name(self) -> String {
+        match self {
+            Consent::Verified => "Verified".into(),
+            Consent::DeviceNotPresent => "DeviceNotPresent".into(),
+            Consent::NotConfiguredForUser => "NotConfiguredForUser".into(),
+            Consent::DisabledByPolicy => "DisabledByPolicy".into(),
+            Consent::DeviceBusy => "DeviceBusy".into(),
+            Consent::RetriesExhausted => "RetriesExhausted".into(),
+            Consent::Canceled => "Canceled".into(),
+            Consent::Unknown(code) => format!("Unknown({})", code),
+        }
+    }
+}
+
+/// How a request for the consent of Windows Hello ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    /// The system answered; the code is a `UserConsentVerificationResult`.
+    Done(i32),
+    /// The operation ended as cancelled, which nothing asked for here.
+    Cancelled,
+    /// The operation failed, with this HRESULT.
+    Failed(u32),
+    /// No answer came within the time allowed, and the request was cancelled.
+    TimedOut,
+    /// The process that started the guard exited while the request was open, and the request was cancelled.
+    OwnerGone,
+    /// The request was asked to cancel and did not end within the time given for it.
+    CancelIgnored,
+}
+
+/// Windows Hello, as the decision uses it. The real one reaches the Windows Runtime; the unit tests give a scripted one.
+pub(crate) trait Consenter {
+    /// Whether Windows Hello can verify the user. It shows nothing. An error is the reason that it could not be found out
+    /// (a library is missing, the call failed or took longer than `SYSTEM_TIMEOUT_MS`).
+    fn availability(&self, owners: &Owners) -> Result<Availability, String>;
+
+    /// Whether the guard runs as the user who is signed in to its session, which is the user whom Windows Hello verifies, and on
+    /// the desktop that receives the input of that user, where the request can be read. An error is the reason that it cannot be
+    /// said so.
+    fn session_user(&self, owners: &Owners) -> Result<(), String>;
+
+    /// Ask for the consent, showing `message`. It does not return before the request has ended or been cancelled, and watches
+    /// `owners` while it waits.
+    fn request(&self, message: &str, owners: &Owners) -> Outcome;
+}
+
+/// Decide on the exception of a run by the desktop method: the consent of Windows Hello where it is available, and otherwise the
+/// credential dialog. In this order, which must not change: (1) the starter is still there; (2) somebody is present and no other
+/// prompt of the guard is open, one right for the rest of the run; (3) Windows Hello is asked whether it is available, which shows
+/// nothing; (4) if it is, the guard must run as the user signed in to the session, and then one request is made and its answer
+/// decides; (5) in any other case, or when the question was not answered, the credential dialog asks for the password with its
+/// three attempts, and every reason of the record ends with why Windows Hello was not used. A consent that was asked for and not
+/// given never falls back to the dialog: that would let a refusal be answered by another door.
+pub(crate) fn authorize_desktop(settings: &Settings, subject: &Subject, consenter: &dyn Consenter, prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners, log: &Log) -> Result<(), GuardError> {
+    let Some(exception) = settings.exception.as_ref() else { return Ok(()) };
+    if owners.gone() {
+        return Err(refuse(settings, log, subject, 0, OWNER_GONE));
+    }
+    let text = prompt_text(subject, exception, settings.max_seconds);
+    // Held for the rest of the run, whichever of the two asks, so that the lock is taken once.
+    let _claim = match prompt.seat(&text) {
+        Ok(claim) => claim,
+        Err(reason) => return Err(refuse(settings, log, subject, 0, &reason)),
+    };
+    let availability = consenter.availability(owners);
+    if owners.gone() {
+        return Err(refuse(settings, log, subject, 0, OWNER_GONE));
+    }
+    match availability {
+        Ok(Availability::Available) => hello(settings, subject, exception, consenter, owners, log, HELLO_MESSAGE_LIMIT),
+        other => {
+            let missing = match other {
+                Ok(availability) => availability.name(),
+                Err(reason) => reason,
+            };
+            let why = format!(" (Windows Hello was not available: {})", missing);
+            if let Err(reason) = prompt.ready(&text) {
+                return Err(refuse(settings, log, subject, 0, &format!("{}{}", reason, why)));
+            }
+            attempts(settings, subject, prompt, verifier, owners, log, &text, &why)
+        }
+    }
+}
+
+/// The consent of Windows Hello for a run: the check of the session user and the desktop, one more look at the starter, one
+/// request, and what the answer decides. Only `Verified` approves. A refusal after the request was shown keeps the right to a
+/// prompt for `COOL_DOWN_MS` more, as after any prompt; a request that had to be cancelled (no answer in time, the starter gone,
+/// a cancel that was not taken) ends the process at once. A message of more than `limit` UTF-16 units is not sent.
+fn hello(settings: &Settings, subject: &Subject, exception: &Exception, consenter: &dyn Consenter, owners: &Owners, log: &Log, limit: usize) -> Result<(), GuardError> {
+    let stop = |attempt: u32, reason: &str| refuse_by(settings, log, subject, HELLO_METHOD, attempt, reason);
+    let refuse_shown = |reason: &str| {
+        let error = stop(1, reason);
+        pause(owners, cool_down_ms());
+        error
+    };
+    if let Err(reason) = consenter.session_user(owners) {
+        return Err(stop(0, &reason));
+    }
+    let message = hello_text(subject, exception, settings.max_seconds);
+    if message.encode_utf16().count() > limit {
+        return Err(stop(0, "the message of the request for Windows Hello is longer than the system takes"));
+    }
+    // The starter may have left while the user and the message were looked at: no request is made for a run that nobody started.
+    if owners.gone() {
+        return Err(stop(0, OWNER_GONE));
+    }
+    match consenter.request(&message, owners) {
+        Outcome::Done(code) => match Consent::from_code(code) {
+            Consent::Verified => {
+                let reason = format!("a cap of {} was approved: Windows Hello verified the signed-in user", hours_phrase(settings.max_seconds));
+                match record_approval(settings, subject, HELLO_METHOD, 1, &reason, owners, log) {
+                    Ok(()) => Ok(()),
+                    Err(NotRecorded::OwnerGone) => Err(stop(1, OWNER_GONE)),
+                    Err(unrecorded) => Err(refuse_shown(unrecorded.reason())),
+                }
+            }
+            other => Err(refuse_shown(&format!("Windows Hello did not verify the user: {}", other.name()))),
+        },
+        Outcome::Cancelled => Err(refuse_shown("Windows Hello did not verify the user: the request was cancelled")),
+        Outcome::Failed(code) => Err(refuse_shown(&format!("Windows Hello failed: 0x{:08x}", code))),
+        Outcome::TimedOut => Err(stop(1, &format!("no answer within {} seconds, the request was cancelled", PROMPT_TIMEOUT_MS / 1000))),
+        Outcome::OwnerGone => Err(stop(1, OWNER_GONE)),
+        Outcome::CancelIgnored => Err(stop(1, "the request for Windows Hello was cancelled and did not end")),
+    }
+}
+
+/// Whether the guard runs as the user who is signed in to its session. Windows Hello verifies the second, so the consent says
+/// something about the first only when they are the same user: a guard started as another account (`runas`, a service account)
+/// would otherwise borrow the Windows Hello of the user at the screen. `session` is the session of the guard, `signed_in` the
+/// domain and the user name that the system gives for that session, `own` the name of the account the guard runs as
+/// (`DOMAIN\user`), and `lookup` compares a name with the account of the guard when the two are not written alike (the same
+/// look up as `account_check`: the security identifiers are compared). Nothing is approved when any of them is not known.
+fn session_user_matches(session: Option<u32>, signed_in: Option<(String, String)>, own: Option<String>, lookup: impl FnOnce(&str) -> Option<Verified>) -> Result<(), String> {
+    match session {
+        None => return Err("the session of the guard cannot be read, so the user signed in to it is not known".into()),
+        Some(0) => return Err("the guard runs in session 0, in which no user is signed in".into()),
+        Some(_) => {}
+    }
+    let Some((domain, user)) = signed_in.filter(|(domain, user)| !domain.is_empty() && !user.is_empty()) else {
+        return Err("the user signed in to this session cannot be read".into());
+    };
+    let Some(own) = own.filter(|own| !own.is_empty()) else {
+        return Err("the account the guard runs as cannot be read".into());
+    };
+    let signed_in = format!("{}\\{}", domain, user);
+    if own.eq_ignore_ascii_case(&signed_in) {
+        return Ok(());
+    }
+    // The names are the system's, but they reach the reason of a refusal, so they are shown as the prompt shows a name: written out
+    // where a character is not plain, and cut.
+    let (own_shown, signed_in_shown) = (shown(&own, ACCOUNT_LIMIT, Keep::End), shown(&signed_in, ACCOUNT_LIMIT, Keep::End));
+    match lookup(&signed_in) {
+        None => Ok(()),
+        Some(Verified::OtherUser) => Err(format!("the guard runs as {}, which is not the user signed in to this session ({}), and Windows Hello verifies only the second; \
+            start the run as the signed-in user", own_shown, signed_in_shown)),
+        Some(_) => Err(format!("the user signed in to this session ({}) cannot be compared with the account the guard runs as ({})", signed_in_shown, own_shown)),
+    }
+}
+
+/// The two looks that stand before a request for Windows Hello, in this order: the guard runs as the user signed in to its session,
+/// and on the desktop that receives the input of that user; the second is not made when the first refuses. What is read from the
+/// system is given in (`signed_in` for the names of the session, `lookup` for the comparison of two accounts by their security
+/// identifiers, `desktops` for the names of the two desktops), so that a unit test can give a user that is not the guard's and see that
+/// it is refused. `HelloConsenter::session_user` is the only caller, with the real ones (G102 scans for it).
+fn session_user_and_desktop(session: Option<u32>, signed_in: impl FnOnce(u32) -> Option<(String, String)>, own: Option<String>,
+    lookup: impl FnOnce(&str) -> Option<Verified>, desktops: impl FnOnce() -> (Option<String>, Option<String>)) -> Result<(), String> {
+    session_user_matches(session, session.and_then(signed_in), own, lookup)?;
+    let (ours, input) = desktops();
+    on_input_desktop(ours, input)
+}
+
+/// The domain and the user name of the user signed in to `session`, when the system gives them.
+fn signed_in_names(session: u32) -> Option<(String, String)> {
+    let api = wts_api()?;
+    let read = |class: u32| -> Option<String> {
+        let (mut buffer, mut bytes): (*mut u16, u32) = (std::ptr::null_mut(), 0);
+        // A null server is this computer.
+        if unsafe { (api.query)(std::ptr::null_mut(), session, class, &mut buffer, &mut bytes) } == 0 || buffer.is_null() {
+            return None;
+        }
+        // SAFETY: the system allocated `bytes` bytes at `buffer`, and the memory is freed once it has been read.
+        let units = unsafe { std::slice::from_raw_parts(buffer, bytes as usize / std::mem::size_of::<u16>()) };
+        let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
+        let name = String::from_utf16_lossy(&units[..end]);
+        unsafe { (api.free)(buffer as *mut c_void) };
+        Some(name)
+    };
+    Some((read(WTS_DOMAIN_NAME)?, read(WTS_USER_NAME)?))
+}
+
+/// The session of this process, when the system gives it.
+fn own_session() -> Option<u32> {
+    let mut session = 0u32;
+    (unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0).then_some(session)
+}
+
+/// Whether the desktop that the guard runs on is the one that receives the input of the user, the one on the screen. The prompt of
+/// Windows Hello is placed by the system, and a face can be matched with no act by the user, so a guard that a program of the
+/// user started on a desktop that nobody is looking at (a desktop that the program made), or while the screen is locked or the
+/// screen saver runs, would have the user verified without being shown what is asked (Common Weakness Enumeration, CWE-451, user
+/// interface misrepresentation of critical information; National Institute of Standards and Technology (NIST) Special
+/// Publication (SP) 800-63B-4, authentication intent). `ours` and `input` are the names of the two desktops, as the system gives
+/// them; nothing is approved when one is not known.
+fn on_input_desktop(ours: Option<String>, input: Option<String>) -> Result<(), String> {
+    match (ours, input) {
+        (Some(ours), Some(input)) if !ours.is_empty() && ours.eq_ignore_ascii_case(&input) => Ok(()),
+        (Some(ours), Some(input)) => Err(format!("the guard runs on the desktop {}, and the desktop that receives the input of the user is {}; \
+            start the run on the desktop that the user is looking at", shown(&ours, ACCOUNT_LIMIT, Keep::Start), shown(&input, ACCOUNT_LIMIT, Keep::Start))),
+        (None, _) => Err("the desktop of the guard cannot be read, so nobody can be shown the request".into()),
+        (_, None) => Err("the desktop that receives the input of the user cannot be opened (the screen may be locked), so nobody can be shown the request".into()),
+    }
+}
+
+/// The name of `desktop` (`UOI_NAME`), when the system gives it.
+fn desktop_name(api: &WindowStationApi, desktop: Handle) -> Option<String> {
+    let mut name = vec![0u16; 256];
+    let mut needed = 0u32;
+    let read = unsafe { (api.information)(desktop, UOI_NAME, name.as_mut_ptr() as *mut c_void, (name.len() * std::mem::size_of::<u16>()) as u32, &mut needed) };
+    if read == 0 {
+        return None;
+    }
+    let end = name.iter().position(|unit| *unit == 0)?;
+    Some(String::from_utf16_lossy(&name[..end]))
+}
+
+/// The names of the desktop of the calling thread and of the desktop that receives the input of the user, when the system gives them.
+fn desktop_names() -> (Option<String>, Option<String>) {
+    let Some(api) = window_station_api() else { return (None, None) };
+    // The desktop of the thread belongs to the process and is not closed; the input desktop is opened for the read of its name and is.
+    let ours = unsafe { (api.thread_desktop)(GetCurrentThreadId()) };
+    let ours = if ours.is_null() { None } else { desktop_name(api, ours) };
+    let input = unsafe { (api.input_desktop)(0, 0, DESKTOP_READOBJECTS) };
+    let input = if input.is_null() {
+        None
+    } else {
+        let name = desktop_name(api, input);
+        unsafe { (api.close_desktop)(input) };
+        name
+    };
+    (ours, input)
+}
+
+/// The real consent of Windows Hello, through the Windows Runtime. Nothing here is linked: the libraries are loaded from the
+/// system folder when it is first wanted, and where they are missing it is not available.
+pub(crate) struct HelloConsenter;
+
+impl Consenter for HelloConsenter {
+    fn availability(&self, owners: &Owners) -> Result<Availability, String> {
+        match bounded(Duration::from_millis(SYSTEM_TIMEOUT_MS), owners, read_availability) {
+            Ok(answer) => answer,
+            Err(Unanswered::TimedOut) => Err(format!("no answer within {} seconds", SYSTEM_TIMEOUT_MS / 1000)),
+            Err(Unanswered::OwnerGone) => Err(OWNER_GONE.into()),
+            Err(_) => Err("the question could not be asked".into()),
+        }
+    }
+
+    fn session_user(&self, owners: &Owners) -> Result<(), String> {
+        let compared = bounded(Duration::from_millis(SYSTEM_TIMEOUT_MS), owners, || {
+            session_user_and_desktop(own_session(), signed_in_names, own_account_name(), account_check, desktop_names)
+        });
+        match compared {
+            Ok(answer) => answer,
+            Err(Unanswered::TimedOut) => Err(format!("the user signed in to this session was not found within {} seconds", SYSTEM_TIMEOUT_MS / 1000)),
+            Err(Unanswered::OwnerGone) => Err(OWNER_GONE.into()),
+            Err(_) => Err("the user signed in to this session could not be looked up".into()),
+        }
+    }
+
+    fn request(&self, message: &str, owners: &Owners) -> Outcome {
+        let message = message.to_string();
+        request_with(owners, Duration::from_millis(PROMPT_TIMEOUT_MS), Duration::from_millis(CANCEL_GRACE_MS), move |stop| consent_request(&message, stop))
+    }
+}
+
+/// Run `work` on a thread of its own and wait for its outcome for at most `timeout`, looking at `owners` every
+/// `OWNER_SLICE_MS`. When the time is up or a starter has exited, `work` is told to stop through the flag it is given (it is to
+/// cancel the request) and is waited for `grace` more. The thread is left if it does not report, and ends with the process,
+/// which the refusal that follows ends at once.
+fn request_with(owners: &Owners, timeout: Duration, grace: Duration, work: impl FnOnce(&AtomicBool) -> Outcome + Send + 'static) -> Outcome {
+    let stop = Arc::new(AtomicBool::new(false));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let flag = stop.clone();
+    let started = std::thread::Builder::new().name("consent".into()).spawn(move || {
+        let _ = sender.send(work(&flag));
+    });
+    if started.is_err() {
+        return Outcome::Failed(E_OUTOFMEMORY);
+    }
+    match wait_for(&receiver, timeout, owners) {
+        Ok(outcome) => outcome,
+        Err(Unanswered::Ended) | Err(Unanswered::NotStarted) => Outcome::Failed(E_FAIL),
+        Err(cause) => {
+            stop.store(true, Ordering::SeqCst);
+            let late = receiver.recv_timeout(grace);
+            match (cause, late) {
+                (Unanswered::OwnerGone, _) => Outcome::OwnerGone,
+                (_, Ok(Outcome::CancelIgnored)) | (_, Err(_)) => Outcome::CancelIgnored,
+                _ => Outcome::TimedOut,
+            }
+        }
+    }
+}
+
+/// An asynchronous operation of the Windows Runtime, as the loop that waits for it uses it. The real one reads the v-table of
+/// `IAsyncInfo`; the unit tests give a scripted one.
+trait Operation {
+    /// The state of the operation (`AsyncStatus`); an error is the HRESULT of the call.
+    fn status(&self) -> Result<i32, u32>;
+    /// The HRESULT an operation in the state `ASYNC_ERROR` failed with.
+    fn error(&self) -> u32;
+    /// The result of an operation in the state `ASYNC_COMPLETED`; an error is the HRESULT of the call.
+    fn result(&self) -> Result<i32, u32>;
+    /// Ask the operation to cancel.
+    fn cancel(&self);
+}
+
+/// Read the state of `operation` every time `step` returns, until it ends. `stop`, or the time `until`, makes the loop cancel
+/// the operation, once, and wait `grace` for the state to leave `ASYNC_STARTED`. The outcome is `TimedOut` when the operation
+/// reached `ASYNC_CANCELED` after it was asked to, `Cancelled` when it did so by itself, and `CancelIgnored` when it was
+/// still started once the grace was over. A state that cannot be read, or is not one of the four, ends the loop with a failure
+/// after one attempt to cancel, so that a refusal does not leave a request open that nothing watches any more (CWE-459,
+/// incomplete cleanup).
+fn drive(operation: &dyn Operation, stop: &AtomicBool, until: Option<Instant>, grace: Duration, step: &dyn Fn()) -> Outcome {
+    let mut cancelled: Option<Instant> = None;
+    loop {
+        match operation.status() {
+            Err(code) => {
+                if cancelled.is_none() {
+                    operation.cancel();
+                }
+                return Outcome::Failed(code);
+            }
+            Ok(ASYNC_COMPLETED) => {
+                return match operation.result() {
+                    Ok(code) => Outcome::Done(code),
+                    Err(code) => Outcome::Failed(code),
+                };
+            }
+            Ok(ASYNC_ERROR) => return Outcome::Failed(operation.error()),
+            Ok(ASYNC_CANCELED) => return if cancelled.is_some() { Outcome::TimedOut } else { Outcome::Cancelled },
+            Ok(ASYNC_STARTED) => {}
+            Ok(_) => {
+                if cancelled.is_none() {
+                    operation.cancel();
+                }
+                return Outcome::Failed(E_UNEXPECTED);
+            }
+        }
+        let stopping = stop.load(Ordering::SeqCst) || until.map_or(false, |until| Instant::now() >= until);
+        match cancelled {
+            None if stopping => {
+                operation.cancel();
+                cancelled = Some(Instant::now());
+            }
+            Some(at) if at.elapsed() >= grace => return Outcome::CancelIgnored,
+            _ => {}
+        }
+        step();
+    }
+}
+
+/// An operation of the Windows Runtime that is read through `IAsyncInfo`. Dropped, it is closed and released.
+struct WinOperation {
+    operation: Com,
+    info: Com,
+}
+
+impl WinOperation {
+    fn new(operation: Com) -> Result<WinOperation, u32> {
+        let info = operation.query(&IID_ASYNC_INFO)?;
+        Ok(WinOperation { operation, info })
+    }
+}
+
+impl Operation for WinOperation {
+    fn status(&self) -> Result<i32, u32> {
+        let mut status = ASYNC_STARTED;
+        // SAFETY: slot 7 of IAsyncInfo is get_Status.
+        let code = unsafe { slot::<GetValueFn>(self.info.0, 7)(self.info.0, &mut status) };
+        if code < 0 { Err(code as u32) } else { Ok(status) }
+    }
+
+    fn error(&self) -> u32 {
+        let mut code = E_FAIL as i32;
+        // SAFETY: slot 8 of IAsyncInfo is get_ErrorCode.
+        unsafe { slot::<GetValueFn>(self.info.0, 8)(self.info.0, &mut code) };
+        // A code that is no failure (0 or a success code) names none, as for a call that gave no object.
+        failure_of(code)
+    }
+
+    fn result(&self) -> Result<i32, u32> {
+        let mut result = NO_RESULT;
+        // SAFETY: slot 8 of IAsyncOperation is GetResults, read only once the status is Completed.
+        let code = unsafe { slot::<GetValueFn>(self.operation.0, 8)(self.operation.0, &mut result) };
+        if code < 0 { Err(code as u32) } else { Ok(result) }
+    }
+
+    fn cancel(&self) {
+        // SAFETY: slot 9 of IAsyncInfo is Cancel.
+        unsafe { slot::<CallFn>(self.info.0, 9)(self.info.0) };
+    }
+}
+
+impl Drop for WinOperation {
+    fn drop(&mut self) {
+        // SAFETY: slot 10 of IAsyncInfo is Close. It fails for an operation that is still started, which is left to the process.
+        unsafe { slot::<CallFn>(self.info.0, 10)(self.info.0) };
+    }
+}
+
+/// A Windows Runtime apartment on this thread, left when it is dropped (`RoInitialize` succeeds with S_OK and with S_FALSE, and
+/// both need the call back).
+struct Apartment(&'static HelloApi);
+
+impl Apartment {
+    fn enter(api: &'static HelloApi) -> Result<Apartment, u32> {
+        let code = unsafe { (api.initialize)(RO_INIT_MULTITHREADED) };
+        if code < 0 { Err(code as u32) } else { Ok(Apartment(api)) }
+    }
+}
+
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        unsafe { (self.0.uninitialize)() };
+    }
+}
+
+/// The activation factory of the class `class`, through the interface `interface`.
+fn factory(api: &HelloApi, class: &HString, interface: &Guid) -> Result<Com, u32> {
+    let mut found: *mut c_void = std::ptr::null_mut();
+    let code = unsafe { (api.factory)(class.raw, interface, &mut found) };
+    if code < 0 || found.is_null() { Err(failure_of(code)) } else { Ok(Com(found)) }
+}
+
+/// The HRESULT for a Windows error code.
+fn hresult_of(code: u32) -> u32 {
+    if code == 0 { E_FAIL } else { 0x8007_0000 | (code & 0xffff) }
+}
+
+/// The window that owns the request, which a program of the desktop needs: a tool window of zero size, with the procedure of
+/// the system, that is never shown and never takes the focus. Whether Windows Hello puts its dialog in front of the windows
+/// of the user with an owner that is not shown is recorded by step 12 of the manual check. Dropped, it is destroyed, and its
+/// class is removed.
+struct OwnerWindow {
+    api: &'static WindowApi,
+    handle: Handle,
+    class: Vec<u16>,
+    instance: Handle,
+}
+
+impl OwnerWindow {
+    fn create(api: &'static WindowApi) -> Result<OwnerWindow, u32> {
+        let class = wide(OWNER_CLASS);
+        let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let description = WndClassExW {
+            size: std::mem::size_of::<WndClassExW>() as u32,
+            style: 0,
+            procedure: api.default_procedure,
+            class_extra: 0,
+            window_extra: 0,
+            instance,
+            icon: std::ptr::null_mut(),
+            cursor: std::ptr::null_mut(),
+            background: std::ptr::null_mut(),
+            menu: std::ptr::null(),
+            class_name: class.as_ptr(),
+            icon_small: std::ptr::null_mut(),
+        };
+        let registered = unsafe { (api.register)(&description) } != 0;
+        let code = unsafe { GetLastError() };
+        if !registered && code != ERROR_CLASS_ALREADY_EXISTS {
+            return Err(hresult_of(code));
+        }
+        let caption = wide(CAPTION);
+        let handle = unsafe {
+            (api.create)(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class.as_ptr(), caption.as_ptr(), WS_POPUP, 0, 0, 0, 0,
+                std::ptr::null_mut(), std::ptr::null_mut(), instance, std::ptr::null_mut())
+        };
+        if handle.is_null() {
+            let code = unsafe { GetLastError() };
+            unsafe { (api.unregister)(class.as_ptr(), instance) };
+            return Err(hresult_of(code));
+        }
+        Ok(OwnerWindow { api, handle, class, instance })
+    }
+
+    /// Dispatch the messages that wait for the window, at most `PUMP_LIMIT` at a time: a program that floods the window with
+    /// posted messages cannot keep the loop that waits for the request from looking at its stop flag and cancelling (CWE-834).
+    /// A message that another process sends (not posts) is handled by the system when the queue is read and is not counted; a
+    /// flood of those can delay the look at the request, and then the caller gives up on the cancel after its grace and refuses
+    /// the run, so it costs availability and never approves. A message that is not `dispatchable` is taken from the queue and dropped.
+    fn pump(&self) {
+        let mut message = Msg { window: std::ptr::null_mut(), message: 0, w: 0, l: 0, time: 0, point: [0; 2] };
+        for _ in 0..PUMP_LIMIT {
+            if unsafe { (self.api.peek)(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) } == 0 {
+                break;
+            }
+            if dispatchable(&message) {
+                unsafe { (self.api.dispatch)(&message) };
+            }
+        }
+    }
+
+    /// Serve the window for `POLL_MS`, or until a message comes, and dispatch at most `PUMP_LIMIT` messages: the wait returns
+    /// at once when a message is already in the queue, so one pass after it is all that a look at the request allows. A wait that
+    /// fails (the desktop of the thread is gone, say) also returns at once, so the time is slept instead: the loop that waits for
+    /// the request must not spin for up to 300 seconds, calling into another process on every turn (CWE-834).
+    fn serve(&self) {
+        if unsafe { (self.api.wait)(0, std::ptr::null(), POLL_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE) } == WAIT_FAILED {
+            unsafe { Sleep(POLL_MS) };
+        }
+        self.pump();
+    }
+}
+
+impl Drop for OwnerWindow {
+    fn drop(&mut self) {
+        unsafe {
+            (self.api.destroy)(self.handle);
+            (self.api.unregister)(self.class.as_ptr(), self.instance);
+        }
+    }
+}
+
+/// Whether a message that was taken from the queue of the thread that serves the owner window is dispatched. A timer message is
+/// not: the thread sets no timer, so every one is from another program, and `DispatchMessageW` is documented to call the function
+/// that the `lParam` of a timer message names, in this process, for a message to a window and for one to the thread (no window).
+/// Any program of the same user can post either kind to another process (a "shatter" attack; Common Weakness Enumeration, CWE-422,
+/// unprotected Windows messaging channel). The system itself did not call it for a timer that the thread did not set on Windows 11
+/// (build 10.0.26200; the unit test of the owner window records it), so this is defence in depth. Every other message goes to
+/// `DefWindowProcW`, or is ignored when it has no window.
+fn dispatchable(message: &Msg) -> bool {
+    message.message != WM_TIMER && message.message != WM_SYSTIMER
+}
+
+/// Ask Windows Hello whether it is available, on the worker, with its own limit: the operation is cancelled if it does not
+/// answer in `SYSTEM_TIMEOUT_MS`, so that a worker that the caller has given up on ends. No window is made and nothing is shown.
+fn read_availability() -> Result<Availability, String> {
+    let failed = |code: u32| format!("the question failed: 0x{:08x}", code);
+    let api = hello_api().ok_or_else(|| HELLO_MISSING.to_string())?;
+    let _apartment = Apartment::enter(api).map_err(failed)?;
+    let class = HString::new(api, CONSENT_CLASS).map_err(failed)?;
+    let statics = factory(api, &class, &IID_CONSENT_STATICS).map_err(failed)?;
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: slot 6 of IUserConsentVerifierStatics is CheckAvailabilityAsync.
+    let code = unsafe { slot::<CheckAvailabilityAsyncFn>(statics.0, 6)(statics.0, &mut raw) };
+    if code < 0 || raw.is_null() {
+        return Err(failed(failure_of(code)));
+    }
+    // The operation as the interface whose result is read: asking for it also checks that the answer is of the kind expected.
+    let typed = Com(raw).query(&IID_AVAILABILITY_OPERATION).map_err(failed)?;
+    let operation = WinOperation::new(typed).map_err(failed)?;
+    let until = Instant::now() + Duration::from_millis(SYSTEM_TIMEOUT_MS);
+    let wait = || unsafe { Sleep(POLL_MS) };
+    match drive(&operation, &AtomicBool::new(false), Some(until), Duration::from_millis(CANCEL_GRACE_MS), &wait) {
+        Outcome::Done(code) => Ok(Availability::from_code(code)),
+        Outcome::Failed(code) => Err(failed(code)),
+        _ => Err(format!("no answer within {} seconds", SYSTEM_TIMEOUT_MS / 1000)),
+    }
+}
+
+/// Ask for the consent, on the worker, and say how the request ended; a failure to make it is `Failed` with its error code.
+fn consent_request(message: &str, stop: &AtomicBool) -> Outcome {
+    match consent_inner(message, stop) {
+        Ok(outcome) => outcome,
+        Err(code) => Outcome::Failed(code),
+    }
+}
+
+/// The only place a request for Windows Hello is made (G102 scans for it). The window that owns the request is made first and
+/// served while the request is open; the operation is cancelled when `stop` is set. Everything that was made is released on
+/// every path, in the opposite order.
+fn consent_inner(message: &str, stop: &AtomicBool) -> Result<Outcome, u32> {
+    let (Some(api), Some(windows)) = (hello_api(), window_api()) else { return Err(E_NOTIMPL) };
+    let _apartment = Apartment::enter(api)?;
+    let owner = OwnerWindow::create(windows)?;
+    let text = HString::new(api, message)?;
+    let class = HString::new(api, CONSENT_CLASS)?;
+    let interop = factory(api, &class, &IID_CONSENT_INTEROP)?;
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    // SAFETY: slot 6 of IUserConsentVerifierInterop is RequestVerificationForWindowAsync.
+    let code = unsafe { slot::<RequestVerificationForWindowAsyncFn>(interop.0, 6)(interop.0, owner.handle, text.raw, &IID_RESULT_OPERATION, &mut raw) };
+    if code < 0 || raw.is_null() {
+        return Err(failure_of(code));
+    }
+    let operation = WinOperation::new(Com(raw))?;
+    Ok(drive(&operation, stop, None, Duration::from_millis(CANCEL_GRACE_MS), &|| owner.serve()))
 }
 
 // ------------------------------------------------------------------ the message
@@ -891,6 +1694,41 @@ pub(crate) fn prompt_text(subject: &Subject, exception: &Exception, seconds: f64
         The run starts with a deadline of {} seconds. Enter the password of the account above to allow it, or {}.{}",
         CAPTION, shown_command(&exception.command), shown(subject.program, PROGRAM_LIMIT, Keep::End), field(subject.account, ACCOUNT_LIMIT),
         field(subject.parent, PARENT_LIMIT), hours_phrase(seconds), format_seconds(exception.timeout), refusal, note)
+}
+
+/// What the request for Windows Hello says, with the same fields as the credential dialog, cut shorter: it starts with how to
+/// refuse, so that a clipped end still shows it, and names the run (the command line first); then the cap and the deadline the run
+/// starts with, and it ends with how to refuse again, as the credential dialog does. The limits of the fields
+/// (`HELLO_COMMAND_LIMIT` and the others) are those of a text that is as long as the message may be; a text that is longer once
+/// the characters are written out is made again with a smaller share of each, down to none, so that it fits
+/// `HELLO_MESSAGE_LIMIT` whatever the fields hold (what is left out is counted, as in the credential dialog).
+fn hello_text(subject: &Subject, exception: &Exception, seconds: f64) -> String {
+    hello_made(subject, exception, seconds, hello_share(subject, exception, seconds))
+}
+
+/// The share, in percent, of the limits of the fields that the message for Windows Hello is made with: the largest of 100, 75, 50
+/// and 25 that keeps it within `HELLO_MESSAGE_LIMIT`, and 0 when none does. The record of a run that Windows Hello decided cuts
+/// the command line and the starter by the same share, so that it never shows more than the user was shown.
+fn hello_share(subject: &Subject, exception: &Exception, seconds: f64) -> usize {
+    [100, 75, 50, 25].into_iter()
+        .find(|percent| hello_made(subject, exception, seconds, *percent).encode_utf16().count() <= HELLO_MESSAGE_LIMIT)
+        .unwrap_or(0)
+}
+
+/// The message for Windows Hello with the limits of its fields at `percent` of their defaults. The parent keeps the words
+/// "as reported" of the credential dialog: the launcher chooses it, so it is information and not proof of who started the run
+/// (Common Weakness Enumeration, CWE-451, user interface misrepresentation of critical information).
+fn hello_made(subject: &Subject, exception: &Exception, seconds: f64, percent: usize) -> String {
+    let field = |text: &str, limit: usize| if text.is_empty() { "(unknown)".to_string() } else { shown(text, limit, Keep::End) };
+    // Said when a field has a character that is written out, so that the form is not a puzzle.
+    let written_out = [subject.account, subject.program, subject.parent, exception.command.as_str()].into_iter()
+        .any(|text| !text.is_ascii() || text.contains("\\u{"));
+    let note = if written_out { " Note: \\u{..} is a character written out; check each field letter by letter." } else { "" };
+    let at = |limit: usize| limit * percent / 100;
+    format!("{} asks Windows Hello to allow this run; cancel to refuse it. Command line: [{}] Program: [{}] Account: [{}] Parent process, as reported: [{}] \
+        Allows a cap of {}, renewable without a total limit; the run starts with a deadline of {} seconds.{} Cancel to refuse it.",
+        CAPTION, shown(&exception.command, at(HELLO_COMMAND_LIMIT), Keep::Start), shown(subject.program, at(HELLO_PROGRAM_LIMIT), Keep::End),
+        field(subject.account, at(HELLO_ACCOUNT_LIMIT)), field(subject.parent, at(HELLO_PARENT_LIMIT)), hours_phrase(seconds), format_seconds(exception.timeout), note)
 }
 
 // --------------------------------------------------------------------- names
@@ -988,8 +1826,7 @@ pub(crate) fn present(session: Option<u32>, flags: Option<u32>) -> Result<(), &'
 
 /// The session of this process and the flags of its window station, when they can be read.
 fn detect() -> (Option<u32>, Option<u32>) {
-    let mut session = 0u32;
-    let session = (unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) } != 0).then_some(session);
+    let session = own_session();
     let flags = window_station_api().and_then(|api| unsafe {
         // The handle belongs to the process and is not closed.
         let station = (api.station)();
@@ -1091,11 +1928,12 @@ fn asked_from(answer: Result<Asked, Unanswered>) -> Asked {
 
 // ------------------------------------------------------------ the desktop prompt
 
-/// The secure desktop prompt: `CredUIPromptForWindowsCredentialsW` showing only the accounts of
-/// the current user, then `CredUnPackAuthenticationBufferW`. It is refused without showing
-/// anything when the process has no interactive window station or runs in session 0. There is
-/// no consent path of Windows Hello: a PIN does not unpack to a password, so an account that
-/// signs in with a PIN alone cannot approve.
+/// The credential dialog of the desktop method, used where Windows Hello is not available:
+/// `CredUIPromptForWindowsCredentialsW` showing only the accounts of the current user, then
+/// `CredUnPackAuthenticationBufferW`. The user whose sign-in is a Personal Identification Number
+/// (PIN) gets the password in a protected form, which is unprotected (`CredUnprotectW`) into a
+/// buffer that is wiped like any other secret. It is refused without showing anything when the
+/// process has no interactive window station or runs in session 0.
 pub(crate) struct DesktopPrompt<'a> {
     owners: &'a Owners,
     /// The thread that makes every call of the prompt of this run, made when the first is asked.
@@ -1110,6 +1948,20 @@ impl<'a> DesktopPrompt<'a> {
 
 impl Prompt for DesktopPrompt<'_> {
     fn begin(&self, text: &str) -> Result<Claim, String> {
+        self.ready(text)?;
+        self.seat(text)
+    }
+
+    fn seat(&self, _text: &str) -> Result<Claim, String> {
+        if window_station_api().is_none() {
+            return Err(NOT_AVAILABLE.into());
+        }
+        let (session, flags) = detect();
+        present(session, flags)?;
+        Ok(Claim { _lock: Some(PromptLock::take()?) })
+    }
+
+    fn ready(&self, text: &str) -> Result<(), String> {
         if desktop_api().is_none() || window_station_api().is_none() {
             return Err(NOT_AVAILABLE.into());
         }
@@ -1118,9 +1970,7 @@ impl Prompt for DesktopPrompt<'_> {
         if text.encode_utf16().count() >= CREDUI_MAX_MESSAGE_LENGTH {
             return Err("the message of the prompt is longer than the dialog takes".into());
         }
-        let (session, flags) = detect();
-        present(session, flags)?;
-        Ok(Claim { _lock: Some(PromptLock::take()?) })
+        Ok(())
     }
 
     fn ask(&self, _attempt: u32, last_error: u32, text: &str) -> Asked {
@@ -1157,32 +2007,85 @@ fn desktop_dialog(api: &DesktopApi, message: &[u16], caption: &[u16], last_error
     if !out.pointer.is_null() && out.size > 0 {
         register(out.pointer as *const u8, out.size as usize);
     }
+    read_credentials(api, out.pointer, out.size)
+}
+
+/// Read the name, the domain and the password out of the authentication buffer that the dialog returned. The password buffer
+/// is the size of a password; one that is not large enough holds a password in a protected form, which is longer than the
+/// password it holds, and the unpacking is made again with a buffer of the size the system asked for (at most
+/// `PROTECTED_LIMIT`). A password in a protected form is then unprotected into a buffer of the size of a password. Every buffer
+/// is a registered secret, wiped when it goes, on every path.
+fn read_credentials(api: &DesktopApi, buffer: *const c_void, size: u32) -> Asked {
     let mut credentials = Box::new(Credentials::new());
     let (mut user_chars, mut domain_chars, mut password_chars) = (CREDUI_USER_CHARS as u32, CREDUI_DOMAIN_CHARS as u32, CREDUI_PASSWORD_CHARS as u32);
-    let unpacked = unsafe {
-        (api.unpack)(0, out.pointer, out.size,
+    let mut unpacked = unsafe {
+        (api.unpack)(0, buffer, size,
             credentials.user.0.as_mut_ptr(), &mut user_chars,
             credentials.domain.0.as_mut_ptr(), &mut domain_chars,
             credentials.password.0.as_mut_ptr(), &mut password_chars)
     };
+    let mut code = if unpacked == 0 { unsafe { GetLastError() } } else { 0 };
+    if unpacked == 0 && code == ERROR_INSUFFICIENT_BUFFER && password_chars as usize > CREDUI_PASSWORD_CHARS {
+        if password_chars as usize > PROTECTED_LIMIT {
+            return Asked::Rejected("the password is longer than the guard takes".into());
+        }
+        // The old buffer is wiped and taken out of the list as the new one takes its place.
+        credentials.password = zeroed(password_chars as usize);
+        (user_chars, domain_chars, password_chars) = (CREDUI_USER_CHARS as u32, CREDUI_DOMAIN_CHARS as u32, credentials.password.0.len() as u32);
+        unpacked = unsafe {
+            (api.unpack)(0, buffer, size,
+                credentials.user.0.as_mut_ptr(), &mut user_chars,
+                credentials.domain.0.as_mut_ptr(), &mut domain_chars,
+                credentials.password.0.as_mut_ptr(), &mut password_chars)
+        };
+        code = if unpacked == 0 { unsafe { GetLastError() } } else { 0 };
+    }
     if unpacked == 0 {
-        // The prompt was answered with something that is not a name and a password (a PIN or a smart
-        // card may be so), or with a name or password that is too long: an attempt used, with no logon
-        // tried, and the user is asked again. The buffers are wiped when `credentials` goes.
-        let code = unsafe { GetLastError() };
+        // The prompt was answered with something that is not a name and a password (a smart card may be so), or with a name or
+        // password that is too long: an attempt used, with no logon tried, and the user is asked again. The buffers are wiped
+        // when `credentials` goes.
         return Asked::Rejected(if code == ERROR_INSUFFICIENT_BUFFER {
             "the name or password is longer than the prompt allows".into()
         } else {
             format!("the answer of the prompt could not be read as a user name and password: {}", error_for(code).message())
         });
     }
-    // A password that the system hands back in a protected (encrypted) form is not the text that was typed:
-    // sent to `LogonUserW` it would fail as a wrong password and count toward the lockout of the account.
-    // It is not sent; it uses an attempt of its own, with a reason of its own.
+    // A password that the system hands back in a protected (encrypted) form is not the text that was typed: sent to `LogonUserW`
+    // it would fail as a wrong password and count toward the lockout of the account. It is unprotected first; one that cannot
+    // be uses an attempt of its own, with a reason of its own, and no logon is tried for it.
     if password_is_protected(api, &mut credentials.password.0) {
-        return Asked::Rejected("the answer of the prompt holds a protected form of the password, which the guard does not unprotect".into());
+        match unprotect(api, &mut credentials.password.0) {
+            // The protected form is wiped as the clear one takes its place.
+            Ok(clear) => credentials.password = clear,
+            Err(reason) => return Asked::Rejected(reason),
+        }
     }
     Asked::Entered(credentials)
+}
+
+/// The clear text of `protected`, a password in a protected form that ends with a NUL inside the slice (`CredUnprotectW`, for
+/// the user whose sign-in it is), in a registered buffer of the size of a password. The size is asked for first, and a password
+/// that would not fit is refused. The clear password is in memory from here until the credentials are dropped.
+fn unprotect(api: &DesktopApi, protected: &mut [u16]) -> Result<Secret<Box<[u16]>>, String> {
+    let failed = |code: u32| format!("the protected form of the password could not be unprotected: {}", error_for(code).message());
+    let Some(end) = protected.iter().position(|unit| *unit == 0) else { return Err(failed(ERROR_INSUFFICIENT_BUFFER)) };
+    // The length counts the NUL, as the call that makes a protected form counts it.
+    let length = end as u32 + 1;
+    let mut needed = 0u32;
+    let sized = unsafe { (api.unprotect)(0, protected.as_mut_ptr(), length, std::ptr::null_mut(), &mut needed) };
+    let code = unsafe { GetLastError() };
+    if sized != 0 || code != ERROR_INSUFFICIENT_BUFFER {
+        return Err(failed(if sized != 0 { UNIDENTIFIED } else { code }));
+    }
+    if needed as usize > CREDUI_PASSWORD_CHARS {
+        return Err("the password is longer than the guard takes".into());
+    }
+    let mut clear = zeroed(CREDUI_PASSWORD_CHARS);
+    let mut chars = CREDUI_PASSWORD_CHARS as u32;
+    if unsafe { (api.unprotect)(0, protected.as_mut_ptr(), length, clear.0.as_mut_ptr(), &mut chars) } == 0 {
+        return Err(failed(unsafe { GetLastError() }));
+    }
+    Ok(clear)
 }
 
 /// True when `password`, which ends with a NUL inside the slice (the unpacking that filled it
@@ -1946,6 +2849,46 @@ mod tests {
         assert!(!live().iter().any(|placed| placed.0 == raw.as_ptr() as usize));
     }
 
+    /// Set in the environment of the copy of this test executable in which no test has installed the panic hook.
+    const HOOK_CHILD: &str = "PROCESS_TREE_GUARD_UNIT_TEST_PANIC_HOOK_CHILD";
+
+    #[test]
+    fn making_a_buffer_for_a_secret_is_enough_to_have_the_hook_that_zeroes_it_on_a_panic() {
+        if std::env::var_os(HOOK_CHILD).is_some() {
+            // The copy: nothing here installs the hook by name, as `decide` does in a program. A buffer for a secret is made and filled,
+            // and a panic is caught while it is alive, as the abort of a release build leaves it.
+            HOOK_FOR_THIS_THREAD.store(true, Ordering::SeqCst);
+            let mut secret = zeroed(8);
+            secret.0.iter_mut().for_each(|unit| *unit = 0x5a5a);
+            let _ = std::panic::catch_unwind(|| -> () { panic!("a panic while a secret is alive") });
+            println!("HOOK {}", if secret.0.iter().all(|unit| *unit == 0) { "zeroed" } else { "left" });
+            return;
+        }
+        // The hook is installed once for the whole process, so the check needs a copy of this executable in which no other test has done it.
+        let output = std::process::Command::new(std::env::current_exe().expect("the path of this test executable"))
+            .args(["making_a_buffer_for_a_secret_is_enough_to_have_the_hook", "--nocapture", "--test-threads=1"])
+            .env(HOOK_CHILD, "1").stdin(std::process::Stdio::null()).output().expect("run the copy");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success() && stdout.contains("HOOK zeroed"), "a secret must not be alive without the hook that zeroes it: {}", stdout);
+    }
+
+    #[test]
+    fn the_credential_dialog_is_refused_a_message_longer_than_it_takes_and_checking_that_shows_nothing() {
+        // `ready` loads the libraries and measures the message; the dialog is not called. The limit counts UTF-16 units, as the dialog does.
+        if desktop_api().is_none() || window_station_api().is_none() {
+            eprintln!("NOT ASSERTED: the libraries of the credential dialog cannot be loaded here");
+            return;
+        }
+        let owners = Owners::empty();
+        let prompt = DesktopPrompt::new(&owners);
+        assert!(prompt.ready("short").is_ok());
+        assert!(prompt.ready(&"x".repeat(CREDUI_MAX_MESSAGE_LENGTH - 1)).is_ok(), "one unit under the limit is taken");
+        let reason = prompt.ready(&"x".repeat(CREDUI_MAX_MESSAGE_LENGTH)).expect_err("a message at the limit is not taken");
+        assert!(reason.contains("longer than the dialog takes"), "{}", reason);
+        let wide_characters = "\u{1d11e}".repeat(CREDUI_MAX_MESSAGE_LENGTH / 2);
+        assert!(wide_characters.chars().count() < CREDUI_MAX_MESSAGE_LENGTH && prompt.ready(&wide_characters).is_err(), "each character outside the basic plane is two units");
+    }
+
     #[test]
     fn the_console_mode_is_put_back_on_a_control_event_only_while_a_mode_was_read_and_the_guard_is_not_ended_by_the_handler() {
         use std::sync::atomic::AtomicU32;
@@ -2313,6 +3256,13 @@ mod tests {
                 Ok(()) => "Ok".to_string(),
                 Err(reason) => format!("Err {}", reason),
             });
+            // The seat of the credential dialog, which the desktop method takes first, looks at the same thing before it takes the lock or
+            // shows anything; it is what G95 and G103 see end to end, and those two run only where the variable that allows them is set.
+            let owners = Owners::empty();
+            println!("SEATED {}", match DesktopPrompt::new(&owners).seat("text") {
+                Ok(_) => "accepted".to_string(),
+                Err(reason) => format!("refused: {}", reason),
+            });
             return;
         }
         // This copy cannot change its own window station without affecting the tests beside it, so a copy of the executable is run for
@@ -2331,6 +3281,9 @@ mod tests {
         }
         assert!(output.status.success() && said.contains("flags=Some(0) Err ")
             && (said.contains("no interactive window station") || said.contains("session 0")), "detect must report a window station that is not visible: {} / {}", said, stdout);
+        let seated = stdout.lines().find_map(|line| line.find("SEATED ").map(|at| line[at + "SEATED ".len()..].to_string())).unwrap_or_default();
+        assert!(seated.starts_with("refused: ") && (seated.contains("no interactive window station") || seated.contains("session 0")),
+            "the seat of the credential dialog must refuse on a window station that is not visible, before the lock is taken: {} / {}", seated, stdout);
     }
 
     /// Set in the environment of the copy of this test executable that the console prompt is begun in.
@@ -2856,6 +3809,1518 @@ mod tests {
         // The real name is DOMAIN\user, read without a look up of the identifier.
         let own = own_account_name().expect("the account this test runs as");
         assert!(own.contains('\\') && !own.contains('\0'), "{}", own);
+    }
+
+    // ------------------------------------------------------------------ Windows Hello
+    //
+    // Nothing below shows a prompt, a dialog or a window to the person who runs the tests: the request for consent is never
+    // made (a scripted `Consenter` stands in), the owner window is made only on a window station that is not visible, and the
+    // one call of the system that is made for real, the question whether Windows Hello is available, shows nothing.
+
+    /// A consent that does what a test scripts, and keeps what it was asked.
+    struct FakeConsent {
+        availability: Result<Availability, String>,
+        session: Result<(), String>,
+        outcome: Outcome,
+        /// The calls made, in order.
+        calls: Mutex<Vec<&'static str>>,
+        /// The message of each request.
+        messages: Mutex<Vec<String>>,
+        /// A name of a lock that the request tries to take, and whether it found the lock taken.
+        lock: Option<String>,
+        lock_was_taken: Mutex<Option<bool>>,
+    }
+
+    impl FakeConsent {
+        fn new(availability: Result<Availability, String>, outcome: Outcome) -> FakeConsent {
+            FakeConsent { availability, session: Ok(()), outcome, calls: Mutex::new(Vec::new()), messages: Mutex::new(Vec::new()), lock: None, lock_was_taken: Mutex::new(None) }
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Consenter for FakeConsent {
+        fn availability(&self, _owners: &Owners) -> Result<Availability, String> {
+            self.calls.lock().unwrap().push("availability");
+            self.availability.clone()
+        }
+
+        fn session_user(&self, _owners: &Owners) -> Result<(), String> {
+            self.calls.lock().unwrap().push("session_user");
+            self.session.clone()
+        }
+
+        fn request(&self, message: &str, _owners: &Owners) -> Outcome {
+            self.calls.lock().unwrap().push("request");
+            self.messages.lock().unwrap().push(message.to_string());
+            if let Some(name) = &self.lock {
+                *self.lock_was_taken.lock().unwrap() = Some(PromptLock::take_named(name).is_err());
+            }
+            self.outcome
+        }
+    }
+
+    /// Settings for a run by the desktop method.
+    fn desktop(command: &str) -> Settings {
+        let mut desktop = settings(command);
+        if let Some(exception) = desktop.exception.as_mut() {
+            exception.method = Method::Desktop;
+        }
+        desktop
+    }
+
+    fn run_desktop(settings: &Settings, consent: &dyn Consenter, prompt: &dyn Prompt, verifier: &dyn Verifier, owners: &Owners, log: &Log) -> Result<(), GuardError> {
+        authorize_desktop(settings, &Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" }, consent, prompt, verifier, owners, log)
+    }
+
+    /// A verifier for the runs where no password is checked.
+    fn any_verifier() -> StubVerifier {
+        StubVerifier { right: "right", same_user: true, failure: None }
+    }
+
+    #[test]
+    fn what_windows_hello_says_is_named_as_the_record_names_it() {
+        let availability = ["Available", "DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "DeviceBusy"];
+        for (code, name) in availability.iter().enumerate() {
+            assert_eq!(Availability::from_code(code as i32).name(), *name, "{}", code);
+        }
+        assert_eq!(Availability::from_code(0), Availability::Available);
+        for code in [5, 6, 7, -1, 99] {
+            assert_eq!(Availability::from_code(code), Availability::Unknown(code));
+            assert_eq!(Availability::from_code(code).name(), format!("Unknown({})", code), "a code that is not known is named by its number");
+        }
+        let consent = ["Verified", "DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "DeviceBusy", "RetriesExhausted", "Canceled"];
+        for (code, name) in consent.iter().enumerate() {
+            assert_eq!(Consent::from_code(code as i32).name(), *name, "{}", code);
+        }
+        assert_eq!(Consent::from_code(0), Consent::Verified);
+        assert_eq!(Consent::from_code(5), Consent::RetriesExhausted);
+        assert_eq!(Consent::from_code(6), Consent::Canceled);
+        for code in [7, 8, -1] {
+            assert_eq!(Consent::from_code(code).name(), format!("Unknown({})", code));
+        }
+        // The value a result is set to before the system fills it is neither a verification nor an availability.
+        assert_ne!(Consent::from_code(NO_RESULT), Consent::Verified);
+        assert_ne!(Availability::from_code(NO_RESULT), Availability::Available);
+    }
+
+    #[test]
+    fn only_a_verified_user_approves_and_every_other_answer_refuses_with_its_name_and_the_password_is_not_asked_for() {
+        // Also the value a result is set to before the system fills it, and the largest and smallest values: none of them is `Verified`.
+        for code in (0..=7).chain([NO_RESULT, i32::MAX, i32::MIN]) {
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let log = Log::capture(kept.clone(), None);
+            let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(code));
+            let prompt = StubPrompt::new(vec![]);
+            COOL_DOWNS.with(|count| count.set(0));
+            let result = run_desktop(&desktop("C:\\tools\\run.exe --all"), &consent, &prompt, &any_verifier(), &Owners::empty(), &log);
+            log.finish(1_000);
+            let lines = lines_of(&kept);
+            assert_eq!(consent.calls(), ["availability", "session_user", "request"], "{}: in this order, and one request", code);
+            assert!(prompt.asked().is_empty(), "{}: the password is never asked for after Windows Hello was", code);
+            assert!(lines.len() == 1 && lines[0].contains("method=\"hello\"") && lines[0].contains("attempt=1 "), "{}: {:?}", code, lines);
+            if code == 0 {
+                assert!(result.is_ok(), "{}: {:?}", code, result.err());
+                assert_eq!(decisions(&lines), ["approved"]);
+                assert!(lines[0].contains("reason=\"a cap of 24 hours was approved: Windows Hello verified the signed-in user\"") && !lines[0].contains("not available"), "{}", lines[0]);
+                assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 0, "no cool-down after an approval");
+            } else {
+                let error = result.expect_err("any answer but Verified refuses the run");
+                let name = Consent::from_code(code).name();
+                assert_eq!(decisions(&lines), ["refused"]);
+                assert!(lines[0].contains(&format!("reason=\"Windows Hello did not verify the user: {}\"", name)), "{}: {}", code, lines[0]);
+                assert!(error.message().contains(&format!("Windows Hello did not verify the user: {}", name)) && error.message().contains("the run did not start"), "{}", error);
+                assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 1, "{}: the right to a prompt is kept for a while after an answer was asked for", code);
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_that_failed_or_had_to_be_cancelled_refuses_and_names_what_happened() {
+        let cases: [(Outcome, &str, u32); 5] = [
+            (Outcome::Failed(0x8007_0005), "reason=\"Windows Hello failed: 0x80070005\"", 1),
+            (Outcome::Cancelled, "reason=\"Windows Hello did not verify the user: the request was cancelled\"", 1),
+            (Outcome::TimedOut, "reason=\"no answer within 300 seconds, the request was cancelled\"", 0),
+            (Outcome::OwnerGone, "nobody is waiting for it", 0),
+            (Outcome::CancelIgnored, "reason=\"the request for Windows Hello was cancelled and did not end\"", 0),
+        ];
+        for (outcome, said, cool_downs) in cases {
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let log = Log::capture(kept.clone(), None);
+            let consent = FakeConsent::new(Ok(Availability::Available), outcome);
+            COOL_DOWNS.with(|count| count.set(0));
+            let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::empty(), &log).expect_err("the run is refused");
+            log.finish(1_000);
+            let lines = lines_of(&kept);
+            assert!(lines.len() == 1 && lines[0].contains(said) && lines[0].contains("method=\"hello\"") && lines[0].contains("attempt=1 "), "{:?}: {:?}", outcome, lines);
+            assert!(error.message().contains("exception refused") && error.message().contains("the run did not start"), "{}", error);
+            assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), cool_downs,
+                "{:?}: a request that was cancelled ends the process at once, any other refusal keeps the right to a prompt", outcome);
+        }
+    }
+
+    #[test]
+    fn where_windows_hello_is_not_available_the_dialog_asks_for_the_password_and_the_record_says_why() {
+        let cases: Vec<(Result<Availability, String>, &str)> = vec![
+            (Ok(Availability::DeviceNotPresent), "DeviceNotPresent"),
+            (Ok(Availability::NotConfiguredForUser), "NotConfiguredForUser"),
+            (Ok(Availability::DisabledByPolicy), "DisabledByPolicy"),
+            (Ok(Availability::DeviceBusy), "DeviceBusy"),
+            (Ok(Availability::Unknown(9)), "Unknown(9)"),
+            (Err("no answer within 5 seconds".into()), "no answer within 5 seconds"),
+            (Err(HELLO_MISSING.into()), HELLO_MISSING),
+        ];
+        for (availability, said) in cases {
+            let suffix = format!(" (Windows Hello was not available: {})", said);
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let log = Log::capture(kept.clone(), None);
+            let consent = FakeConsent::new(availability, Outcome::Done(0));
+            let prompt = StubPrompt::new(vec![Answer::Password("wrong"), Answer::Password("right")]);
+            assert!(run_desktop(&desktop("x"), &consent, &prompt, &any_verifier(), &Owners::empty(), &log).is_ok(), "{}", said);
+            log.finish(1_000);
+            let lines = lines_of(&kept);
+            assert_eq!(consent.calls(), ["availability"], "{}: neither the user nor a request is looked at when Windows Hello is not used", said);
+            assert_eq!(prompt.asked().len(), 2, "{}", said);
+            assert_eq!(decisions(&lines), ["refused", "approved"], "{:?}", lines);
+            assert!(lines.iter().all(|line| line.contains("method=\"desktop\"") && line.contains(&format!("{}\"", suffix))), "every reason says why: {:?}", lines);
+            assert!(lines[1].contains("the password of the account the guard runs as was given at the desktop prompt"), "{}", lines[1]);
+        }
+        // A refusal in the dialog says it too, and so does the last attempt.
+        for (answers, said) in [(vec![Answer::Cancel], "the prompt was cancelled"), (vec![Answer::Password("a"), Answer::Password("b"), Answer::Password("c")], "no attempts are left")] {
+            let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+            let consent = FakeConsent::new(Ok(Availability::NotConfiguredForUser), Outcome::Done(0));
+            let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(answers), &any_verifier(), &Owners::empty(), &log).expect_err("refused");
+            log.finish(1_000);
+            assert!(error.message().contains(said) && error.message().ends_with(" (Windows Hello was not available: NotConfiguredForUser); the run did not start"), "{}", error);
+        }
+        // A dialog that cannot be shown is refused before an attempt, with the reason Windows Hello was not used.
+        struct NotReady;
+        impl Prompt for NotReady {
+            fn begin(&self, _text: &str) -> Result<Claim, String> {
+                Ok(Claim::none())
+            }
+            fn ready(&self, _text: &str) -> Result<(), String> {
+                Err(NOT_AVAILABLE.into())
+            }
+            fn ask(&self, _attempt: u32, _last_error: u32, _text: &str) -> Asked {
+                panic!("the dialog was asked");
+            }
+        }
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let consent = FakeConsent::new(Ok(Availability::DisabledByPolicy), Outcome::Done(0));
+        assert!(run_desktop(&desktop("x"), &consent, &NotReady, &any_verifier(), &Owners::empty(), &log).is_err());
+        log.finish(1_000);
+        assert!(lines_of(&kept)[0].contains("attempt=0 ") && lines_of(&kept)[0].contains(&format!("{} (Windows Hello was not available: DisabledByPolicy)", NOT_AVAILABLE)), "{:?}", lines_of(&kept));
+    }
+
+    #[test]
+    fn a_consent_that_was_asked_for_and_not_given_never_falls_back_to_the_password() {
+        for code in 1..=7 {
+            let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+            let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(code));
+            let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+            assert!(run_desktop(&desktop("x"), &consent, &prompt, &any_verifier(), &Owners::empty(), &log).is_err(), "{}", code);
+            log.finish(1_000);
+            assert!(prompt.asked().is_empty(), "{}: a cancel or a wrong PIN is not answered by another door", code);
+        }
+    }
+
+    /// A consent that verifies, and makes the starter exit at the call named by `at`.
+    struct StarterLeaves {
+        starter: usize,
+        at: &'static str,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl StarterLeaves {
+        fn call(&self, name: &'static str) {
+            self.calls.lock().unwrap().push(name);
+            if name == self.at {
+                unsafe { SetEvent(self.starter as Handle) };
+            }
+        }
+    }
+
+    impl Consenter for StarterLeaves {
+        fn availability(&self, _owners: &Owners) -> Result<Availability, String> {
+            self.call("availability");
+            Ok(Availability::Available)
+        }
+
+        fn session_user(&self, _owners: &Owners) -> Result<(), String> {
+            self.call("session_user");
+            Ok(())
+        }
+
+        fn request(&self, _message: &str, _owners: &Owners) -> Outcome {
+            self.call("request");
+            Outcome::Done(0)
+        }
+    }
+
+    #[test]
+    fn a_starter_that_leaves_before_the_approval_is_recorded_gets_no_request_and_no_approval_and_a_verification_that_no_record_holds_does_not_stand() {
+        // The starter exits during the question, during the look at the user, and while the request is answered (a verification that
+        // arrives with the starter gone is no approval). No request is made for a run that nobody started, no approval is written, and
+        // the process ends at once.
+        for (at, calls, attempt, method) in [
+            ("availability", vec!["availability"], "attempt=0 ", "desktop"),
+            ("session_user", vec!["availability", "session_user"], "attempt=0 ", "hello"),
+            ("request", vec!["availability", "session_user", "request"], "attempt=1 ", "hello"),
+        ] {
+            let starter = event(false);
+            let consent = StarterLeaves { starter: starter as usize, at, calls: Mutex::new(Vec::new()) };
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let log = Log::capture(kept.clone(), None);
+            COOL_DOWNS.with(|count| count.set(0));
+            let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::of(vec![starter]), &log).expect_err("nobody is waiting");
+            log.finish(1_000);
+            let lines = lines_of(&kept);
+            assert_eq!(*consent.calls.lock().unwrap(), calls, "{}: the starter leaves at this call, and nothing is asked after the check that follows", at);
+            assert!(error.message().contains("nobody is waiting for it"), "{}: {}", at, error);
+            assert!(decisions(&lines) == ["refused"] && lines[0].contains(attempt) && lines[0].contains(&format!("method=\"{}\"", method)), "{}: {:?}", at, lines);
+            assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 0, "{}: the process ends at once", at);
+        }
+        // A verification whose line no record can hold is no approval: standard error that cannot take it refuses the run, and keeps
+        // the right to a prompt for a while, as any refusal after a request does.
+        let fail = Arc::new(AtomicBool::new(true));
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), Some(fail.clone()));
+        COOL_DOWNS.with(|count| count.set(0));
+        let error = run_desktop(&desktop("x"), &FakeConsent::new(Ok(Availability::Available), Outcome::Done(0)), &StubPrompt::new(vec![]), &any_verifier(), &Owners::empty(), &log)
+            .expect_err("an approval that no record holds is not one");
+        log.finish(1_000);
+        assert!(error.message().contains("could not be recorded"), "{}", error);
+        assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 1);
+        // The same consent with a standard error that works is recorded, and the run goes on.
+        fail.store(false, Ordering::SeqCst);
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), Some(fail));
+        assert!(run_desktop(&desktop("x"), &FakeConsent::new(Ok(Availability::Available), Outcome::Done(0)), &StubPrompt::new(vec![]), &any_verifier(), &Owners::empty(), &log).is_ok());
+        log.finish(1_000);
+        assert_eq!(decisions(&lines_of(&kept)), ["approved"]);
+    }
+
+    #[test]
+    fn nothing_is_asked_of_windows_hello_before_somebody_is_present_and_nothing_is_requested_for_another_user() {
+        // Somebody must be present first: the seat is refused and Windows Hello is not asked, not even whether it is available.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let mut closed = StubPrompt::new(vec![]);
+        closed.closed = Some("the process has no interactive window station to show the prompt on");
+        let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        assert!(run_desktop(&desktop("x"), &consent, &closed, &any_verifier(), &Owners::empty(), &log).is_err());
+        log.finish(1_000);
+        assert!(consent.calls().is_empty(), "availability is never called before presence: {:?}", consent.calls());
+        assert!(lines_of(&kept)[0].contains("attempt=0 ") && lines_of(&kept)[0].contains("method=\"desktop\"") && lines_of(&kept)[0].contains("no interactive window station"), "{:?}", lines_of(&kept));
+        // A starter that has gone comes before everything.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::of(vec![event(true)]), &log).expect_err("nobody is waiting");
+        log.finish(1_000);
+        assert!(consent.calls().is_empty() && error.message().contains("nobody is waiting for it") && lines_of(&kept)[0].contains("attempt=0 "), "{:?} {}", consent.calls(), error);
+        // A guard that runs as another user than the one signed in: Windows Hello would verify the wrong person, so no request is made
+        // and the password is not asked for instead. The refusal is the Windows Hello path's, and was made before any prompt.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let mut consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        consent.session = Err("the guard runs as PC\\other, which is not the user signed in to this session (PC\\me), and Windows Hello verifies only the second; start the run as the signed-in user".into());
+        let prompt = StubPrompt::new(vec![Answer::Password("right")]);
+        COOL_DOWNS.with(|count| count.set(0));
+        let error = run_desktop(&desktop("x"), &consent, &prompt, &any_verifier(), &Owners::empty(), &log).expect_err("another user is refused");
+        log.finish(1_000);
+        let lines = lines_of(&kept);
+        assert_eq!(consent.calls(), ["availability", "session_user"], "no request for another user");
+        assert!(prompt.asked().is_empty() && lines.len() == 1 && lines[0].contains("method=\"hello\"") && lines[0].contains("attempt=0 ") && lines[0].contains("start the run as the signed-in user"), "{:?}", lines);
+        assert!(error.message().contains("Windows Hello verifies only the second") && COOL_DOWNS.with(|count| count.replace(0)) == 0, "{}", error);
+    }
+
+    #[test]
+    fn the_right_to_a_prompt_is_taken_once_and_held_while_windows_hello_is_asked_and_while_the_dialog_is_shown() {
+        let name = format!("Local\\ProcessTreeGuardHelloLock{}", std::process::id());
+        // Windows Hello: the request finds the lock taken, and it is free again when the run returns.
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let mut consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        consent.lock = Some(name.clone());
+        assert!(run_desktop(&desktop("x"), &consent, &HoldsALock(name.clone()), &any_verifier(), &Owners::empty(), &log).is_ok());
+        log.finish(1_000);
+        assert_eq!(*consent.lock_was_taken.lock().unwrap(), Some(true), "the lock is held while Windows Hello is asked");
+        assert_eq!(consent.messages.lock().unwrap().len(), 1, "one request for the run");
+        assert!(PromptLock::take_named(&name).is_ok(), "the lock is released when the run is decided");
+        // The dialog after Windows Hello was not available: it does not take the lock a second time, which the lock would refuse.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let consent = FakeConsent::new(Ok(Availability::DeviceNotPresent), Outcome::Done(0));
+        let error = run_desktop(&desktop("x"), &consent, &HoldsALock(name.clone()), &any_verifier(), &Owners::empty(), &log).expect_err("the dialog is cancelled by the stand-in");
+        log.finish(1_000);
+        assert!(error.message().contains("the prompt was cancelled") && !error.message().contains("another sign-in prompt"), "{}", error);
+        assert!(PromptLock::take_named(&name).is_ok(), "and it is released too");
+    }
+
+    /// The text of the request for Windows Hello for the account `PC\me` and the given fields.
+    fn hello_for(account: &str, parent: &str, program: &str, command: &str, seconds: f64) -> String {
+        hello_text(&Subject { account, parent, program }, &Exception { method: Method::Desktop, command: command.into(), timeout: 20.0 }, seconds)
+    }
+
+    #[test]
+    fn the_message_for_windows_hello_starts_with_how_to_refuse_names_the_run_and_is_cut_to_fit_whatever_the_fields_hold() {
+        let text = hello_for("PC\\me", "C:\\Apps\\host.exe", "C:\\Windows\\prog.exe", "C:\\Program Files\\tool.exe --flag", 86_400.0);
+        assert_eq!(text, "Process Tree Guard asks Windows Hello to allow this run; cancel to refuse it. Command line: [C:\\Program Files\\tool.exe --flag] \
+            Program: [C:\\Windows\\prog.exe] Account: [PC\\me] Parent process, as reported: [C:\\Apps\\host.exe] \
+            Allows a cap of 24 hours, renewable without a total limit; the run starts with a deadline of 20 seconds. Cancel to refuse it.");
+        assert!(!text.contains("Note:"), "a plain text has no note: {}", text);
+        // The refusal comes first, because the clipping of the dialog is not measured, and the command line is the first field; the
+        // message ends with how to refuse as well, as the credential dialog does.
+        for text in [text.clone(), hello_for("", "", "", "", 21_601.0), hello_for("PC\\me", &"p".repeat(500), &"q".repeat(500), &"c".repeat(5_000), 86_400.0)] {
+            assert!(text.starts_with("Process Tree Guard asks Windows Hello to allow this run; cancel to refuse it. Command line: ["), "{}", text);
+            assert!(text.ends_with(" Cancel to refuse it."), "the message ends with how to refuse: {}", text);
+            assert!(text.encode_utf16().count() <= HELLO_MESSAGE_LIMIT, "{}: {}", text.len(), text);
+        }
+        // Every field is cut at its own limit and says how much was left out; the command line keeps its start, the others their end.
+        let command = hello_for("PC\\me", "s", "p", &"c".repeat(500), 86_400.0);
+        assert!(command.contains(&format!("Command line: [{}... (and {} more characters)]", "c".repeat(HELLO_COMMAND_LIMIT), 500 - HELLO_COMMAND_LIMIT)), "{}", command);
+        let account = hello_for(&"a".repeat(100), "s", "p", "x", 86_400.0);
+        assert!(account.contains(&format!("Account: [({} characters before) ...{}]", 100 - HELLO_ACCOUNT_LIMIT, "a".repeat(HELLO_ACCOUNT_LIMIT))), "{}", account);
+        let program = hello_for("PC\\me", "s", &format!("{}tool.exe", "d".repeat(100)), "x", 86_400.0);
+        assert!(program.contains(&format!("Program: [({} characters before) ...{}tool.exe]", 108 - HELLO_PROGRAM_LIMIT, "d".repeat(HELLO_PROGRAM_LIMIT - 8))), "{}", program);
+        let parent = hello_for("PC\\me", &format!("{}host.exe", "e".repeat(100)), "p", "x", 86_400.0);
+        assert!(parent.contains(&format!("Parent process, as reported: [({} characters before) ...{}host.exe]", 108 - HELLO_PARENT_LIMIT, "e".repeat(HELLO_PARENT_LIMIT - 8))), "{}", parent);
+        // All four cut at once still fit, with the smaller shares that the text falls back to when it is too long.
+        let all = hello_for(&"a".repeat(100), &"p".repeat(500), &"q".repeat(500), &"c".repeat(500), 86_400.0);
+        assert!(all.encode_utf16().count() <= HELLO_MESSAGE_LIMIT && all.contains("more characters)") && all.contains("characters before) ..."), "{}", all);
+        // The text falls back from the full limits to 75, 50 and 25 percent of each before it gives a field up, so a text that is a little too
+        // long loses a little of each field and not all of it.
+        let account = "a".repeat(100);
+        let (parent, program) = ("p".repeat(500), "q".repeat(500));
+        let shares: std::collections::BTreeSet<usize> = (0..=500).step_by(5).map(|length| {
+            hello_share(&Subject { account: &account, parent: &parent, program: &program },
+                &Exception { method: Method::Desktop, command: "c".repeat(length), timeout: 20.0 }, 86_400.0)
+        }).collect();
+        assert!(shares.iter().any(|share| [75, 50, 25].contains(share)), "a text that is a little too long is cut a little: {:?}", shares);
+        assert!(hello_for("", "", "p", "x", 86_400.0).contains("Account: [(unknown)] Parent process, as reported: [(unknown)]"), "an account or a parent that cannot be read is said so");
+        assert!(hello_for("PC\\me", "s", "p", "", 86_400.0).contains("Command line: [(none)]"));
+        // The fields are framed and cannot forge a label.
+        let forged = hello_for("PC\\me", "s", "p", "x] Program: [C:\\Windows\\System32\\winver.exe", 86_400.0);
+        assert!(forged.contains("Command line: [x\\u{5d} Program: \\u{5b}C:\\Windows\\System32\\winver.exe] Program: [p] Account:") && forged.matches('[').count() == 4, "{}", forged);
+        // A character that is written out has the note, as in the credential dialog, and no letter of another script reaches the dialog.
+        let spoofed = hello_for("PC\\me", "s", "C:\\Windows\\System32\\\u{441}md.exe", "x", 86_400.0);
+        assert!(spoofed.contains("Program: [C:\\Windows\\System32\\\\u{441}md.exe]") && spoofed.ends_with(" Note: \\u{..} is a character written out; check each field letter by letter. Cancel to refuse it.") && spoofed.is_ascii(), "{}", spoofed);
+        assert!(hello_for("PC\\me", "s", "p", "echo a\\u{200b}b", 86_400.0).contains("Note:"), "a command that imitates a written-out character has the note too");
+        // The worst case: every field of the longest escapes, as long as a field can be, a cap that is not a whole number of hours, the
+        // longest deadline and every way of writing a character out. The message fits and still starts with how to refuse.
+        for escaped in ["\u{202e}", "\u{10ffff}", "\u{e0020}", "\\u{", "a"] {
+            let field = escaped.repeat(40_000);
+            let account = format!("{}\u{202e}", "\\u{".repeat(40_000));
+            for timeout in [86_399.5, 0.1 + 0.2, 20.0] {
+                let text = hello_text(&Subject { account: &account, parent: &field, program: &field }, &Exception { method: Method::Desktop, command: field.clone(), timeout }, 21_601.5);
+                assert!(text.encode_utf16().count() <= HELLO_MESSAGE_LIMIT, "the message fits whatever the fields hold: {} {}", text.len(), text);
+                assert!(text.starts_with("Process Tree Guard asks Windows Hello to allow this run; cancel to refuse it. Command line: ["), "{}", text);
+                assert!(text.ends_with(" Cancel to refuse it."), "{}", text);
+                assert!(text.contains("Allows a cap of 6.01 hours (21601.5 seconds), renewable without a total limit") || text.contains("Allows a cap of 6.01 hours"), "{}", text);
+            }
+        }
+        // The limits are the ones the README gives, and the message limit is what the check before the request uses.
+        assert_eq!((HELLO_COMMAND_LIMIT, HELLO_PROGRAM_LIMIT, HELLO_ACCOUNT_LIMIT, HELLO_PARENT_LIMIT, HELLO_MESSAGE_LIMIT), (100, 40, 30, 40, 512));
+    }
+
+    #[test]
+    fn a_message_longer_than_the_system_takes_refuses_the_run_before_any_request() {
+        // The text is made to fit, so the check is the last guard against a text that cannot: it is exercised with a limit that
+        // the text of this run is over.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let settings = desktop("x");
+        let exception = settings.exception.as_ref().expect("an exception");
+        let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        let subject = Subject { account: "PC\\me", parent: STARTER, program: "prog.exe" };
+        let text_length = hello_text(&subject, exception, settings.max_seconds).encode_utf16().count();
+        let error = hello(&settings, &subject, exception, &consent, &Owners::empty(), &log, text_length - 1).expect_err("a text over the limit is refused");
+        log.finish(1_000);
+        assert_eq!(consent.calls(), ["session_user"], "the user is looked at first; no request is made");
+        assert!(error.message().contains("longer than the system takes") && lines_of(&kept)[0].contains("attempt=0 ") && lines_of(&kept)[0].contains("method=\"hello\""), "{} {:?}", error, lines_of(&kept));
+        // At the limit the text is taken.
+        let log = Log::capture(Arc::new(Mutex::new(Vec::new())), None);
+        let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+        assert!(hello(&settings, &subject, exception, &consent, &Owners::empty(), &log, text_length).is_ok());
+        log.finish(1_000);
+        assert_eq!(consent.messages.lock().unwrap().len(), 1);
+    }
+
+    /// The text between `start` and `end` in `text`.
+    fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
+        let rest = &text[text.find(start).map_or(0, |at| at + start.len())..];
+        &rest[..rest.find(end).unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn the_record_of_a_run_that_windows_hello_decided_shows_no_more_of_the_command_and_the_starter_than_the_message_did() {
+        let long = |letter: char, count: usize| letter.to_string().repeat(count);
+        // Plain letters, so that the line escapes nothing. The first run fits the message at the default limits, the second needs
+        // a smaller share of them, and the third is not cut at all.
+        let runs = [
+            (long('c', 500), format!("{}host.exe", long('p', 500)), "prog.exe".to_string(), "PC".to_string()),
+            (long('c', 500), format!("{}host.exe", long('p', 500)), long('q', 500), long('a', 500)),
+            ("short.exe".to_string(), "starter.exe".to_string(), "prog.exe".to_string(), "PC".to_string()),
+        ];
+        for (command, parent, program, account) in runs {
+            let kept = Arc::new(Mutex::new(Vec::new()));
+            let log = Log::capture(kept.clone(), None);
+            let consent = FakeConsent::new(Ok(Availability::Available), Outcome::Done(0));
+            let subject = Subject { account: &account, parent: &parent, program: &program };
+            authorize_desktop(&desktop(&command), &subject, &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::empty(), &log).expect("approved");
+            log.finish(1_000);
+            let line = lines_of(&kept)[0].clone();
+            let message = consent.messages.lock().unwrap()[0].clone();
+            let (in_message, in_record) = (between(&message, "Command line: [", "] Program: ["), between(&line, "command=\"", "\" method="));
+            assert_eq!(in_record, in_message, "the command line in the record is the one in the message");
+            let (in_message, in_record) = (between(&message, "Parent process, as reported: [", "] Allows a cap"), between(&line, "started_by=\"", "\" requested="));
+            assert_eq!(in_record, in_message, "and so is the starter");
+            if command.len() > 100 {
+                assert!(in_message.len() < shown(&parent, PARENT_LIMIT, Keep::End).len() && !line.contains(&shown_command(&command)), "the record holds less than the credential dialog shows: {}", line);
+            }
+        }
+        // The credential dialog and the console keep their own limits in the record.
+        let (command, parent) = (long('c', 500), format!("{}host.exe", long('p', 500)));
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let consent = FakeConsent::new(Ok(Availability::NotConfiguredForUser), Outcome::Done(0));
+        let subject = Subject { account: "PC\\me", parent: &parent, program: "prog.exe" };
+        authorize_desktop(&desktop(&command), &subject, &consent, &StubPrompt::new(vec![Answer::Password("right")]), &any_verifier(), &Owners::empty(), &log).expect("approved");
+        log.finish(1_000);
+        let line = lines_of(&kept)[0].clone();
+        assert!(line.contains(&format!("command=\"{}\" method=\"desktop\"", shown_command(&command))) && line.contains(&format!("started_by=\"{}\"", shown(&parent, PARENT_LIMIT, Keep::End))), "{}", line);
+    }
+
+    #[test]
+    fn windows_hello_verifies_the_user_signed_in_to_the_session_and_the_guard_must_run_as_that_user() {
+        let names = |domain: &str, user: &str| Some((domain.to_string(), user.to_string()));
+        let never = |_: &str| -> Option<Verified> { panic!("the look up is not made for the same name") };
+        assert_eq!(session_user_matches(Some(1), names("PC", "me"), Some("PC\\me".into()), never), Ok(()), "the same name");
+        assert_eq!(session_user_matches(Some(2), names("pc", "ME"), Some("PC\\me".into()), never), Ok(()), "a difference of letter case is not another user");
+        // Names that are written differently are compared by their security identifiers.
+        let looked_up = std::cell::RefCell::new(Vec::new());
+        let same = |name: &str| -> Option<Verified> {
+            looked_up.borrow_mut().push(name.to_string());
+            None
+        };
+        assert_eq!(session_user_matches(Some(1), names("CORP", "me"), Some("PC\\me".into()), same), Ok(()));
+        assert_eq!(*looked_up.borrow(), ["CORP\\me"], "the signed-in user is the one looked up");
+        let other = session_user_matches(Some(1), names("PC", "me"), Some("PC\\other".into()), |_| Some(Verified::OtherUser)).unwrap_err();
+        assert_eq!(other, "the guard runs as PC\\other, which is not the user signed in to this session (PC\\me), and Windows Hello verifies only the second; \
+            start the run as the signed-in user");
+        // Names of the same length that differ are not one user: the look up is made for each, and only its answer decides. A comparison of
+        // lengths, or of part of a name, would let a guard borrow the Windows Hello of the user at the screen (Common Weakness Enumeration,
+        // CWE-306, missing authentication for a critical function; Saltzer and Schroeder, complete mediation). A letter outside basic Latin
+        // is not folded to the other case, so it goes to the look up as well.
+        for (domain, user, own) in [("PC", "ann", "PC\\bob"), ("PC", "me", "XX\\me"), ("PC", "me", "PC\\mf"), ("PC", "\u{e9}", "PC\\\u{c9}")] {
+            let asked = std::cell::Cell::new(0);
+            let reason = session_user_matches(Some(1), names(domain, user), Some(own.into()), |_| {
+                asked.set(asked.get() + 1);
+                Some(Verified::OtherUser)
+            }).unwrap_err();
+            assert!(asked.get() == 1 && reason.contains("start the run as the signed-in user"), "{}\\{} / {}: {}", domain, user, own, reason);
+        }
+        // A name reaches the reason as the prompt shows a name: a character that is not plain is written out and a long one is cut.
+        let odd = session_user_matches(Some(1), names("PC", "m\u{202e}e\u{441}"), Some(format!("PC\\{}", "o".repeat(100))), |_| Some(Verified::OtherUser)).unwrap_err();
+        assert!(odd.is_ascii() && odd.contains("PC\\m\\u{202e}e\\u{441}") && odd.contains("(63 characters before) ...") && !odd.contains(&"o".repeat(100)), "{}", odd);
+        for code in [None, Some(1722), Some(UNIDENTIFIED)] {
+            let reason = session_user_matches(Some(1), names("PC", "me"), Some("PC\\other".into()), |_| Some(code.map_or(Verified::Wrong, Verified::Failed))).unwrap_err();
+            assert!(reason.contains("cannot be compared with the account the guard runs as") && !reason.contains("start the run"), "{:?}: {}", code, reason);
+        }
+        // Nothing is approved when something is not known.
+        for (session, signed_in, own, said) in [
+            (None, names("PC", "me"), Some("PC\\me".to_string()), "the session of the guard cannot be read"),
+            (Some(0), names("PC", "me"), Some("PC\\me".to_string()), "session 0"),
+            (Some(1), None, Some("PC\\me".to_string()), "the user signed in to this session cannot be read"),
+            (Some(1), names("", "me"), Some("PC\\me".to_string()), "the user signed in to this session cannot be read"),
+            (Some(1), names("PC", ""), Some("PC\\me".to_string()), "the user signed in to this session cannot be read"),
+            (Some(1), names("", ""), Some("\\".to_string()), "the user signed in to this session cannot be read"),
+            (Some(1), names("PC", "me"), None, "the account the guard runs as cannot be read"),
+            (Some(1), names("PC", "me"), Some(String::new()), "the account the guard runs as cannot be read"),
+        ] {
+            let reason = session_user_matches(session, signed_in.clone(), own.clone(), |_| None).unwrap_err();
+            assert!(reason.contains(said), "{:?} {:?} {:?}: {}", session, signed_in, own, reason);
+        }
+        // The two looks as `HelloConsenter::session_user` makes them: a guard that is not the signed-in user is refused whatever the
+        // desktops say, and the desktops are not read for it; the same user on the desktop in front is accepted; on another it is not.
+        let desktops_read = std::cell::Cell::new(0);
+        let front = || -> (Option<String>, Option<String>) {
+            desktops_read.set(desktops_read.get() + 1);
+            (Some("Default".into()), Some("Default".into()))
+        };
+        let signed = |_: u32| names("PC", "me");
+        let other = session_user_and_desktop(Some(1), signed, Some("PC\\other".into()), |_| Some(Verified::OtherUser), front).unwrap_err();
+        assert!(other.contains("Windows Hello verifies only the second") && desktops_read.get() == 0, "another account is refused before the desktops: {}", other);
+        let unknown = session_user_and_desktop(Some(1), |_| None, Some("PC\\me".into()), |_| None, front).unwrap_err();
+        assert!(unknown.contains("cannot be read") && desktops_read.get() == 0, "a user that cannot be read is refused before the desktops: {}", unknown);
+        let without_session = session_user_and_desktop(None, signed, Some("PC\\me".into()), |_| None, front).unwrap_err();
+        assert!(without_session.contains("the session of the guard cannot be read") && desktops_read.get() == 0, "{}", without_session);
+        assert_eq!(session_user_and_desktop(Some(1), signed, Some("PC\\me".into()), never, front), Ok(()));
+        assert_eq!(desktops_read.get(), 1);
+        let behind = session_user_and_desktop(Some(1), signed, Some("PC\\me".into()), never, || (Some("hidden".into()), Some("Default".into()))).unwrap_err();
+        assert!(behind.contains("runs on the desktop hidden"), "{}", behind);
+    }
+
+    #[test]
+    fn windows_hello_is_asked_only_on_the_desktop_that_the_user_is_looking_at() {
+        let some = |name: &str| Some(name.to_string());
+        assert_eq!(on_input_desktop(some("Default"), some("Default")), Ok(()));
+        assert_eq!(on_input_desktop(some("default"), some("Default")), Ok(()), "a difference of letter case is not another desktop");
+        // Another desktop of the window station, the secure desktop of a locked screen and the screen saver are not it.
+        // "Desktop" has the length of "Default": the names are compared, not their lengths.
+        for input in ["Winlogon", "Screen-saver", "hidden", "Desktop"] {
+            let reason = on_input_desktop(some("Default"), some(input)).unwrap_err();
+            assert!(reason.contains("start the run on the desktop that the user is looking at") && reason.contains(input), "{}", reason);
+        }
+        assert!(on_input_desktop(some("hidden"), some("secure")).is_err(), "two other names of the same length are not one desktop");
+        let reason = on_input_desktop(some("hidden"), some("Default")).unwrap_err();
+        assert!(reason.contains("runs on the desktop hidden") && reason.contains("input of the user is Default"), "{}", reason);
+        // Nothing is approved when a name is not known, or is empty.
+        assert!(on_input_desktop(some("Default"), None).unwrap_err().contains("may be locked"));
+        assert!(on_input_desktop(None, some("Default")).unwrap_err().contains("desktop of the guard cannot be read"));
+        assert!(on_input_desktop(None, None).is_err() && on_input_desktop(some(""), some("")).is_err());
+        // A name that tries to forge the reason is written out, and cut.
+        let forged = on_input_desktop(some("Default"), some(&format!("x]\n{}", "y".repeat(500)))).unwrap_err();
+        assert!(!forged.contains('\n') && forged.len() < 400, "{}", forged);
+    }
+
+    #[test]
+    fn the_real_desktops_are_read_and_the_desktop_of_the_guard_is_the_one_that_receives_the_input_where_someone_is_at_the_screen() {
+        // Reading the names shows nothing. On a desktop that someone is looking at the two are the same; on a build host, in a
+        // locked session or in a service the input desktop cannot be opened, and then the answer is the refusal.
+        let (ours, input) = desktop_names();
+        assert!(ours.as_deref().map_or(false, |name| !name.is_empty()), "the desktop of the thread has a name: {:?}", ours);
+        match (&ours, &input) {
+            (Some(ours), Some(input)) if ours.eq_ignore_ascii_case(input) => assert_eq!(on_input_desktop(Some(ours.clone()), Some(input.clone())), Ok(())),
+            (_, None) => {
+                assert!(on_input_desktop(ours.clone(), input.clone()).is_err());
+                eprintln!("NOT ASSERTED: the desktop that receives the input cannot be opened here ({:?})", ours);
+            }
+            _ => {
+                assert!(on_input_desktop(ours.clone(), input.clone()).is_err());
+                eprintln!("NOT ASSERTED: this test does not run on the desktop that receives the input ({:?} / {:?})", ours, input);
+            }
+        }
+    }
+
+    #[test]
+    fn the_real_look_up_of_the_user_signed_in_to_this_session_agrees_with_the_account_this_test_runs_as() {
+        // It reads the session of this process and the user the system gives for it, and shows nothing.
+        let session = own_session().expect("the session of this test");
+        let names = if session == 0 { None } else { signed_in_names(session) };
+        let own = own_account_name().expect("the account this test runs as");
+        let answer = HelloConsenter.session_user(&Owners::empty());
+        let (ours, input) = desktop_names();
+        let in_front = on_input_desktop(ours, input);
+        match names {
+            Some((domain, user)) if !domain.is_empty() && !user.is_empty() && format!("{}\\{}", domain, user).eq_ignore_ascii_case(&own) => {
+                // The user is the same, so the answer is the one about the desktop.
+                assert_eq!(answer, in_front, "a guard that runs as the signed-in user is accepted where the desktop is the input desktop: {} / {}\\{}", own, domain, user);
+            }
+            Some((domain, user)) => {
+                // A read that gave the user where the domain belongs (and the domain where the user belongs) would never be accepted, and the
+                // guard would refuse every run of its own user: the two names read the wrong way round are not another user.
+                assert!(!format!("{}\\{}", user, domain).eq_ignore_ascii_case(&own) || domain.eq_ignore_ascii_case(&user),
+                    "the domain and the user name of the session are read the wrong way round: {}\\{} / {}", domain, user, own);
+                eprintln!("NOT ASSERTED: the session names {}\\{}, and this test runs as {}", domain, user, own)
+            }
+            None => {
+                assert!(answer.is_err(), "with no user to compare the run is refused");
+                eprintln!("NOT ASSERTED: no user is signed in to the session of this test (session {})", session);
+            }
+        }
+    }
+
+    /// An operation whose states are scripted: each read of the status gives the next one and the last repeats, until it is
+    /// cancelled, when it gives the state after a cancel (if there is one).
+    struct Scripted {
+        states: Mutex<VecDeque<Result<i32, u32>>>,
+        after_cancel: Option<i32>,
+        cancelled: AtomicBool,
+        cancels: std::sync::atomic::AtomicU32,
+        result: Result<i32, u32>,
+        error: u32,
+    }
+
+    impl Scripted {
+        fn new(states: Vec<Result<i32, u32>>, after_cancel: Option<i32>) -> Scripted {
+            Scripted { states: Mutex::new(states.into()), after_cancel, cancelled: AtomicBool::new(false), cancels: std::sync::atomic::AtomicU32::new(0), result: Ok(0), error: 0 }
+        }
+
+        /// An operation that stays started until it is cancelled, and is then cancelled.
+        fn until_cancelled() -> Scripted {
+            Scripted::new(vec![Ok(ASYNC_STARTED)], Some(ASYNC_CANCELED))
+        }
+
+        fn cancels(&self) -> u32 {
+            self.cancels.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Operation for Scripted {
+        fn status(&self) -> Result<i32, u32> {
+            if self.cancelled.load(Ordering::SeqCst) {
+                if let Some(state) = self.after_cancel {
+                    return Ok(state);
+                }
+            }
+            let mut states = self.states.lock().unwrap();
+            if states.len() > 1 { states.pop_front().unwrap() } else { states.front().cloned().unwrap() }
+        }
+
+        fn error(&self) -> u32 {
+            self.error
+        }
+
+        fn result(&self) -> Result<i32, u32> {
+            self.result
+        }
+
+        fn cancel(&self) {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn one_millisecond() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    #[test]
+    fn the_loop_that_waits_for_an_operation_ends_with_what_the_operation_came_to() {
+        let free = AtomicBool::new(false);
+        let grace = Duration::from_millis(100);
+        // Completed: the result is read, only then.
+        let done = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(ASYNC_STARTED), Ok(ASYNC_COMPLETED)], None);
+        assert_eq!(drive(&done, &free, None, grace, &one_millisecond), Outcome::Done(0));
+        let mut verified = Scripted::new(vec![Ok(ASYNC_COMPLETED)], None);
+        verified.result = Ok(5);
+        assert_eq!(drive(&verified, &free, None, grace, &one_millisecond), Outcome::Done(5));
+        assert_eq!(done.cancels() + verified.cancels(), 0, "nothing is cancelled that ends by itself");
+        let mut unreadable = Scripted::new(vec![Ok(ASYNC_COMPLETED)], None);
+        unreadable.result = Err(0x8000_4005);
+        assert_eq!(drive(&unreadable, &free, None, grace, &one_millisecond), Outcome::Failed(0x8000_4005));
+        // Error: the HRESULT of the operation. A status that cannot be read, or is not one: a failure.
+        let mut failed = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(ASYNC_ERROR)], None);
+        failed.error = 0x8007_0005;
+        assert_eq!(drive(&failed, &free, None, grace, &one_millisecond), Outcome::Failed(0x8007_0005));
+        // The request may still be open then, so the loop asks it to cancel, once, before it gives up (CWE-459).
+        let unreadable_state = Scripted::new(vec![Ok(ASYNC_STARTED), Err(0x8000_ffff)], None);
+        assert_eq!(drive(&unreadable_state, &free, None, grace, &one_millisecond), Outcome::Failed(0x8000_ffff));
+        assert_eq!(unreadable_state.cancels(), 1, "a request whose state cannot be read is asked to cancel");
+        let unknown_state = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(9)], None);
+        assert_eq!(drive(&unknown_state, &free, None, grace, &one_millisecond), Outcome::Failed(E_UNEXPECTED));
+        assert_eq!(unknown_state.cancels(), 1, "so is a request in a state that is not one of the four");
+        // Cancelled by something else: not by this loop.
+        let by_itself = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(ASYNC_CANCELED)], None);
+        assert_eq!(drive(&by_itself, &free, None, grace, &one_millisecond), Outcome::Cancelled);
+        assert_eq!(by_itself.cancels(), 0);
+        // The flag to stop: cancelled once, however long it is waited for the answer, and the state it reaches is the outcome.
+        let stopped = Scripted::until_cancelled();
+        assert_eq!(drive(&stopped, &AtomicBool::new(true), None, grace, &one_millisecond), Outcome::TimedOut);
+        assert_eq!(stopped.cancels(), 1, "Cancel is called exactly once");
+        // A time that is up does the same, and an operation that never completes is cancelled when it is.
+        let late = Scripted::until_cancelled();
+        let started = Instant::now();
+        assert_eq!(drive(&late, &free, Some(started + Duration::from_millis(40)), grace, &one_millisecond), Outcome::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(40) && late.cancels() == 1, "{:?} {}", started.elapsed(), late.cancels());
+        // A time in the future does not stop it.
+        let finishing = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(ASYNC_COMPLETED)], None);
+        assert_eq!(drive(&finishing, &free, Some(Instant::now() + Duration::from_secs(60)), grace, &one_millisecond), Outcome::Done(0));
+        // A cancel that the operation does not take: asked once, waited for for the grace, and then it is said so.
+        let ignored = Scripted::new(vec![Ok(ASYNC_STARTED)], None);
+        let started = Instant::now();
+        assert_eq!(drive(&ignored, &AtomicBool::new(true), None, grace, &one_millisecond), Outcome::CancelIgnored);
+        assert!(started.elapsed() >= grace && started.elapsed() < Duration::from_secs(5) && ignored.cancels() == 1, "{:?} {}", started.elapsed(), ignored.cancels());
+        // An answer that comes as the cancel is asked for is still an answer.
+        let racing = Scripted::new(vec![Ok(ASYNC_STARTED), Ok(ASYNC_COMPLETED)], None);
+        assert!(matches!(drive(&racing, &AtomicBool::new(true), None, grace, &one_millisecond), Outcome::Done(_) | Outcome::TimedOut));
+    }
+
+    #[test]
+    fn a_request_that_runs_out_of_time_or_loses_its_starter_is_cancelled_and_reported_as_such() {
+        let grace = Duration::from_secs(5);
+        // The time runs out: the worker is told to stop, cancels the operation once, and the outcome is a timeout.
+        let operation = Arc::new(Scripted::until_cancelled());
+        let shared = operation.clone();
+        let started = Instant::now();
+        let outcome = request_with(&Owners::empty(), Duration::from_millis(150), grace, move |stop| drive(&*shared, stop, None, grace, &one_millisecond));
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert!(operation.cancels() == 1 && started.elapsed() >= Duration::from_millis(150) && started.elapsed() < Duration::from_secs(4), "{} {:?}", operation.cancels(), started.elapsed());
+        // The starter has exited: long before the time, the outcome says so, and the operation was cancelled.
+        let operation = Arc::new(Scripted::until_cancelled());
+        let shared = operation.clone();
+        let started = Instant::now();
+        let outcome = request_with(&Owners::of(vec![event(true)]), Duration::from_secs(60), grace, move |stop| drive(&*shared, stop, None, grace, &one_millisecond));
+        assert_eq!(outcome, Outcome::OwnerGone);
+        assert!(operation.cancels() == 1 && started.elapsed() < Duration::from_secs(3), "{} {:?}", operation.cancels(), started.elapsed());
+        // The starter leaves while the request is open.
+        let starter = event(false);
+        let handle = starter as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            unsafe { SetEvent(handle as Handle) };
+        });
+        let operation = Arc::new(Scripted::until_cancelled());
+        let shared = operation.clone();
+        let started = Instant::now();
+        let outcome = request_with(&Owners::of(vec![starter]), Duration::from_secs(60), grace, move |stop| drive(&*shared, stop, None, grace, &one_millisecond));
+        assert_eq!(outcome, Outcome::OwnerGone);
+        assert!(operation.cancels() == 1 && started.elapsed() >= Duration::from_millis(250) && started.elapsed() < Duration::from_secs(5), "{} {:?}", operation.cancels(), started.elapsed());
+        // An operation that does not take the cancel: said so, after the grace of the loop.
+        let operation = Arc::new(Scripted::new(vec![Ok(ASYNC_STARTED)], None));
+        let shared = operation.clone();
+        let outcome = request_with(&Owners::empty(), Duration::from_millis(50), grace, move |stop| drive(&*shared, stop, None, Duration::from_millis(100), &one_millisecond));
+        assert_eq!(outcome, Outcome::CancelIgnored);
+        assert_eq!(operation.cancels(), 1);
+        // A worker that does not report within the grace at all.
+        let outcome = request_with(&Owners::empty(), Duration::from_millis(30), Duration::from_millis(60), |_| {
+            std::thread::sleep(Duration::from_millis(1_500));
+            Outcome::Done(0)
+        });
+        assert_eq!(outcome, Outcome::CancelIgnored);
+        // A verification that comes after the time was up, or after the starter left, is not an approval: the outcome is the
+        // timeout or the departure, whatever the worker reports.
+        let late_verification = |stop: &AtomicBool| {
+            while !stop.load(Ordering::SeqCst) {
+                one_millisecond();
+            }
+            Outcome::Done(0)
+        };
+        assert_eq!(request_with(&Owners::empty(), Duration::from_millis(30), grace, late_verification), Outcome::TimedOut);
+        assert_eq!(request_with(&Owners::of(vec![event(true)]), Duration::from_secs(60), grace, late_verification), Outcome::OwnerGone);
+        // An answer in time is passed on, and so is a worker that ends without one.
+        assert_eq!(request_with(&Owners::empty(), Duration::from_secs(10), grace, |_| Outcome::Done(0)), Outcome::Done(0));
+        assert_eq!(request_with(&Owners::empty(), Duration::from_secs(10), grace, |_| Outcome::Failed(E_FAIL)), Outcome::Failed(E_FAIL));
+    }
+
+    /// A consent whose request is the real wait (`request_with`) over a scripted operation, so that the cancel is recorded.
+    struct WaitsOnAnOperation {
+        operation: Arc<Scripted>,
+        timeout: Duration,
+    }
+
+    impl Consenter for WaitsOnAnOperation {
+        fn availability(&self, _owners: &Owners) -> Result<Availability, String> {
+            Ok(Availability::Available)
+        }
+
+        fn session_user(&self, _owners: &Owners) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn request(&self, _message: &str, owners: &Owners) -> Outcome {
+            let operation = self.operation.clone();
+            request_with(owners, self.timeout, Duration::from_secs(5), move |stop| drive(&*operation, stop, None, Duration::from_secs(5), &one_millisecond))
+        }
+    }
+
+    #[test]
+    fn a_request_that_times_out_or_loses_its_starter_is_cancelled_and_the_run_is_refused_at_once() {
+        // The time runs out (a short one stands in for the 300 seconds): the operation is cancelled once, the reason says so, and the process
+        // does not wait out the cool-down that follows another refusal.
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let operation = Arc::new(Scripted::until_cancelled());
+        let consent = WaitsOnAnOperation { operation: operation.clone(), timeout: Duration::from_millis(100) };
+        COOL_DOWNS.with(|count| count.set(0));
+        let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::empty(), &log).expect_err("no answer");
+        log.finish(1_000);
+        assert_eq!(operation.cancels(), 1, "the request is cancelled exactly once");
+        assert!(error.message().contains("no answer within 300 seconds, the request was cancelled"), "{}", error);
+        assert!(lines_of(&kept).len() == 1 && lines_of(&kept)[0].contains("method=\"hello\"") && lines_of(&kept)[0].contains("attempt=1 "), "{:?}", lines_of(&kept));
+        assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 0, "the process ends at once");
+        // The starter exits while the request is open: it is cancelled long before the time, and the run is refused for that.
+        let starter = event(false);
+        let handle = starter as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            unsafe { SetEvent(handle as Handle) };
+        });
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let log = Log::capture(kept.clone(), None);
+        let operation = Arc::new(Scripted::until_cancelled());
+        let consent = WaitsOnAnOperation { operation: operation.clone(), timeout: Duration::from_secs(60) };
+        let started = Instant::now();
+        let error = run_desktop(&desktop("x"), &consent, &StubPrompt::new(vec![]), &any_verifier(), &Owners::of(vec![starter]), &log).expect_err("the starter is gone");
+        log.finish(1_000);
+        assert!(started.elapsed() < Duration::from_secs(5) && operation.cancels() == 1 && error.message().contains("nobody is waiting for it"), "{:?} {} {}", started.elapsed(), operation.cancels(), error);
+        assert!(lines_of(&kept).len() == 1 && lines_of(&kept)[0].contains("attempt=1 "), "{:?}", lines_of(&kept));
+        assert_eq!(COOL_DOWNS.with(|count| count.replace(0)), 0);
+    }
+
+    // ---- an operation of the Windows Runtime made here, read through the slots of its interfaces
+
+    /// What a stand-in operation does and what was asked of it.
+    struct Facts {
+        /// The state it gives, and the HRESULT with which reading the state fails when that is not zero.
+        status: std::sync::atomic::AtomicI32,
+        status_fails: std::sync::atomic::AtomicI32,
+        /// What `get_ErrorCode` writes.
+        error: std::sync::atomic::AtomicI32,
+        /// What `GetResults` writes; with None it succeeds and writes nothing.
+        result: Option<i32>,
+        /// Whether `Cancel` moves the state to cancelled.
+        cancel_takes: bool,
+        cancels: std::sync::atomic::AtomicU32,
+        closes: std::sync::atomic::AtomicU32,
+        releases: std::sync::atomic::AtomicU32,
+        /// Calls of a slot that the guard has no business with.
+        strays: std::sync::atomic::AtomicU32,
+        asked_for: Mutex<Vec<Guid>>,
+    }
+
+    /// An interface pointer as the system lays out an object: the first field is the table of methods.
+    #[repr(C)]
+    struct Object {
+        table: *const *const c_void,
+        facts: *const Facts,
+        /// The pointer of the other interface of the same operation (`IAsyncOperation` and `IAsyncInfo`).
+        other: *const Object,
+        is_info: bool,
+    }
+
+    /// An operation with the two interfaces that the guard reads, and the tables of their methods (slots 0 to 2 of both are those of
+    /// `IUnknown`, 3 to 5 those of `IInspectable`; the rest are the methods of the interface, and the other slots count as strays).
+    struct Fake {
+        facts: Box<Facts>,
+        operation: Box<Object>,
+        _info: Box<Object>,
+        _tables: [Vec<*const c_void>; 2],
+    }
+
+    unsafe fn facts_of<'a>(this: *mut c_void) -> &'a Facts {
+        &*(*(this as *const Object)).facts
+    }
+
+    unsafe extern "system" fn fake_query(this: *mut c_void, interface: *const Guid, found: *mut *mut c_void) -> i32 {
+        let object = &*(this as *const Object);
+        facts_of(this).asked_for.lock().unwrap().push(*interface);
+        let (operation, info) = if object.is_info { (object.other, this as *const Object) } else { (this as *const Object, object.other) };
+        if *interface == IID_ASYNC_INFO {
+            *found = info as *mut c_void;
+        } else if *interface == IID_RESULT_OPERATION {
+            *found = operation as *mut c_void;
+        } else {
+            *found = std::ptr::null_mut();
+            return 0x8000_4002u32 as i32;
+        }
+        0
+    }
+
+    unsafe extern "system" fn fake_add_ref(_this: *mut c_void) -> u32 {
+        1
+    }
+
+    unsafe extern "system" fn fake_release(this: *mut c_void) -> u32 {
+        facts_of(this).releases.fetch_add(1, Ordering::SeqCst);
+        1
+    }
+
+    unsafe extern "system" fn fake_stray(this: *mut c_void) -> i32 {
+        facts_of(this).strays.fetch_add(1, Ordering::SeqCst);
+        E_NOTIMPL as i32
+    }
+
+    unsafe extern "system" fn fake_status(this: *mut c_void, status: *mut i32) -> i32 {
+        let facts = facts_of(this);
+        let failure = facts.status_fails.load(Ordering::SeqCst);
+        if failure != 0 {
+            return failure;
+        }
+        *status = facts.status.load(Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "system" fn fake_error(this: *mut c_void, code: *mut i32) -> i32 {
+        *code = facts_of(this).error.load(Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "system" fn fake_cancel(this: *mut c_void) -> i32 {
+        let facts = facts_of(this);
+        facts.cancels.fetch_add(1, Ordering::SeqCst);
+        if facts.cancel_takes {
+            facts.status.store(ASYNC_CANCELED, Ordering::SeqCst);
+        }
+        0
+    }
+
+    unsafe extern "system" fn fake_close(this: *mut c_void) -> i32 {
+        facts_of(this).closes.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    unsafe extern "system" fn fake_results(this: *mut c_void, result: *mut i32) -> i32 {
+        if let Some(value) = facts_of(this).result {
+            *result = value;
+        }
+        0
+    }
+
+    impl Fake {
+        fn new(status: i32, result: Option<i32>, cancel_takes: bool) -> Fake {
+            let facts = Box::new(Facts {
+                status: std::sync::atomic::AtomicI32::new(status), status_fails: std::sync::atomic::AtomicI32::new(0), error: std::sync::atomic::AtomicI32::new(0x8007_0005u32 as i32), result, cancel_takes,
+                cancels: std::sync::atomic::AtomicU32::new(0), closes: std::sync::atomic::AtomicU32::new(0), releases: std::sync::atomic::AtomicU32::new(0),
+                strays: std::sync::atomic::AtomicU32::new(0), asked_for: Mutex::new(Vec::new()),
+            });
+            let stray = fake_stray as *const c_void;
+            let unknown = [fake_query as *const c_void, fake_add_ref as *const c_void, fake_release as *const c_void];
+            // IAsyncOperation<T>: put_Completed (6), get_Completed (7), GetResults (8).
+            let mut operation_table: Vec<*const c_void> = unknown.to_vec();
+            operation_table.extend([stray; 5]);
+            operation_table.push(fake_results as *const c_void);
+            // IAsyncInfo: get_Id (6), get_Status (7), get_ErrorCode (8), Cancel (9), Close (10).
+            let mut info_table: Vec<*const c_void> = unknown.to_vec();
+            info_table.extend([stray; 4]);
+            info_table.extend([fake_status as *const c_void, fake_error as *const c_void, fake_cancel as *const c_void, fake_close as *const c_void]);
+            let mut operation = Box::new(Object { table: operation_table.as_ptr(), facts: &*facts, other: std::ptr::null(), is_info: false });
+            let mut info = Box::new(Object { table: info_table.as_ptr(), facts: &*facts, other: std::ptr::null(), is_info: true });
+            operation.other = &*info;
+            info.other = &*operation;
+            Fake { facts, operation, _info: info, _tables: [operation_table, info_table] }
+        }
+
+        /// The pointer of the operation, as the call that makes a request gives it.
+        fn com(&self) -> Com {
+            Com(&*self.operation as *const Object as *mut c_void)
+        }
+
+        fn counts(&self) -> (u32, u32, u32, u32) {
+            let facts = &self.facts;
+            (facts.cancels.load(Ordering::SeqCst), facts.closes.load(Ordering::SeqCst), facts.releases.load(Ordering::SeqCst), facts.strays.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn an_operation_is_read_and_cancelled_through_the_slots_of_its_interfaces_and_a_result_that_is_not_written_is_not_a_verification() {
+        let free = AtomicBool::new(false);
+        let grace = Duration::from_millis(150);
+        // Each read is made through the interface and the slot that has it: the state, the error, the cancel and the close through
+        // `IAsyncInfo`, the result through `IAsyncOperation`, and the other interface is asked for once.
+        let fake = Fake::new(ASYNC_COMPLETED, Some(6), true);
+        {
+            let operation = WinOperation::new(fake.com()).expect("an operation that has IAsyncInfo");
+            assert_eq!(operation.status(), Ok(ASYNC_COMPLETED));
+            assert_eq!(operation.result(), Ok(6), "the result is the one GetResults wrote, from the interface of the operation and not of the information");
+            assert_eq!(operation.error(), 0x8007_0005);
+            assert_eq!(fake.counts(), (0, 0, 0, 0), "nothing is cancelled, closed or released while the operation is read");
+            operation.cancel();
+            assert_eq!(fake.counts(), (1, 0, 0, 0), "Cancel is slot 9 of IAsyncInfo");
+            assert_eq!(operation.status(), Ok(ASYNC_CANCELED), "a cancel that the operation takes moves its state");
+        }
+        assert_eq!(fake.counts(), (1, 1, 2, 0), "Close is slot 10, called once, and both interface pointers are released; no other slot was called");
+        assert_eq!(*fake.facts.asked_for.lock().unwrap(), [IID_ASYNC_INFO], "the information is the only other interface that is asked for");
+        // An operation that failed but whose error code is no failure (0, or a success code) is reported with a failure of its own: a
+        // reason such as `Windows Hello failed: 0x00000000` would name no failure at all.
+        let failed = Fake::new(ASYNC_ERROR, None, false);
+        let operation = WinOperation::new(failed.com()).expect("an operation that has IAsyncInfo");
+        for (written, said) in [(0x8007_0005u32 as i32, 0x8007_0005), (0, E_FAIL), (1, E_FAIL), (i32::MAX, E_FAIL)] {
+            failed.facts.error.store(written, Ordering::SeqCst);
+            assert_eq!(operation.error(), said, "an error code of {:#x}", written);
+            assert_eq!(drive(&operation, &free, None, grace, &one_millisecond), Outcome::Failed(said));
+        }
+        assert_eq!(failed.counts().3, 0, "no stray slot was called");
+        // The system succeeds and writes nothing: the result is the value that is none of the results, and is not a verification.
+        let silent = Fake::new(ASYNC_COMPLETED, None, true);
+        let operation = WinOperation::new(silent.com()).expect("an operation that has IAsyncInfo");
+        assert_eq!(operation.result(), Ok(NO_RESULT));
+        let outcome = drive(&operation, &free, None, grace, &one_millisecond);
+        assert_eq!(outcome, Outcome::Done(NO_RESULT));
+        assert!(matches!(outcome, Outcome::Done(code) if Consent::from_code(code) != Consent::Verified && Availability::from_code(code) != Availability::Available));
+        // A state that cannot be read: the request is asked to cancel, once, and the failure is the one the system gave.
+        let unreadable = Fake::new(ASYNC_STARTED, Some(0), true);
+        unreadable.facts.status_fails.store(0x8000_4005u32 as i32, Ordering::SeqCst);
+        let operation = WinOperation::new(unreadable.com()).expect("an operation that has IAsyncInfo");
+        assert_eq!(operation.status(), Err(0x8000_4005));
+        assert_eq!(drive(&operation, &free, None, grace, &one_millisecond), Outcome::Failed(0x8000_4005));
+        assert_eq!(unreadable.counts().0, 1, "a request whose state cannot be read is asked to cancel");
+        // The flag to stop: the operation is cancelled once, and the outcome is a timeout where it took the cancel and a cancel that was
+        // ignored where it did not, however it went on to answer.
+        let takes = Fake::new(ASYNC_STARTED, Some(0), true);
+        let operation = WinOperation::new(takes.com()).expect("an operation that has IAsyncInfo");
+        assert_eq!(drive(&operation, &AtomicBool::new(true), None, grace, &one_millisecond), Outcome::TimedOut);
+        assert_eq!(takes.counts().0, 1);
+        let ignores = Fake::new(ASYNC_STARTED, Some(0), false);
+        let operation = WinOperation::new(ignores.com()).expect("an operation that has IAsyncInfo");
+        assert_eq!(drive(&operation, &AtomicBool::new(true), None, grace, &one_millisecond), Outcome::CancelIgnored);
+        assert_eq!(ignores.counts().0, 1, "Cancel is asked once and the grace is waited for");
+        drop(operation);
+        assert_eq!(ignores.counts().3, 0, "no stray slot was called on any path");
+        assert_eq!((takes.counts().3, unreadable.counts().3, silent.counts().3), (0, 0, 0));
+    }
+
+    // ---- the password in a protected form, with a stand-in for the calls of the system
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetLastError(code: u32);
+    }
+
+    /// What the stand-ins for the calls of the dialog do.
+    #[derive(Default)]
+    struct Script {
+        /// The password as the dialog returns it, with its NUL, and the clear text it is unprotected to.
+        packed: Vec<u16>,
+        clear: Vec<u16>,
+        unpack_fails: Option<u32>,
+        unprotect_fails: Option<u32>,
+        unpack_calls: u32,
+        unprotect_calls: u32,
+        /// The size of the password buffer of each call of the unpacking.
+        buffers: Vec<u32>,
+    }
+
+    thread_local! {
+        static SCRIPT: std::cell::RefCell<Script> = std::cell::RefCell::new(Script::default());
+    }
+
+    fn units(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    unsafe extern "system" fn fake_unpack(_flags: u32, _buffer: *const c_void, _size: u32, user: *mut u16, user_chars: *mut u32,
+        domain: *mut u16, domain_chars: *mut u32, password: *mut u16, password_chars: *mut u32) -> Bool {
+        SCRIPT.with(|script| {
+            let mut script = script.borrow_mut();
+            script.unpack_calls += 1;
+            script.buffers.push(*password_chars);
+            if let Some(code) = script.unpack_fails {
+                SetLastError(code);
+                return 0;
+            }
+            if (*password_chars as usize) < script.packed.len() {
+                *password_chars = script.packed.len() as u32;
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            for (at, unit) in units("me").iter().enumerate() {
+                *user.add(at) = *unit;
+            }
+            *user_chars = 3;
+            *domain = 0;
+            *domain_chars = 1;
+            for (at, unit) in script.packed.iter().enumerate() {
+                *password.add(at) = *unit;
+            }
+            1
+        })
+    }
+
+    /// A password that begins with `@` is in a protected form.
+    unsafe extern "system" fn fake_protected(password: *mut u16, kind: *mut i32) -> Bool {
+        *kind = if *password == '@' as u16 { 1 } else { CRED_UNPROTECTED };
+        1
+    }
+
+    unsafe extern "system" fn fake_unprotect(_as_self: Bool, _protected: *mut u16, _length: u32, clear: *mut u16, chars: *mut u32) -> Bool {
+        SCRIPT.with(|script| {
+            let mut script = script.borrow_mut();
+            script.unprotect_calls += 1;
+            if let Some(code) = script.unprotect_fails {
+                SetLastError(code);
+                return 0;
+            }
+            if clear.is_null() || (*chars as usize) < script.clear.len() {
+                *chars = script.clear.len() as u32;
+                SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                return 0;
+            }
+            for (at, unit) in script.clear.iter().enumerate() {
+                *clear.add(at) = *unit;
+            }
+            1
+        })
+    }
+
+    unsafe extern "system" fn fake_free(_memory: *mut c_void) {}
+
+    unsafe extern "system" fn fake_prompt(_info: *const CredUiInfoW, _error: u32, _package: *mut u32, _in: *const c_void, _in_size: u32,
+        _out: *mut *mut c_void, _out_size: *mut u32, _save: *mut Bool, _flags: u32) -> u32 {
+        ERROR_CANCELLED
+    }
+
+    fn fake_api() -> DesktopApi {
+        DesktopApi { prompt: fake_prompt, unpack: fake_unpack, free: fake_free, protected: fake_protected, unprotect: fake_unprotect }
+    }
+
+    /// Script the dialog and read the credentials it returns; the wipes of the buffers that were dropped on the way are cleared first.
+    fn read_with(script: Script) -> (Asked, Script) {
+        SCRIPT.with(|slot| *slot.borrow_mut() = script);
+        WIPES.with(|wipes| wipes.borrow_mut().clear());
+        let asked = read_credentials(&fake_api(), std::ptr::null(), 0);
+        (asked, SCRIPT.with(|slot| std::mem::take(&mut *slot.borrow_mut())))
+    }
+
+    fn rejected(asked: Asked) -> String {
+        match asked {
+            Asked::Rejected(reason) => reason,
+            Asked::Entered(_) => "(entered)".into(),
+            _ => "(something else)".into(),
+        }
+    }
+
+    #[test]
+    fn a_password_in_a_clear_form_is_taken_as_it_is_and_one_in_a_protected_form_is_unprotected_into_a_buffer_that_is_wiped() {
+        // Clear text: no unprotecting.
+        let (asked, script) = read_with(Script { packed: units("hunter2"), ..Script::default() });
+        let Asked::Entered(credentials) = asked else { panic!("a clear password is taken") };
+        assert_eq!(credentials.password_units(), "hunter2".encode_utf16().collect::<Vec<u16>>());
+        assert_eq!((script.unpack_calls, script.unprotect_calls), (1, 0));
+        drop(credentials);
+        // A protected form that fits the buffer of a password: unprotected into one of the same size.
+        let (asked, script) = read_with(Script { packed: units(&format!("@{}", "B".repeat(200))), clear: units("hunter2"), ..Script::default() });
+        let Asked::Entered(credentials) = asked else { panic!("a protected form that can be unprotected is taken") };
+        assert_eq!(credentials.password_units(), "hunter2".encode_utf16().collect::<Vec<u16>>(), "the clear form is what is checked");
+        assert!(credentials.password_ends() && credentials.password.0.len() == CREDUI_PASSWORD_CHARS && (script.unpack_calls, script.unprotect_calls) == (1, 2), "{}", script.unprotect_calls);
+        drop(credentials);
+        let wiped = WIPES.with(|wipes| wipes.borrow().clone());
+        assert!(wiped.iter().all(|(_, after)| *after == 0), "every buffer that was alive is zero once dropped: {:?}", wiped);
+        assert!(wiped.iter().any(|(before, _)| *before == 201) && wiped.iter().any(|(before, _)| *before == 7), "the protected form and the clear password were each there and were wiped: {:?}", wiped);
+    }
+
+    #[test]
+    fn a_protected_form_longer_than_a_password_is_read_with_a_larger_buffer_and_no_larger_than_the_limit() {
+        // The dialog returns a form of 400 characters: the buffer of a password is too small, and the unpacking is made again with the
+        // size the system asked for. The password it holds is then 7 characters, which fit the buffer of a password.
+        let (asked, script) = read_with(Script { packed: units(&format!("@{}", "B".repeat(399))), clear: units("hunter2"), ..Script::default() });
+        let Asked::Entered(credentials) = asked else { panic!("a long protected form is taken") };
+        assert_eq!(credentials.password_units(), "hunter2".encode_utf16().collect::<Vec<u16>>());
+        assert_eq!(script.buffers, [CREDUI_PASSWORD_CHARS as u32, 401], "asked with the buffer of a password, then with the size that was asked for");
+        assert_eq!((script.unpack_calls, script.unprotect_calls), (2, 2));
+        assert_eq!(credentials.password.0.len(), CREDUI_PASSWORD_CHARS, "the password is held in a buffer of the size of a password");
+        drop(credentials);
+        let wiped = WIPES.with(|wipes| wipes.borrow().clone());
+        assert!(wiped.iter().all(|(_, after)| *after == 0) && wiped.iter().any(|(before, _)| *before == 400), "the larger buffer was wiped: {:?}", wiped);
+        // At the limit it is taken, over it the dialog's answer is turned away (an attempt used, no logon), after one call.
+        let at_limit = Script { packed: units(&format!("@{}", "B".repeat(PROTECTED_LIMIT - 2))), clear: units("x"), ..Script::default() };
+        assert!(matches!(read_with(at_limit).0, Asked::Entered(_)), "the limit itself is taken");
+        let (asked, script) = read_with(Script { packed: units(&format!("@{}", "B".repeat(PROTECTED_LIMIT))), clear: units("x"), ..Script::default() });
+        assert_eq!(rejected(asked), "the password is longer than the guard takes");
+        assert_eq!((script.unpack_calls, script.unprotect_calls), (1, 0));
+        assert!(WIPES.with(|wipes| wipes.borrow().iter().all(|(_, after)| *after == 0)));
+    }
+
+    #[test]
+    fn a_password_that_cannot_be_unprotected_or_read_uses_an_attempt_and_leaves_nothing_in_memory() {
+        // The system fails to unprotect.
+        let (asked, script) = read_with(Script { packed: units("@protected"), clear: units("hunter2"), unprotect_fails: Some(5), ..Script::default() });
+        let reason = rejected(asked);
+        assert!(reason.starts_with("the protected form of the password could not be unprotected: ") && reason.contains("[WinError 5]"), "{}", reason);
+        assert_eq!(script.unprotect_calls, 1);
+        assert!(WIPES.with(|wipes| wipes.borrow().iter().all(|(_, after)| *after == 0)), "the protected form was wiped");
+        // The clear password would be longer than a password can be.
+        let (asked, script) = read_with(Script { packed: units("@protected"), clear: units(&"p".repeat(CREDUI_PASSWORD_CHARS)), ..Script::default() });
+        assert_eq!(rejected(asked), "the password is longer than the guard takes");
+        assert_eq!(script.unprotect_calls, 1, "the clear text is not asked for");
+        // The size is asked for and the system fills nothing: the first call does not fail with the error for the size.
+        let (asked, _) = read_with(Script { packed: units("@protected"), clear: units("x"), unprotect_fails: Some(ERROR_NONE_MAPPED), ..Script::default() });
+        assert!(rejected(asked).contains("could not be unprotected"));
+        // The dialog's answer cannot be read at all, or the name is too long: as before.
+        let (asked, _) = read_with(Script { unpack_fails: Some(1168), ..Script::default() });
+        assert!(rejected(asked).starts_with("the answer of the prompt could not be read as a user name and password: "));
+        let (asked, script) = read_with(Script { unpack_fails: Some(ERROR_INSUFFICIENT_BUFFER), ..Script::default() });
+        assert_eq!(rejected(asked), "the name or password is longer than the prompt allows");
+        assert_eq!(script.unpack_calls, 1, "a size that did not grow is not asked again");
+        assert!(WIPES.with(|wipes| wipes.borrow().iter().all(|(_, after)| *after == 0)));
+    }
+
+    #[test]
+    fn a_password_protected_by_the_system_is_unprotected_by_the_system() {
+        // The real calls: a password protected for the test with `CredProtectW` and given back by `CredUnprotectW`. Neither shows anything.
+        let api = desktop_api().expect("the libraries of the desktop prompt");
+        let clear: Vec<u16> = "hunter2".encode_utf16().chain(std::iter::once(0)).collect();
+        let (mut size, mut kind) = (0u32, 0i32);
+        unsafe { CredProtectW(0, clear.as_ptr(), clear.len() as u32, std::ptr::null_mut(), &mut size, &mut kind) };
+        let mut blob = vec![0u16; size as usize];
+        assert_ne!(unsafe { CredProtectW(0, clear.as_ptr(), clear.len() as u32, blob.as_mut_ptr(), &mut size, &mut kind) }, 0, "protect a password for the test");
+        assert!(password_is_protected(api, &mut blob));
+        match unprotect(api, &mut blob) {
+            Ok(back) => assert_eq!(text_before_nul(&back.0).as_deref(), Some("hunter2")),
+            Err(reason) => panic!("{}", reason),
+        }
+        wipe(&mut blob);
+    }
+
+    // ---- the calls of the Windows Runtime, for real, where they show nothing
+
+    #[test]
+    fn the_class_and_the_interfaces_that_the_request_uses_are_there_and_whether_windows_hello_is_available_is_answered_without_showing_anything() {
+        let api = hello_api().expect("combase.dll");
+        let _apartment = Apartment::enter(api).expect("a Windows Runtime apartment");
+        let class = HString::new(api, CONSENT_CLASS).expect("a string of the Windows Runtime");
+        // The two interfaces of the class that are used: the code to ask for the request is slot 6 of the second, and a request is never made here.
+        match factory(api, &class, &IID_CONSENT_INTEROP) {
+            Ok(interop) => assert!(interop.query(&IID_CONSENT_INTEROP).is_ok() && !interop.0.is_null()),
+            // A system without the class (0x80040154) or without the interop interface (an edition of Windows older than 1703 or a server edition).
+            Err(code) if code == 0x8004_0154 || code == 0x8000_4002 => eprintln!("NOT ASSERTED: the class or the interop interface of Windows Hello is not there (0x{:08x})", code),
+            Err(code) => panic!("the interop interface of the class: 0x{:08x}", code),
+        }
+        if let Ok(statics) = factory(api, &class, &IID_CONSENT_STATICS) {
+            assert!(!statics.0.is_null());
+        }
+        // The question: it shows nothing, and the answer is one of the names that are logged.
+        match HelloConsenter.availability(&Owners::empty()) {
+            Ok(answer) => {
+                let name = answer.name();
+                assert!(["Available", "DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "DeviceBusy"].contains(&name.as_str()) || name.starts_with("Unknown("), "{}", name);
+                eprintln!("Windows Hello on this machine: {}", name);
+            }
+            Err(reason) => eprintln!("NOT ASSERTED: the question was not answered here: {}", reason),
+        }
+        // A starter that has gone ends the question early, with its reason, unless the system answered first; either way it returns
+        // within the limit of the question, and an answer is one of the names that are logged.
+        let gone = Owners::of(vec![event(true)]);
+        let started = Instant::now();
+        match HelloConsenter.availability(&gone) {
+            Ok(answer) => assert!(["Available", "DeviceNotPresent", "NotConfiguredForUser", "DisabledByPolicy", "DeviceBusy"].contains(&answer.name().as_str()) || answer.name().starts_with("Unknown(")),
+            Err(reason) => assert!(!reason.is_empty(), "a question that is not answered says why"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(SYSTEM_TIMEOUT_MS + 2_000), "{:?}", started.elapsed());
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn CreateDesktopW(name: *const u16, device: *const u16, devmode: *mut c_void, flags: u32, access: u32, attributes: *mut c_void) -> Handle;
+        fn SetThreadDesktop(desktop: Handle) -> Bool;
+        fn PostMessageW(window: Handle, message: u32, w: usize, l: isize) -> Bool;
+        fn PostThreadMessageW(thread: u32, message: u32, w: usize, l: isize) -> Bool;
+    }
+
+    /// Set by the function that a timer message posted to the owner window names, if it is ever called.
+    static TIMER_FUNCTION_CALLED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn timer_function(_window: Handle, _message: u32, _id: usize, _time: u32) {
+        TIMER_FUNCTION_CALLED.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_question_about_windows_hello_that_is_cancelled_ends_cancelled_through_the_cancel_slot_of_the_system() {
+        // The question shows nothing, and it is the one real operation of the Windows Runtime that can be cancelled here: the request is
+        // never made. Cancel is slot 9 of `IAsyncInfo`; only a system that lays the table out as the guard declares ends the operation
+        // as cancelled, which the stand-in operations cannot show. The loop that waits for an operation cancels it when its flag is set.
+        let Some(api) = hello_api() else { return eprintln!("NOT ASSERTED: combase.dll is not there") };
+        let (mut cancelled, mut asked) = (0, 0);
+        for _ in 0..20 {
+            let Ok(_apartment) = Apartment::enter(api) else { return eprintln!("NOT ASSERTED: no apartment of the Windows Runtime") };
+            let Ok(class) = HString::new(api, CONSENT_CLASS) else { return eprintln!("NOT ASSERTED: no string of the Windows Runtime") };
+            let Ok(statics) = factory(api, &class, &IID_CONSENT_STATICS) else { return eprintln!("NOT ASSERTED: the class of Windows Hello is not there") };
+            let mut raw: *mut c_void = std::ptr::null_mut();
+            // SAFETY: slot 6 of IUserConsentVerifierStatics is CheckAvailabilityAsync.
+            let code = unsafe { slot::<CheckAvailabilityAsyncFn>(statics.0, 6)(statics.0, &mut raw) };
+            assert!(code >= 0 && !raw.is_null(), "the question is asked: 0x{:08x}", code);
+            let typed = Com(raw).query(&IID_AVAILABILITY_OPERATION).expect("the operation as the interface whose result is read");
+            let operation = WinOperation::new(typed).expect("an operation that has IAsyncInfo");
+            asked += 1;
+            match drive(&operation, &AtomicBool::new(true), None, Duration::from_secs(5), &one_millisecond) {
+                Outcome::TimedOut => cancelled += 1,
+                // The answer came before the loop looked at its flag: an answer is an answer.
+                Outcome::Done(code) => assert!(!matches!(Availability::from_code(code), Availability::Unknown(_)), "an availability that is known: {}", code),
+                other => panic!("a question that is cancelled ends as cancelled or answered, not {:?}", other),
+            }
+        }
+        assert!(cancelled > 0, "no question of {} ended as cancelled: Cancel (slot 9) does not reach the operation", asked);
+    }
+
+    #[test]
+    fn only_a_message_the_window_can_have_asked_for_is_dispatched() {
+        let (own, none) = (0x1000usize as Handle, std::ptr::null_mut());
+        let message = |window: Handle, message: u32, l: isize| Msg { window, message, w: 1, l, time: 0, point: [0; 2] };
+        // A timer message is never dispatched, for the window or for the thread, with a function named or none: the thread sets no timer.
+        for kind in [WM_TIMER, WM_SYSTIMER] {
+            for window in [own, none] {
+                assert!(!dispatchable(&message(window, kind, timer_function as *const () as usize as isize)), "{}: the function it names is never called", kind);
+                assert!(!dispatchable(&message(window, kind, 0)), "{}: and nor is one that names none", kind);
+            }
+        }
+        // Everything else is.
+        assert!(dispatchable(&message(own, 0, 0)) && dispatchable(&message(own, 0x0010, 0)) && dispatchable(&message(none, 0x0400, 0)), "WM_NULL, WM_CLOSE and a message of the thread");
+    }
+
+    thread_local! {
+        /// What the stand-in for the wait of the owner window gives.
+        static WAIT_GIVES: std::cell::Cell<u32> = const { std::cell::Cell::new(WAIT_OBJECT_0) };
+    }
+
+    unsafe extern "system" fn fake_wait(_count: u32, _handles: *const Handle, _milliseconds: u32, _mask: u32, _flags: u32) -> u32 {
+        WAIT_GIVES.with(|gives| gives.get())
+    }
+
+    unsafe extern "system" fn fake_register(_class: *const WndClassExW) -> u16 {
+        1
+    }
+
+    unsafe extern "system" fn fake_create(_ex: u32, _class: *const u16, _name: *const u16, _style: u32, _x: i32, _y: i32, _width: i32, _height: i32,
+        _parent: Handle, _menu: Handle, _instance: Handle, _parameter: *mut c_void) -> Handle {
+        std::ptr::null_mut()
+    }
+
+    unsafe extern "system" fn fake_destroy(_window: Handle) -> Bool {
+        1
+    }
+
+    unsafe extern "system" fn fake_unregister(_class: *const u16, _instance: Handle) -> Bool {
+        1
+    }
+
+    unsafe extern "system" fn fake_peek(_message: *mut Msg, _window: Handle, _first: u32, _last: u32, _flags: u32) -> Bool {
+        0
+    }
+
+    unsafe extern "system" fn fake_dispatch(_message: *const Msg) -> isize {
+        0
+    }
+
+    unsafe extern "system" fn fake_procedure(_window: Handle, _message: u32, _w: usize, _l: isize) -> isize {
+        0
+    }
+
+    #[test]
+    fn a_wait_for_the_owner_window_that_fails_sleeps_the_time_and_does_not_spin() {
+        let api: &'static WindowApi = Box::leak(Box::new(WindowApi {
+            register: fake_register, create: fake_create, destroy: fake_destroy, unregister: fake_unregister, peek: fake_peek,
+            dispatch: fake_dispatch, default_procedure: fake_procedure, wait: fake_wait,
+        }));
+        let window = OwnerWindow { api, handle: std::ptr::null_mut(), class: wide("none"), instance: std::ptr::null_mut() };
+        // A wait that could not be made returns at once, which the loop that waits for the request would turn into a spin: the time is slept.
+        WAIT_GIVES.with(|gives| gives.set(WAIT_FAILED));
+        let started = Instant::now();
+        window.serve();
+        assert!(started.elapsed() >= Duration::from_millis(POLL_MS as u64 - 20), "{:?}", started.elapsed());
+        // A wait that ended because of a message, or because the time was up, is not slept again.
+        for gives in [WAIT_OBJECT_0, WAIT_TIMEOUT] {
+            WAIT_GIVES.with(|slot| slot.set(gives));
+            window.serve();
+        }
+    }
+
+    /// Set in the environment of the copy of this test executable that makes the owner window.
+    const OWNER_CHILD: &str = "PROCESS_TREE_GUARD_UNIT_TEST_OWNER_WINDOW_CHILD";
+
+    #[test]
+    fn the_window_that_owns_the_request_is_made_served_and_destroyed_on_a_window_station_that_is_not_visible() {
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        if std::env::var_os(OWNER_CHILD).is_some() {
+            // The copy: it makes a window station of its own, which is not visible, and a desktop on it, makes them its own and makes the
+            // window on that desktop, so that no window is ever on the desktop of whoever runs the tests. It is served once and
+            // destroyed, twice, to see that the class can be made again.
+            let station = unsafe { CreateWindowStationW(std::ptr::null(), 0, GENERIC_ALL, std::ptr::null_mut()) };
+            if station.is_null() || unsafe { SetProcessWindowStation(station) } == 0 {
+                println!("OWNER no window station could be made [WinError {}]", unsafe { GetLastError() });
+                return;
+            }
+            let desktop = unsafe { CreateDesktopW(wide("hidden").as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, GENERIC_ALL, std::ptr::null_mut()) };
+            if desktop.is_null() || unsafe { SetThreadDesktop(desktop) } == 0 {
+                println!("OWNER no desktop could be made [WinError {}]", unsafe { GetLastError() });
+                return;
+            }
+            // The real read of the two desktops from a desktop that does not receive the input of anyone: it is not accepted.
+            let (ours, input) = desktop_names();
+            println!("OWNER desktops ours={} input={:?} accepted={}", ours.as_deref().unwrap_or("(none)"), input, on_input_desktop(ours.clone(), input.clone()).is_ok());
+            let api = window_api().expect("user32.dll");
+            for round in 1..=2 {
+                match OwnerWindow::create(api) {
+                    Ok(window) => {
+                        window.serve();
+                        println!("OWNER round {} made and served", round);
+                        // With nothing in its queue the window waits for the poll and does not return at once, which would turn the loop that
+                        // waits for the request into a spin that reads the operation on every turn (CWE-834).
+                        for pass in 0..4 {
+                            let before = Instant::now();
+                            window.serve();
+                            println!("OWNER round {} idle serve {} {}", round, pass, before.elapsed().as_millis());
+                        }
+                        // One look at the request serves what waits for the window: the loop that waits for the request serves the window nowhere
+                        // else, so a few posted messages are gone after it.
+                        let mut seen = Msg { window: std::ptr::null_mut(), message: 0, w: 0, l: 0, time: 0, point: [0; 2] };
+                        unsafe {
+                            for _ in 0..3 {
+                                PostMessageW(window.handle, 0, 0, 0);
+                            }
+                        }
+                        window.serve();
+                        println!("OWNER round {} serve drains {}", round, unsafe { (window.api.peek)(&mut seen, std::ptr::null_mut(), 0, 0, 0) } == 0);
+                        // A program of the same user can post to the window and to its thread: a timer message that names a function
+                        // to each, then more messages than one look at the queue takes. One look serves no more than PUMP_LIMIT of them and calls no
+                        // function, and a few looks empty the queue.
+                        let mut probe = Msg { window: std::ptr::null_mut(), message: 0, w: 0, l: 0, time: 0, point: [0; 2] };
+                        unsafe {
+                            PostMessageW(window.handle, WM_TIMER, 1, timer_function as *const () as usize as isize);
+                            PostThreadMessageW(GetCurrentThreadId(), WM_TIMER, 2, timer_function as *const () as usize as isize);
+                            for _ in 0..PUMP_LIMIT * 2 {
+                                PostMessageW(window.handle, 0, 0, 0);
+                            }
+                        }
+                        window.pump();
+                        let left = unsafe { (window.api.peek)(&mut probe, std::ptr::null_mut(), 0, 0, 0) } != 0;
+                        for _ in 0..4 {
+                            window.pump();
+                        }
+                        let drained = unsafe { (window.api.peek)(&mut probe, std::ptr::null_mut(), 0, 0, 0) } == 0;
+                        // A pass of `serve`, which is what a look at the request allows, dispatches no more than that either.
+                        unsafe {
+                            for _ in 0..PUMP_LIMIT * 2 {
+                                PostMessageW(window.handle, 0, 0, 0);
+                            }
+                        }
+                        window.serve();
+                        let left_by_serve = unsafe { (window.api.peek)(&mut probe, std::ptr::null_mut(), 0, 0, 0) } != 0;
+                        for _ in 0..4 {
+                            window.pump();
+                        }
+                        println!("OWNER round {} flood left_after_one_look={} drained={} left_after_serve={} timer_function_called={}", round, left, drained, left_by_serve,
+                            TIMER_FUNCTION_CALLED.load(Ordering::SeqCst));
+                        // What the system itself does with such a message, dispatched without the filter: recorded and not asserted, because
+                        // the guard does not rely on it and it may differ between systems.
+                        TIMER_FUNCTION_CALLED.store(false, Ordering::SeqCst);
+                        unsafe { PostMessageW(window.handle, WM_TIMER, 3, timer_function as *const () as usize as isize) };
+                        while unsafe { (window.api.peek)(&mut probe, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                            if probe.message == WM_TIMER {
+                                unsafe { (window.api.dispatch)(&probe) };
+                            }
+                        }
+                        println!("OWNER round {} the system calls the function of a timer message from outside: {}", round, TIMER_FUNCTION_CALLED.load(Ordering::SeqCst));
+                        TIMER_FUNCTION_CALLED.store(false, Ordering::SeqCst);
+                    }
+                    Err(code) => {
+                        println!("OWNER round {} failed 0x{:08x}", round, code);
+                        return;
+                    }
+                }
+            }
+            println!("OWNER ok");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("the path of this test executable"))
+            .args(["the_window_that_owns_the_request_is_made_served_and_destroyed", "--nocapture", "--test-threads=1"])
+            .env(OWNER_CHILD, "1").stdin(std::process::Stdio::null()).output().expect("run the copy");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let said: Vec<String> = stdout.lines().filter_map(|line| line.find("OWNER ").map(|at| line[at + "OWNER ".len()..].to_string())).collect();
+        if said.iter().any(|line| line.starts_with("no window station") || line.starts_with("no desktop")) {
+            assert!(std::env::var_os("PROCESS_TREE_GUARD_REQUIRE_WINDOW_STATION").map_or(true, |value| value.is_empty()), "{:?}", said);
+            eprintln!("NOT ASSERTED: {:?}", said);
+            return;
+        }
+        assert!(output.status.success() && said.last().map(String::as_str) == Some("ok"), "{:?} / {}", said, stdout);
+        assert!(said.iter().any(|line| line.starts_with("desktops ours=hidden ") && line.ends_with(" accepted=false")),
+            "a desktop of a window station that is not visible is not the one that receives the input of the user: {:?}", said);
+        for round in 1..=2 {
+            assert!(said.iter().any(|line| *line == format!("round {} flood left_after_one_look=true drained=true left_after_serve=true timer_function_called=false", round)),
+                "round {}: a flood is served in parts and a timer message calls nothing: {:?}", round, said);
+            assert!(said.iter().any(|line| *line == format!("round {} serve drains true", round)), "round {}: one look at the request serves the messages that wait: {:?}", round, said);
+            // A message that the system sends to a window can end one wait early, so three of the four idle waits must last about the poll.
+            let prefix = format!("round {} idle serve ", round);
+            let waits: Vec<u128> = said.iter().filter_map(|line| line.strip_prefix(prefix.as_str())).filter_map(|rest| rest.split_whitespace().nth(1)?.parse().ok()).collect();
+            assert!(waits.len() == 4 && waits.iter().filter(|ms| **ms >= POLL_MS as u128 / 2).count() >= 3 && waits.iter().all(|ms| *ms < 5_000),
+                "round {}: a window with nothing in its queue waits for the poll and does not spin: {:?}", round, waits);
+        }
+        for line in said.iter().filter(|line| line.contains("the system calls the function")) {
+            eprintln!("Recorded, not asserted: {}", line);
+        }
     }
 }
 

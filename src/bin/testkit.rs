@@ -1505,9 +1505,10 @@ fn main() {
             // Run GUARD --extendable --max-extension CAP --timeout SECONDS -- CHILD... on a window
             // station that is not visible, with the default (desktop) method of asking, and exit
             // with its code. The guard must refuse at once, because it has no interactive window
-            // station. If its test for that were defective, the real secure prompt could appear on
-            // the desktop of whoever runs the tests; where it would appear is not established. The
-            // station is made and checked first, and nothing starts if it cannot be.
+            // station. If its test for that were defective, the real secure prompt, or the prompt of
+            // Windows Hello, could appear on the desktop of whoever runs the tests; where it would
+            // appear is not established. The station is made and checked first, and nothing starts
+            // if it cannot be.
             need_at_least(rest, 4, "hidden-station-guard GUARD CAP SECONDS CHILD...");
             exit(run_on_hidden_station(&rest[0], &rest[1], &rest[2], &rest[3..]));
         }

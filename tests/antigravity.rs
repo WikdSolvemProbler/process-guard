@@ -1160,7 +1160,7 @@ fn a41_a_denial_exits_2_whether_or_not_its_output_can_be_written() {
 fn a42_a_command_line_with_a_cap_over_the_default_or_a_method_is_not_an_envelope() {
     let mut checks = Checks::new("exception launch");
     // The envelope is an exact form with no extension options, so a line that asks for an exception above the cap, which would
-    // need the signed-in user's password, is never passed through as an envelope: the hooks that only allow or deny refuse it, and
+    // need the signed-in user's approval, is never passed through as an envelope: the hooks that only allow or deny refuse it, and
     // the rewriting ones wrap it again whole, as the command text of the automatic wrapper. The options are in that text and not in
     // the wrapper's arguments, so the wrapper does not refuse them; the guard that it starts is a top-level guard that another guard
     // started, and it is refused before anything is shown. The hook and the wrapper do not ask themselves. The checks that decide only

@@ -538,7 +538,7 @@ fn u24_automatic_mode_never_takes_a_cap_over_the_default_and_never_prompts() {
     let (_dir, auto) = auto_copy();
     let tree = Tree::new(Layout::Install, "u24-");
     let deadline_auto = tree.exe("process-tree-guard-deadline-auto");
-    // Automatic mode refuses the extension options, so a cap over the default, which would need the signed-in user's password, is
+    // Automatic mode refuses the extension options, so a cap over the default, which would need the signed-in user's approval, is
     // refused before anything else. The console method and a standard input that is null or a pipe are used so that, whatever
     // a defect did, no prompt could show on the desktop of whoever runs the tests.
     let forms: [(&str, Vec<&str>); 3] = [
